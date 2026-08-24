@@ -201,20 +201,16 @@
         <div class="panel">
           <div class="panel-title">Enumerated devices — stable IDs, never numeric indexes</div>
           <div class="filter-bar">
-            <span class="filter-label">Show</span>
-            <button class="toggle" id="dv-show-inputs" aria-pressed="true">Inputs</button>
-            <button class="toggle" id="dv-show-outputs" aria-pressed="true">Outputs</button>
+            <span class="filter-label" title="Click a category to cycle Show → Hide → Filtered">Filter</span>
+            <button class="tristate" data-cat="inputs" data-state="show">Inputs</button>
+            <button class="tristate" data-cat="outputs" data-state="show">Outputs</button>
             <span class="toolbar-sep"></span>
-            <button class="toggle" id="dv-show-physical" aria-pressed="true">Physical</button>
-            <button class="toggle" id="dv-show-loopback" aria-pressed="true">Loopback</button>
-            <button class="toggle" id="dv-show-virtual" aria-pressed="false">Virtual</button>
+            <button class="tristate" data-cat="physical" data-state="show">Physical</button>
+            <button class="tristate" data-cat="loopback" data-state="show">Loopback</button>
+            <button class="tristate" data-cat="virtual" data-state="show">Virtual</button>
             <span class="toolbar-sep"></span>
-            <span class="filter-label">Hide</span>
-            <button class="toggle" id="dv-hide-unknown" aria-pressed="true">Unknown</button>
-            <button class="toggle" id="dv-hide-disabled" aria-pressed="true">Disabled</button>
-            <span class="toolbar-sep"></span>
-            <button class="toggle" id="dv-show-filtered" aria-pressed="false"
-                    title="Reveal the devices these filters are hiding, marked as filtered">Filtered</button>
+            <button class="tristate" data-cat="unknown" data-state="hide">Unknown</button>
+            <button class="tristate" data-cat="disabled" data-state="hide">Disabled</button>
             <input type="search" id="dv-search" placeholder="filter by name, host API, id…" />
             <span class="spacer" style="flex:1"></span>
             <span class="mono hint" id="dv-counts"></span>

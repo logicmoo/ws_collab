@@ -289,6 +289,49 @@ button.toggle[aria-pressed="true"]:hover { background: #0a4f4c; }
 button.toggle[aria-pressed="true"]::before { content: "\2713\00a0"; font-size: 10px; }
 button.toggle[aria-pressed="false"]::before { content: "\00a0\00a0\00a0"; font-size: 10px; }
 
+/* Tri-state device category filters: show / hide / filtered. The state word is
+ * rendered from data-state and each state has a distinct glyph, so it stays
+ * readable without relying on colour alone. */
+button.tristate {
+  position: relative;
+  padding: 4px 10px;
+  background: var(--bg-input);
+  border-color: var(--border-subtle);
+  color: var(--text-muted);
+}
+button.tristate:hover { filter: brightness(1.18); }
+button.tristate::before { font-size: 10px; }
+button.tristate::after {
+  content: attr(data-state);
+  margin-left: 7px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  opacity: 0.8;
+}
+button.tristate[data-state="show"] {
+  background: #073b3a;
+  border-color: var(--accent-teal);
+  color: var(--accent-teal);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.55);
+}
+button.tristate[data-state="show"]::before { content: "\2713\00a0"; }
+button.tristate[data-state="hide"] {
+  background: #3a0f0f;
+  border-color: #d66a6a;
+  color: #f0a3a3;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.55);
+}
+button.tristate[data-state="hide"]::before { content: "\2715\00a0"; }
+button.tristate[data-state="filtered"] {
+  background: #3a2e07;
+  border-color: #caa14a;
+  color: #e6c56b;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.55);
+}
+button.tristate[data-state="filtered"]::before { content: "\25D0\00a0"; }
+
 .toolbar-sep {
   width: 1px;
   align-self: stretch;

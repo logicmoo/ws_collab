@@ -650,24 +650,64 @@ function deviceClass(device) {
   return "unknown";
 }
 
-/* Returns null when the device passes, otherwise why it was excluded -- so the
- * "Filtered" toggle can show the row and say what is hiding it. */
-function deviceExclusion(device) {
+/* ---- device category filters: tri-state show / hide / filtered ---- */
+
+const DEVICE_FILTER_DEFAULTS = {
+  inputs: "show", outputs: "show", physical: "show", loopback: "show",
+  virtual: "show", unknown: "hide", disabled: "hide",
+};
+const DEVICE_FILTER_STATES = ["show", "hide", "filtered"];
+
+function catState(cat) {
+  return localStorage.getItem(`ws_collab_devfilter_${cat}`) || DEVICE_FILTER_DEFAULTS[cat] || "show";
+}
+
+function wireCatFilter(button, onChange) {
+  const cat = button.dataset.cat;
+  button.dataset.state = catState(cat);
+  button.title = `${cat}: click to cycle show → hide → filtered`;
+  button.addEventListener("click", () => {
+    const cur = DEVICE_FILTER_STATES.indexOf(button.dataset.state || "show");
+    const next = DEVICE_FILTER_STATES[(cur + 1) % DEVICE_FILTER_STATES.length];
+    button.dataset.state = next;
+    localStorage.setItem(`ws_collab_devfilter_${cat}`, next);
+    onChange();
+  });
+}
+
+/* A device sits on several categories at once (direction, class, availability). */
+function deviceCategories(device) {
   const group = deviceGroup(device);
   const klass = deviceClass(device);
-  if (group === "input" && !isPressed("dv-show-inputs")) return "inputs hidden";
-  if (group === "output" && !isPressed("dv-show-outputs")) return "outputs hidden";
-  if (group === "unknown" && isPressed("dv-hide-unknown")) return "unknown hidden";
-  if (klass === "physical" && !isPressed("dv-show-physical")) return "physical hidden";
-  if (klass === "loopback" && !isPressed("dv-show-loopback")) return "loopback hidden";
-  if (klass === "virtual" && !isPressed("dv-show-virtual")) return "virtual hidden";
-  if (!device.available && isPressed("dv-hide-disabled")) return "disabled hidden";
+  const cats = [];
+  if (group === "input") cats.push("inputs");
+  if (group === "output") cats.push("outputs");
+  if (group === "unknown" || klass === "unknown") cats.push("unknown");
+  if (klass === "physical") cats.push("physical");
+  if (klass === "loopback") cats.push("loopback");
+  if (klass === "virtual") cats.push("virtual");
+  if (!device.available) cats.push("disabled");
+  return cats;
+}
+
+/* Resolve the tri-state filters to one verdict per device. The strictest state
+ * wins: hide > filtered > show. "filtered" keeps the row visible but dimmed and
+ * tagged with why. A non-empty search box always hides the rows it does not
+ * match. Returns { state, reason }. */
+function deviceVerdict(device) {
+  let state = "show";
+  let reason = "";
+  for (const cat of deviceCategories(device)) {
+    const s = catState(cat);
+    if (s === "hide") return { state: "hide", reason: `${cat} hidden` };
+    if (s === "filtered" && state === "show") { state = "filtered"; reason = `${cat} filtered`; }
+  }
   const needle = ($("dv-search").value || "").trim().toLowerCase();
   if (needle) {
     const hay = `${device.name} ${device.host_api} ${device.id} ${device.direction}`.toLowerCase();
-    if (!hay.includes(needle)) return "no text match";
+    if (!hay.includes(needle)) return { state: "hide", reason: "no text match" };
   }
-  return null;
+  return { state, reason };
 }
 
 async function loadDevices() {
@@ -689,20 +729,22 @@ async function loadDevices() {
     $("dv-capture").replaceChildren(capPanel.root);
 
     const all = devices.devices || [];
-    const decorated = all.map((d) => ({ device: d, excluded: deviceExclusion(d) }));
-    const passing = decorated.filter((row) => !row.excluded);
-    const revealFiltered = isPressed("dv-show-filtered");
-    const visible = revealFiltered ? decorated : passing;
+    const decorated = all.map((d) => {
+      const verdict = deviceVerdict(d);
+      return { device: d, state: verdict.state, reason: verdict.reason };
+    });
+    const shownCount = decorated.filter((r) => r.state === "show").length;
+    const filteredCount = decorated.filter((r) => r.state === "filtered").length;
+    const visible = decorated.filter((r) => r.state !== "hide");
     $("dv-counts").textContent =
-      `${passing.length} shown · ${all.length - passing.length} hidden` +
-      (revealFiltered && all.length !== passing.length ? " (revealed)" : "");
+      `${shownCount} shown · ${filteredCount} filtered · ${all.length - visible.length} hidden`;
 
     const target = $("dv-table");
     target.replaceChildren();
     if (!visible.length) {
       target.appendChild(el("div", "hint", "No devices match the current filters."));
     } else {
-      const rows = visible.map(({ device: d, excluded }) => [
+      const rows = visible.map(({ device: d, state, reason }) => [
         mono(d.id), d.name,
         badge(d.direction, { input: "teal", loopback: "purple", output: "" }[d.direction] || "warn"),
         badge(deviceClass(d), deviceClass(d) === "physical" ? "ok" : ""),
@@ -712,8 +754,8 @@ async function loadDevices() {
         [d.is_default_input && "in", d.is_default_output && "out", d.is_default_comm && "comm"]
           .filter(Boolean).join("/") || "—",
         badge(d.available ? "yes" : "no", d.available ? "ok" : "danger"),
-        excluded
-          ? badge(excluded, "warn")
+        state === "filtered"
+          ? badge(reason, "warn")
           : (deviceGroup(d) === "input" && d.available
               ? actionButton("Use", "", async () => {
                   if (!confirm(`Switch the active capture device to "${d.name}"? Listening will restart on this device.`)) return;
@@ -726,10 +768,10 @@ async function loadDevices() {
       const table_ = table(
         ["ID", "Name", "Direction", "Class", "Host API", "Ch", "Rates", "Latency", "Default", "Available", "Select"],
         rows);
-      // Mark revealed rows so it is obvious they are excluded, not selectable.
+      // Mark filtered rows so it is obvious they are excluded, not selectable.
       const bodyRows = table_.querySelectorAll("tbody tr");
       visible.forEach((row, index) => {
-        if (row.excluded && bodyRows[index]) bodyRows[index].classList.add("filtered-out");
+        if (row.state === "filtered" && bodyRows[index]) bodyRows[index].classList.add("filtered-out");
       });
       target.appendChild(table_);
     }
@@ -1241,9 +1283,8 @@ function wireEvents() {
     try { await api(`${V1}/audio/utterance`, { method: "POST", body: { text, source_kind: "operator" } }); }
     catch (error) { pushError(error.message); }
   };
-  ["dv-show-inputs", "dv-show-outputs", "dv-show-physical", "dv-show-loopback",
-   "dv-show-virtual", "dv-show-filtered", "dv-hide-unknown", "dv-hide-disabled"]
-    .forEach((id) => wireToggle(id, loadDevices));
+  document.querySelectorAll(".filter-bar button.tristate[data-cat]")
+    .forEach((btn) => wireCatFilter(btn, loadDevices));
   $("dv-search").addEventListener("input", loadDevices);
   $("vc-refresh").onclick = loadVoices;
   $("vc-assign").onclick = async () => {
