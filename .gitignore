@@ -27,3 +27,6 @@ venv/
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Editor/backup artifacts
+*.bak
