@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WS_COLLAB — Operations Workbench</title>
+<link rel="stylesheet" href="app.css" />
+</head>
+<body>
+
+<div id="login" class="login-shell">
+  <form class="login-card" id="login-form">
+    <h1>WS_COLLAB</h1>
+    <label class="hint" for="login-token">Access token</label>
+    <input type="password" id="login-token" autocomplete="current-password" placeholder="bearer token" />
+    <div class="login-error" id="login-error"></div>
+    <button class="primary" type="submit" style="width:100%">Sign in</button>
+    <p class="hint" style="margin-top:12px">
+      Tokens come from <span class="mono">WS_COLLAB_TOKENS</span> /
+      <span class="mono">WS_COLLAB_ADMIN_TOKEN</span>. If none were configured, a
+      generated token is written to
+      <span class="mono">collab_state/generated_admin_token.txt</span>.
+    </p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header class="topbar">
+    <button id="nav-toggle" title="Toggle navigation" aria-label="Toggle navigation">☰</button>
+    <span class="brand">WS_COLLAB</span>
+    <span class="mono" id="top-title" style="color:var(--text-secondary)">Transcript</span>
+    <span class="spacer"></span>
+    <span class="mono" style="color:var(--text-muted)" id="top-clock">--:--:--</span>
+    <span class="transport-wrap">
+      <button class="transport-badge" id="transport" data-state="disconnected"
+              aria-haspopup="dialog" aria-expanded="false"
+              title="Connection status — click to inspect endpoints and reconnect">disconnected</button>
+      <div class="endpoint-popover" id="endpoint-popover" role="dialog" aria-label="Endpoints" hidden>
+        <div class="endpoint-title">Endpoints</div>
+        <div id="endpoint-tree" class="endpoint-tree"></div>
+        <div class="endpoint-actions">
+          <button class="primary" id="endpoint-reconnect">Reconnect now</button>
+          <span class="mono hint" id="endpoint-retry"></span>
+        </div>
+      </div>
+    </span>
+    <button id="inspector-toggle" title="Toggle inspector">Inspector</button>
+    <button id="logout">Sign out</button>
+  </header>
+
+  <nav class="sidebar" id="sidebar">
+    <div class="nav-group-title">Live</div>
+    <div class="nav-item active" data-page="transcript" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 3h12M2 8h9M2 13h6"/></svg>
+      <span class="nav-label">Unified Transcript</span>
+      <span class="nav-badge" id="badge-transcript">0</span>
+    </div>
+    <div class="nav-item" data-page="conversation" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 3h12v8H6l-4 3z"/></svg>
+      <span class="nav-label">Conversation</span>
+    </div>
+    <div class="nav-item" data-page="streams" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
+      <span class="nav-label">JSONL Streams</span>
+    </div>
+
+    <div class="nav-group-title">Fleet</div>
+    <div class="nav-item" data-page="workers" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><circle cx="8" cy="5" r="2.5"/><path d="M3 13c0-2.5 2.2-4 5-4s5 1.5 5 4"/></svg>
+      <span class="nav-label">Workers</span>
+      <span class="nav-badge" id="badge-workers">0</span>
+    </div>
+    <div class="nav-item" data-page="alerts" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M8 2l6 11H2z"/><path d="M8 6v3M8 11v.5"/></svg>
+      <span class="nav-label">Alerts</span>
+      <span class="nav-badge" id="badge-alerts">0</span>
+    </div>
+
+    <div class="nav-group-title">Audio</div>
+    <div class="nav-item" data-page="devices" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><rect x="6" y="2" width="4" height="7" rx="2"/><path d="M4 8a4 4 0 008 0M8 12v2"/></svg>
+      <span class="nav-label">Devices &amp; Routing</span>
+    </div>
+    <div class="nav-item" data-page="voices" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M3 6v4M6 3v10M9 5v6M13 7v2"/></svg>
+      <span class="nav-label">Agent Voices</span>
+    </div>
+    <div class="nav-item" data-page="accuracy" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 13l4-5 3 3 5-7"/></svg>
+      <span class="nav-label">TTS Accuracy</span>
+    </div>
+
+    <div class="nav-group-title">Control</div>
+    <div class="nav-item" data-page="cursors" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M3 2l10 6-4.5 1.5L6 14z"/></svg>
+      <span class="nav-label">Cursors</span>
+    </div>
+    <div class="nav-item" data-page="prompt" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M3 3h10v10H3z"/><path d="M6 7h4M6 10h4"/></svg>
+      <span class="nav-label">Prompt</span>
+    </div>
+    <div class="nav-item" data-page="system" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.5"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2"/></svg>
+      <span class="nav-label">System &amp; Audit</span>
+    </div>
+  </nav>
+
+  <main class="main">
+    <!-- ------------------------------------------------- unified transcript -->
+    <section class="page active" data-page="transcript">
+      <div class="toolbar">
+        <button id="tr-pause" class="primary">Pause</button>
+        <input type="search" id="tr-search" placeholder="search…" style="width:150px" />
+        <label class="inline"><input type="checkbox" id="tr-finals" /> finals only</label>
+        <label class="inline"><input type="checkbox" id="tr-hide-partials" checked /> hide partials</label>
+        <label class="inline"><input type="checkbox" id="tr-hide-echo" /> hide TTS echo</label>
+        <label class="inline"><input type="checkbox" id="tr-hide-routine" /> hide routine</label>
+        <label class="inline">min conf
+          <input type="number" id="tr-minconf" value="0" min="0" max="1" step="0.1" style="width:56px" />
+        </label>
+        <label class="inline">cap
+          <input type="number" id="tr-cap" value="2000" min="100" step="100" style="width:70px" />
+        </label>
+        <label class="inline"><input type="checkbox" id="tr-group" /> group by utterance</label>
+        <button id="tr-backfill">Backfill</button>
+        <button id="tr-export">Export</button>
+        <button id="tr-clear" title="Clears only this browser view; durable data is untouched">Clear view</button>
+        <span class="spacer" style="flex:1"></span>
+        <span class="mono hint" id="tr-counts">0 shown · 0 hidden</span>
+      </div>
+      <div class="event-scroll" id="tr-scroll">
+        <div class="event-spacer" id="tr-spacer"></div>
+        <div class="event-viewport" id="tr-viewport"></div>
+      </div>
+      <button class="jump-latest" id="tr-jump">↓ Jump to latest (<span id="tr-unseen">0</span> unseen)</button>
+    </section>
+
+    <!-- ------------------------------------------------------- conversation -->
+    <section class="page" data-page="conversation">
+      <div class="toolbar">
+        <input type="text" id="cv-text" placeholder="message…" style="flex:1;min-width:200px" />
+        <button class="primary" id="cv-send">Send</button>
+        <button id="cv-pause">Pause</button>
+        <input type="search" id="cv-search" placeholder="search…" style="width:140px" />
+      </div>
+      <div class="event-scroll" id="cv-scroll">
+        <div class="event-spacer" id="cv-spacer"></div>
+        <div class="event-viewport" id="cv-viewport"></div>
+      </div>
+      <button class="jump-latest" id="cv-jump">↓ Jump to latest (<span id="cv-unseen">0</span> unseen)</button>
+    </section>
+
+    <!-- ------------------------------------------------------ jsonl streams -->
+    <section class="page" data-page="streams">
+      <div class="toolbar">
+        <select id="st-stream"></select>
+        <button id="st-pause">Pause</button>
+        <input type="search" id="st-search" placeholder="search…" style="width:150px" />
+        <input type="text" id="st-type" placeholder="type filter" style="width:150px" />
+        <label class="inline"><input type="checkbox" id="st-raw" /> raw JSONL</label>
+        <button id="st-backfill">Backfill</button>
+        <button id="st-export">Export</button>
+        <button id="st-clear">Clear view</button>
+        <span class="spacer" style="flex:1"></span>
+        <span class="mono hint" id="st-counts"></span>
+      </div>
+      <div class="event-scroll" id="st-scroll">
+        <div class="event-spacer" id="st-spacer"></div>
+        <div class="event-viewport" id="st-viewport"></div>
+      </div>
+      <button class="jump-latest" id="st-jump">↓ Jump to latest (<span id="st-unseen">0</span> unseen)</button>
+    </section>
+
+    <!-- ------------------------------------------------------------ workers -->
+    <section class="page" data-page="workers">
+      <div class="toolbar">
+        <button class="primary" id="wk-refresh">Refresh</button>
+        <button id="wk-monitor">Run monitor cycle</button>
+        <span class="hint">Workers are reported overdue/unresponsive unless termination is independently confirmed.</span>
+      </div>
+      <div class="panel-body"><div id="wk-body"></div></div>
+    </section>
+
+    <!-- ------------------------------------------------------------- alerts -->
+    <section class="page" data-page="alerts">
+      <div class="toolbar"><button class="primary" id="al-refresh">Refresh</button></div>
+      <div class="panel-body"><div id="al-body"></div></div>
+    </section>
+
+    <!-- -------------------------------------------------- devices & routing -->
+    <section class="page" data-page="devices">
+      <div class="toolbar">
+        <button class="primary" id="dv-refresh">Refresh devices</button>
+        <button id="dv-start">Start listening</button>
+        <button id="dv-stop">Stop listening</button>
+        <button id="dv-inject">Inject test utterance</button>
+      </div>
+      <div class="panel-body">
+        <div id="dv-capture"></div>
+
+        <div class="panel">
+          <div class="panel-title">Enumerated devices — stable IDs, never numeric indexes</div>
+          <div class="filter-bar">
+            <span class="filter-label">Show</span>
+            <button class="toggle" id="dv-show-inputs" aria-pressed="true">Inputs</button>
+            <button class="toggle" id="dv-show-outputs" aria-pressed="true">Outputs</button>
+            <span class="toolbar-sep"></span>
+            <button class="toggle" id="dv-show-physical" aria-pressed="true">Physical</button>
+            <button class="toggle" id="dv-show-loopback" aria-pressed="true">Loopback</button>
+            <button class="toggle" id="dv-show-virtual" aria-pressed="false">Virtual</button>
+            <span class="toolbar-sep"></span>
+            <span class="filter-label">Hide</span>
+            <button class="toggle" id="dv-hide-unknown" aria-pressed="true">Unknown</button>
+            <button class="toggle" id="dv-hide-disabled" aria-pressed="true">Disabled</button>
+            <span class="toolbar-sep"></span>
+            <button class="toggle" id="dv-show-filtered" aria-pressed="false"
+                    title="Reveal the devices these filters are hiding, marked as filtered">Filtered</button>
+            <input type="search" id="dv-search" placeholder="filter by name, host API, id…" />
+            <span class="spacer" style="flex:1"></span>
+            <span class="mono hint" id="dv-counts"></span>
+          </div>
+          <div class="panel-content" id="dv-table"></div>
+        </div>
+
+        <div id="dv-engines"></div>
+        <div id="dv-defaults"></div>
+        <div id="dv-routing"></div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- voices -->
+    <section class="page" data-page="voices">
+      <div class="toolbar">
+        <button class="primary" id="vc-refresh">Refresh</button>
+        <select id="vc-policy">
+          <option value="unique_when_possible">unique_when_possible</option>
+          <option value="manual_only">manual_only</option>
+          <option value="role_based">role_based</option>
+          <option value="language_based">language_based</option>
+          <option value="round_robin">round_robin</option>
+          <option value="shared_default">shared_default</option>
+        </select>
+        <button id="vc-assign">Apply policy</button>
+      </div>
+      <div class="panel-body"><div id="vc-body"></div></div>
+    </section>
+
+    <!-- ----------------------------------------------------------- accuracy -->
+    <section class="page" data-page="accuracy">
+      <div class="toolbar">
+        <button class="primary" id="ac-refresh">Refresh</button>
+        <input type="text" id="ac-agent" placeholder="agent id" value="agent-1" style="width:120px" />
+        <input type="text" id="ac-text" placeholder="reference text to speak & measure" style="flex:1;min-width:200px" />
+        <button id="ac-measure">Measure</button>
+      </div>
+      <div class="panel-body"><div id="ac-body"></div></div>
+    </section>
+
+    <!-- ------------------------------------------------------------ cursors -->
+    <section class="page" data-page="cursors">
+      <div class="toolbar">
+        <button class="primary" id="cu-refresh">Refresh</button>
+        <span class="hint">Repositioning a cursor can replay or skip events — confirm carefully.</span>
+      </div>
+      <div class="panel-body"><div id="cu-body"></div></div>
+    </section>
+
+    <!-- ------------------------------------------------------------- prompt -->
+    <section class="page" data-page="prompt">
+      <div class="toolbar">
+        <button class="primary" id="pr-save">Save version</button>
+        <button id="pr-diff">Preview diff</button>
+        <button id="pr-reload">Reload</button>
+        <input type="text" id="pr-note" placeholder="change note" style="width:200px" />
+      </div>
+      <div class="panel-body">
+        <textarea id="pr-text" rows="16" style="width:100%"></textarea>
+        <div class="panel"><div class="panel-title">Diff</div><div class="panel-content" id="pr-diffbody"><span class="hint">No diff previewed.</span></div></div>
+        <div class="panel"><div class="panel-title">Version history</div><div class="panel-content" id="pr-history"></div></div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------ system & audit -->
+    <section class="page" data-page="system">
+      <div class="toolbar"><button class="primary" id="sy-refresh">Refresh</button></div>
+      <div class="panel-body"><div id="sy-body"></div></div>
+    </section>
+  </main>
+
+  <aside class="inspector" id="inspector">
+    <div class="tabs">
+      <div class="tab active" data-tab="event">Event</div>
+      <div class="tab" data-tab="raw">Raw JSON</div>
+      <div class="tab" data-tab="transcript">Transcript</div>
+      <div class="tab" data-tab="routing">Routing</div>
+      <div class="tab" data-tab="agent">Agent</div>
+      <div class="tab" data-tab="prompt">Prompt</div>
+      <div class="tab" data-tab="docs">Docs</div>
+      <div class="tab" data-tab="audit">Audit</div>
+    </div>
+    <div class="inspector-body">
+      <button id="insp-copy" style="margin-bottom:8px">Copy</button>
+      <pre id="insp-content">Select an event to inspect it.</pre>
+    </div>
+  </aside>
+
+  <footer class="statusbar">
+    <span id="sb-backend">backend —</span><span class="sep">|</span>
+    <span id="sb-state">state —</span><span class="sep">|</span>
+    <span id="sb-agents">agents 0</span><span class="sep">|</span>
+    <span id="sb-workers">workers 0</span><span class="sep">|</span>
+    <span id="sb-listen">listening off</span><span class="sep">|</span>
+    <span id="sb-tts">tts idle</span><span class="sep">|</span>
+    <span id="sb-clients">clients 0</span><span class="sep">|</span>
+    <span id="sb-transport">transport —</span><span class="sep">|</span>
+    <span id="sb-errors" class="err"></span>
+  </footer>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,56 @@
+{
+  "id": "ws_collab",
+  "label": "WS_COLLAB",
+  "description": "Coordination, audio, transcription, and administration infrastructure for Codex/Copilot workers over durable JSONL event streams with HTTP/HTTPS/WS/WSS parity.",
+  "version": "1.0.0",
+  "entrypoint": "plugin.py",
+  "scan": "startup",
+  "routePrefix": "/ws_collab"
+  "version": "1.0.0",
+  "entrypoint": "plugin.py",
+  "scan": "startup",
+  "requestTimeoutSeconds": 0,
+  "kind": "custom",
+  "install": {
+    "requires": [
+    ],
+    "install": "python -m pip install -e \"../ws_collab/[all]\""
+  },
+
+  "plugin-init": [
+      {
+        "command": "web_proxy",
+        "description": "Redirects /ws_collab to the Workspace Collab plugin.",
+        "redirect": "http://127.0.0.1:8802/ws_collab",
+        "path": "/ws_collab"
+      }
+  ],
+  "ui": {
+    "pages": [
+      {
+        "id": "configure",
+        "label": "Configure Workspace Collab",
+        "kind": "admin",
+        "descriptor": "/ws_collab/admin",
+        "glyph": "?",
+        "group": "PLUGINS"
+      },
+      {
+        "id": "audio",
+        "label": "Workspace Collab Audio",
+        "kind": "admin",
+        "descriptor": "/ws_collab/admin/#audio",
+        "glyph": "?",
+        "group": "PLUGINS"
+      },
+      {
+        "id": "monitor",
+        "label": "Workspace Collab Monitor",
+        "kind": "user",
+        "descriptor": "/monitor/ws_collab",
+        "glyph": "?",
+        "group": "PLUGINS"
+      }
+    ]
+  }
+}

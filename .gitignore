@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Packaging build output
+build/
+dist/
+
+# Runtime writable state (JSONL logs, standalone.log, session data)
+collab_state/
+
+# Virtualenvs
+.venv/
+venv/
+
+# TLS material generated for local development (never commit private keys)
+*.pem
+*.key
+*.crt
+
+# OS noise
+.DS_Store
+Thumbs.db

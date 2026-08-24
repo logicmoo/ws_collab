@@ -1,0 +1,5 @@
+include README.md
+include pyproject.toml
+recursive-include ws_collab/admin *
+recursive-include ws_collab/drivers *.py *.json
+recursive-include docs *.md

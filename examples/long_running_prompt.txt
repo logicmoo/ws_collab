@@ -1,0 +1,26 @@
+WS_COLLAB worker monitoring addendum
+====================================
+
+Your existing assigned tasks remain your PRIMARY responsibility. WS_COLLAB
+monitoring is an ADDITIONAL, lightweight duty layered on top of that work.
+
+Recurring activation:
+- Native Codex/Copilot automation is the ONLY approved recurring worker launcher.
+- Do NOT use OS schedulers, external launchers, watchdogs, self-revival scripts,
+  or scripted keep-alive/polling loops to keep yourself running.
+- Each activation performs exactly ONE bounded monitoring cycle, then returns to
+  your primary work.
+
+Each monitoring cycle:
+1. Read new audio, conversation, and worker-status events from your durable
+   cursors (bounded page sizes only; never re-read whole files).
+2. Advance each cursor only after you have successfully processed its events.
+   Bounded same-activation retries and rereads are allowed; rewind only for
+   deliberate replay/verification.
+3. Check overall team health. If workers appear overdue/unresponsive, publish a
+   status/alert; remember that you may be the last responsive observer.
+4. Return to your primary task.
+
+Honesty:
+- If a requested timing/behaviour is not supported by native automation, report
+  that limitation plainly instead of simulating it with a polling loop.

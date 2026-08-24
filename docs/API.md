@@ -1,0 +1,247 @@
+# WS_COLLAB API
+
+Everything below works over plain HTTP and over HTTPS. Every capability also has
+a WebSocket equivalent — nothing is WebSocket-only, and nothing is REST-only.
+
+* REST root: `/ws_collab`
+* Versioned resources: `/ws_collab/v1/...`
+* WebSocket: `/ws_collab/ws` (`ws://` or `wss://`)
+* Interactive OpenAPI: `/docs` (standalone server)
+
+## Authentication
+
+Send a bearer token:
+
+```bash
+curl -H "Authorization: Bearer $WS_COLLAB_ADMIN_TOKEN" \
+     http://127.0.0.1:8802/ws_collab/v1/capabilities
+```
+
+Or exchange a token for a cookie session (used by the admin page):
+
+```
+POST /ws_collab/v1/auth/login    {"token": "..."}   -> sets cookie, returns csrf
+POST /ws_collab/v1/auth/logout
+GET  /ws_collab/v1/auth/whoami
+```
+
+Cookie-authenticated mutations must send the CSRF token in
+`X-WS-Collab-CSRF`. Bearer-token clients do not need CSRF.
+
+### Roles
+
+`viewer` < `worker` < `operator` < `admin`. Reads need `viewer`; publishing and
+cursor commits need `worker`; configuration, cursor repositioning, prompt edits,
+and audio control need `operator`.
+
+## Errors
+
+Every failure — on both transports — uses the same envelope and codes:
+
+```json
+{"error": {"code": "cursor_invalid", "message": "...", "details": {"recovery": "..."}}}
+```
+
+| Code | HTTP |
+| --- | --- |
+| `validation_error` | 400 |
+| `authentication_required` | 401 |
+| `forbidden` | 403 |
+| `not_found` | 404 |
+| `conflict` / `cursor_invalid` | 409 |
+| `payload_too_large` | 413 |
+| `rate_limited` | 429 |
+
+## Reading events
+
+```http
+GET /ws_collab/v1/events?stream=conversation&after=<cursor>&limit=100
+```
+
+| Parameter | Meaning |
+| --- | --- |
+| `stream` | Stream name (resolve it from `capabilities.stream_roles`) |
+| `after` | Opaque cursor; omit to start at the beginning |
+| `limit` | 1–1000 |
+| `wait_ms` | 0–30000; block server-side until an event arrives |
+| `type`, `source_id`, `source_kind`, `correlation_id`, `since`, `until`, `q` | Filters |
+
+Response:
+
+```json
+{
+  "stream": "conversation",
+  "events": [ ... ],
+  "next_cursor": "opaque-token",
+  "has_more": false,
+  "server_time": "2026-01-01T00:00:00.000Z",
+  "malformed": 0
+}
+```
+
+`next_cursor` is also returned as an `ETag`. Sending it back as `If-None-Match`
+together with `after` yields `304 Not Modified` instead of an empty page.
+
+**REST clients never need a tight polling loop** — use `wait_ms`:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8802/ws_collab/v1/events?stream=conversation&after=$CURSOR&wait_ms=25000"
+```
+
+Bounded history without cursors: `GET /ws_collab/v1/streams/{stream}/tail?count=200`.
+
+## Writing events
+
+```bash
+curl -X POST http://127.0.0.1:8802/ws_collab/v1/conversation/events \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "cycle complete"}'
+```
+
+Returns the durable id, position, cursor, and duplicate status. Success is only
+reported after the event is durably accepted:
+
+```json
+{"id": "01M0...", "seq": 42, "cursor": "...", "duplicate": false, "server_time": "..."}
+```
+
+Replaying the same `Idempotency-Key` returns the original id with
+`"duplicate": true` and writes nothing.
+
+Generic form: `POST /ws_collab/v1/events` with `{"stream", "type", "data",
+"correlation_id", "idempotency_key"}`.
+
+## Endpoint reference
+
+### Discovery
+| Method | Path | Role |
+| --- | --- | --- |
+| GET | `/ws_collab/health` | public |
+| GET | `/ws_collab/v1/capabilities` | public |
+| GET | `/ws_collab/v1/config` | viewer |
+| GET | `/ws_collab/v1/diagnostics` | viewer |
+| GET | `/ws_collab/v1/audit` | operator |
+
+### Conversation and events
+| Method | Path | Role |
+| --- | --- | --- |
+| GET | `/ws_collab/v1/events` | viewer |
+| POST | `/ws_collab/v1/events` | worker |
+| GET | `/ws_collab/v1/streams/{stream}/tail` | viewer |
+| GET | `/ws_collab/v1/conversation` | viewer |
+| POST | `/ws_collab/v1/conversation/events` | worker |
+
+### Workers
+| Method | Path | Role |
+| --- | --- | --- |
+| POST | `/ws_collab/v1/workers/register` | worker |
+| POST | `/ws_collab/v1/workers/{id}/status` | worker |
+| GET | `/ws_collab/v1/workers` | viewer |
+| POST | `/ws_collab/v1/workers/monitor` | operator |
+| GET | `/ws_collab/v1/alerts` | viewer |
+
+### Audio
+| Method | Path | Role |
+| --- | --- | --- |
+| GET | `/ws_collab/v1/audio/capture` | viewer |
+| POST | `/ws_collab/v1/audio/capture/start` · `/stop` | operator |
+| POST | `/ws_collab/v1/audio/utterance` | operator |
+| GET | `/ws_collab/v1/audio/devices` | viewer |
+| POST | `/ws_collab/v1/audio/devices/refresh` | operator |
+| GET/POST | `/ws_collab/v1/audio/routing` | viewer / operator |
+
+### Transcription
+| Method | Path | Role |
+| --- | --- | --- |
+| GET | `/ws_collab/v1/stt/transcripts` | viewer |
+| POST | `/ws_collab/v1/stt/ingest` | worker |
+| GET | `/ws_collab/v1/transcripts` | viewer |
+
+`stt/ingest` is the bridge for an **external recognizer** (for example a desktop
+app's dictation engine). The transcript is recorded as a hypothesis and, when
+final, flows through the same disambiguation, classification, and timeline path
+as a local engine:
+
+```bash
+curl -X POST http://127.0.0.1:8802/ws_collab/v1/stt/ingest \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"engine": "external-asr", "text": "deploy the staging build", "confidence": 0.94}'
+```
+
+### Speech output
+| Method | Path | Role |
+| --- | --- | --- |
+| POST | `/ws_collab/v1/tts/speak` | worker |
+| GET | `/ws_collab/v1/tts` | viewer |
+| POST | `/ws_collab/v1/tts/cancel` | operator |
+| POST | `/ws_collab/v1/tts/measure` | operator |
+| GET | `/ws_collab/v1/tts/accuracy` | viewer |
+| GET | `/ws_collab/v1/voices` | viewer |
+| POST | `/ws_collab/v1/voices/{agent_id}` | operator |
+| POST | `/ws_collab/v1/voices/assign` | operator |
+
+### Cursors
+| Method | Path | Role |
+| --- | --- | --- |
+| GET | `/ws_collab/v1/cursors` | viewer |
+| GET | `/ws_collab/v1/cursors/{stream}/{consumer}` | viewer |
+| GET | `/ws_collab/v1/cursors/{stream}/{consumer}/history` | viewer |
+| POST | `/ws_collab/v1/cursors/{stream}/{consumer}/commit` | worker |
+| POST | `/ws_collab/v1/cursors/{stream}/{consumer}/reposition` | operator |
+| POST | `/ws_collab/v1/cursors/{stream}/{consumer}/reset` | operator |
+
+Repositioning backwards requires `"allow_replay": true`; forwards requires
+`"allow_skip": true`. Both are refused otherwise, and both are audited.
+
+### Prompt
+| Method | Path | Role |
+| --- | --- | --- |
+| GET | `/ws_collab/v1/prompt` · `/prompt/history` | viewer |
+| POST | `/ws_collab/v1/prompt` | operator |
+| POST | `/ws_collab/v1/prompt/preview-diff` | operator |
+| POST | `/ws_collab/v1/prompt/rollback` | operator |
+
+### Administration
+`GET /ws_collab/admin` — loopback-only unless `WS_COLLAB_ADMIN_REMOTE=1` (which
+requires TLS).
+
+## WebSocket protocol
+
+Connect to `/ws_collab/ws`, then authenticate before anything else.
+
+| Client frame | Purpose |
+| --- | --- |
+| `{"type":"auth","token":"..."}` | Authenticate; replies `auth_ok` with capabilities |
+| `{"type":"subscribe","streams":[...],"cursors":{...},"filters":{...}}` | Subscribe with catch-up from a cursor |
+| `{"type":"resume","streams":[...],"cursors":{...}}` | Resume from the last acknowledged cursor |
+| `{"type":"unsubscribe","streams":[...]}` | Stop receiving those streams |
+| `{"type":"publish","stream","event_type","data","idempotency_key","ack_id"}` | Publish; replies `ack` |
+| `{"type":"stt_ingest", ...}` | External transcript ingest; replies `ingest_result` |
+| `{"type":"cursor","action":"get\|commit\|reposition\|reset", ...}` | Cursor operations |
+| `{"type":"ping"}` | Liveness; replies `pong` |
+
+| Server frame | Meaning |
+| --- | --- |
+| `auth_ok` | Authenticated; includes capabilities |
+| `subscribed` / `unsubscribed` | Subscription state changed |
+| `event` | A durable event |
+| `caught_up` | Historical catch-up finished for a stream; includes its cursor |
+| `ack` | Durable acceptance of a publish |
+| `cursor_result` / `ingest_result` | Command results |
+| `ping` / `pong` | Liveness |
+| `error` | Same code and message a REST call would return |
+
+Catch-up and live delivery are gap-free and de-duplicated: the live subscription
+is active before history replays, and each stream position is delivered once.
+
+## Client modes
+
+`examples/clients/` contains all three required modes:
+
+* `rest_client.py` — REST only, cursor + long polling
+* `ws_client.py` — WebSocket preferred with automatic REST fallback that
+  preserves the cursor
+* `copilot_speech_bridge.py` — pushing an external recognizer's speech in

@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ws_collab"
+dynamic = ["version"]
+description = "Coordination, audio, transcription, and administration infrastructure for Codex/Copilot workers over durable JSONL event streams with HTTP/HTTPS/WS/WSS parity."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "WS_COLLAB maintainers" }]
+keywords = ["fastapi", "websocket", "stt", "tts", "coordination", "jsonl", "copilot"]
+# NOTE: set an explicit license (and a License classifier) before publishing to PyPI.
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: FastAPI",
+    "Operating System :: OS Independent",
+    "Topic :: Communications",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+# Core runtime: the multi-transport server itself. Everything hardware/model
+# specific is an optional extra so a base install stays light and portable.
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "starlette>=0.40",
+]
+
+[project.optional-dependencies]
+# Live microphone capture + voice-activity detection.
+audio = ["sounddevice>=0.4", "numpy>=1.24"]
+# Speech-to-text engines (each loads lazily; install only what you use).
+vosk = ["vosk>=0.3", "numpy>=1.24"]
+whisper = ["faster-whisper>=1.0", "numpy>=1.24"]
+nemo = ["nemo_toolkit[asr]>=1.20", "numpy>=1.24"]
+# Remote HTTP STT engine and the optional LLM disambiguation path.
+remote = ["httpx>=0.27"]
+# Windows SAPI voices / TTS (win32com + pythoncom).
+sapi = ["pywin32>=306 ; sys_platform == 'win32'"]
+# Encrypted secure-channel handshake (AES-256-GCM / HKDF).
+secure = ["cryptography>=42"]
+# Everything commonly used for a full local stack (excludes the heavy NeMo ASR
+# toolkit, which is available via the separate `nemo` extra).
+all = ["ws_collab[audio,vosk,whisper,remote,secure,sapi]"]
+# Test / development tooling. httpx powers fastapi's TestClient.
+dev = ["pytest>=8", "httpx>=0.27", "build>=1.2"]
+
+[project.scripts]
+ws-collab = "ws_collab.server:main"
+ws-collab-standalone = "ws_collab.standalone:main"
+
+[project.urls]
+Documentation = "https://example.invalid/ws_collab/docs"
+
+[tool.setuptools.dynamic]
+version = { attr = "ws_collab.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ws_collab*"]
+
+# The driver folders under ws_collab/drivers/{stt,tts}/* are intentionally NOT
+# Python packages (they carry no __init__.py) -- they are discovered at runtime
+# by path. Ship their driver.py/driver.json as package data of ws_collab.drivers,
+# and ship the admin SPA assets as package data of ws_collab.
+[tool.setuptools.package-data]
+"ws_collab" = ["admin/*"]
+"ws_collab.drivers" = [
+    "stt/*/driver.py",
+    "stt/*/driver.json",
+    "tts/*/driver.py",
+    "tts/*/driver.json",
+]
