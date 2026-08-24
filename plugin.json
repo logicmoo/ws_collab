@@ -5,16 +5,13 @@
   "version": "1.0.0",
   "entrypoint": "plugin.py",
   "scan": "startup",
-  "routePrefix": "/ws_collab"
-  "version": "1.0.0",
-  "entrypoint": "plugin.py",
-  "scan": "startup",
+  "routePrefix": "/ws_collab",
   "requestTimeoutSeconds": 0,
   "kind": "custom",
   "install": {
     "requires": [
     ],
-    "install": "python -m pip install -e \"../ws_collab/[all]\""
+    "install": "python -m pip install -e \"../ws_collab[all]\""
   },
 
   "plugin-init": [
