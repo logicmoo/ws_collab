@@ -443,7 +443,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     @router.get(f"{mount}/mailbox/mailbox-config")
     async def mailbox_config_get(request: Request, mailbox: str = Query(...)) -> dict[str, Any]:
         await _require(request, "viewer")
-        return {"mailbox": mailbox, "config": {}}
+        return {"mailbox": mailbox, "config": guarded(service.mailbox_config, mailbox)}
 
     @router.post(f"{mount}/mailbox/mailbox-config")
     async def mailbox_config_set(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:

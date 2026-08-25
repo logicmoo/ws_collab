@@ -1033,6 +1033,18 @@ class WsCollabService:
             mailboxes.append(self._virtual_descriptor(vname))
         return {"place": "ws_collab", "global_name": self._global_name, "mailboxes": mailboxes, "server_time": utc_now_iso()}
 
+    def mailbox_config(self, mailbox: str) -> dict[str, Any]:
+        """The server's descriptor/config for a single mailbox (its real
+        properties), or an empty object if the mailbox is unknown."""
+        name = str(mailbox or "").strip()
+        if not name:
+            return {}
+        if name in self._virtual:
+            return self._virtual_descriptor(name)
+        if name in STREAMS or name in self._dynamic_mailboxes:
+            return self._mailbox_descriptor(name)
+        return {}
+
     def _virtual_descriptor(self, name: str) -> dict[str, Any]:
         """Descriptor for an emulated read-only mailbox (projected server state)."""
         spec = self._virtual.get(name) or {}
