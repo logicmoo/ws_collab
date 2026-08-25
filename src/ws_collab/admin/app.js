@@ -122,6 +122,7 @@ function selectStream(stream) {
     n.classList.toggle("active", n.dataset.stream === stream));
   renderStreamMenu();
   showPage("streams");
+  if (state.streamMode === "tile") renderTiles();
   if (!TRANSCRIPT_STREAMS.length) TRANSCRIPT_STREAMS = STREAMS.slice(0, 1);
 }
 
@@ -199,6 +200,7 @@ function ingest(event) {
   const viewingThis = state.page === "streams" && sel && sel.value === stream;
   if (!viewingThis) stats.unread += 1;
   scheduleStreamMenuRender();
+  scheduleTilesRender(stream);
   Object.values(state.views).forEach((view) => view.onEvent(event));
   return true;
 }
@@ -457,6 +459,68 @@ function selectEvent(event, row) {
   document.querySelectorAll(".event-row.selected").forEach((n) => n.classList.remove("selected"));
   if (row) row.classList.add("selected");
   renderInspector();
+}
+
+/* -------------------------------------------------- tile / chat-bubble mode */
+/* An alternative to the dense list: each event is a chat bubble (like the
+ * workbench mailbox reader). Operator/agent messages align right, everything
+ * else left. Bounded to the most recent events for performance. */
+function bubbleFor(event) {
+  const data = event.data || {};
+  const summary = eventSummary(event);
+  const kind = event.source_kind || "system";
+  const wrap = el("div", `bubble-row bubble-${kind}`);
+  const bubble = el("div", "bubble");
+  if (state.selected && state.selected.id === event.id) bubble.classList.add("selected");
+  const head = el("div", "bubble-head");
+  head.append(
+    el("span", "bubble-src", event.source_id || kind),
+    el("span", "bubble-type", event.type),
+    el("span", "bubble-ts", shortTs(event.ts)),
+  );
+  bubble.appendChild(head);
+  const bodyText = summary.text || JSON.stringify(data);
+  bubble.appendChild(el("div", `bubble-body ${summary.cls || ""}`, bodyText));
+  if (summary.extra) bubble.appendChild(el("div", "bubble-meta", String(summary.extra)));
+  bubble.addEventListener("click", () => { selectEvent(event, null); renderTiles(); });
+  wrap.appendChild(bubble);
+  return wrap;
+}
+
+function renderTiles() {
+  const tiles = document.getElementById("st-tiles");
+  if (!tiles) return;
+  const stream = document.getElementById("st-stream").value;
+  const view = state.views && state.views.streams;
+  const all = state.buffers[stream] || [];
+  const filtered = view ? all.filter((e) => view.filter(e)) : all;
+  const shown = filtered.slice(-300);
+  const atBottom = tiles.scrollHeight - tiles.scrollTop - tiles.clientHeight < 60;
+  tiles.replaceChildren();
+  shown.forEach((e) => tiles.appendChild(bubbleFor(e)));
+  if (atBottom) tiles.scrollTop = tiles.scrollHeight;
+}
+
+function scheduleTilesRender(stream) {
+  if (state.streamMode !== "tile" || state.page !== "streams") return;
+  if (stream !== document.getElementById("st-stream").value) return;
+  if (state._tilesRaf) return;
+  state._tilesRaf = requestAnimationFrame(() => { state._tilesRaf = null; renderTiles(); });
+}
+
+function setStreamMode(mode) {
+  state.streamMode = mode;
+  const tile = mode === "tile";
+  const scroll = document.getElementById("st-scroll");
+  const tiles = document.getElementById("st-tiles");
+  const jump = document.getElementById("st-jump");
+  const btn = document.getElementById("st-mode");
+  if (scroll) scroll.style.display = tile ? "none" : "";
+  if (tiles) tiles.style.display = tile ? "" : "none";
+  if (jump && tile) jump.classList.remove("visible");
+  if (btn) btn.textContent = tile ? "List view" : "Tile view";
+  if (tile) renderTiles();
+  else if (state.views && state.views.streams) state.views.streams.draw();
 }
 
 /* ------------------------------------------------------- endpoint inspector */
@@ -1404,6 +1468,7 @@ function wireEvents() {
       document.querySelectorAll("#nav-streams-sub .nav-subitem").forEach((n) =>
         n.classList.toggle("active", n.dataset.stream === cur));
       renderStreamMenu();
+      if (state.streamMode === "tile") renderTiles();
     }));
   $("st-pause").onclick = () => {
     const view = state.views.streams;
@@ -1413,6 +1478,7 @@ function wireEvents() {
   $("st-backfill").onclick = () => backfill([$("st-stream").value], state.views.streams);
   $("st-export").onclick = () => exportView(state.views.streams, $("st-stream").value);
   $("st-clear").onclick = () => state.views.streams.clearView();
+  $("st-mode").onclick = () => setStreamMode(state.streamMode === "tile" ? "list" : "tile");
 
   // page actions
   $("wk-refresh").onclick = loadWorkers;

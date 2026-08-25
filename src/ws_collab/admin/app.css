@@ -461,6 +461,37 @@ tr:hover td { background: var(--bg-panel-raised); }
   font-size: 11.5px;
 }
 .event-spacer { width: 1px; }
+
+/* Tile / chat-bubble stream view (workbench mailbox style). */
+.event-tiles {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.bubble-row { display: flex; }
+.bubble-row.bubble-operator, .bubble-row.bubble-agent { justify-content: flex-end; }
+.bubble {
+  max-width: 78%;
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 7px 11px;
+  cursor: pointer;
+  transition: border-color var(--transition);
+}
+.bubble:hover { border-color: var(--border-strong); }
+.bubble.selected { border-color: var(--accent-purple); }
+.bubble-row.bubble-operator .bubble { border-color: var(--accent-teal); }
+.bubble-row.bubble-agent .bubble { background: #0d2f2e; }
+.bubble-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 3px; }
+.bubble-src { font-weight: 700; font-size: 11px; color: var(--text-primary); }
+.bubble-type { font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.bubble-ts { margin-left: auto; font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); }
+.bubble-body { font-size: 13px; color: var(--text-secondary); white-space: pre-wrap; word-break: break-word; line-height: 1.35; }
+.bubble-meta { font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); margin-top: 4px; }
 .event-viewport { position: absolute; top: 0; left: 0; right: 0; }
 
 .event-row {
