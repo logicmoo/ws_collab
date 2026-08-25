@@ -392,6 +392,16 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             stream=str(body.get("stream") or ""),
         )
 
+    @router.get(f"{mount}/mailbox/field-cache")
+    async def get_field_cache(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.get_field_cache_file)
+
+    @router.post(f"{mount}/mailbox/field-cache")
+    async def set_field_cache(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.set_field_cache_file, str(body.get("content") or ""))
+
     @router.post(f"{mount}/mailbox/send")
     async def mailbox_send(
         request: Request,

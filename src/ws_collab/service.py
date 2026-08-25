@@ -413,6 +413,42 @@ class WsCollabService:
         self._save_field_cache(force=True)
         return {"stream": stream or "*", "field": field, "cached_limit": lim}
 
+    def get_field_cache_file(self) -> dict[str, Any]:
+        """Raw contents of the field-cache config file, for a universal file editor."""
+        path = self._field_cache_path()
+        try:
+            content = path.read_text("utf-8")
+        except Exception:
+            content = "{}"
+        return {"path": str(path), "content": content}
+
+    def set_field_cache_file(self, content: str) -> dict[str, Any]:
+        """Overwrite the field-cache config file with edited JSON, then reload it."""
+        import json
+        import os
+
+        try:
+            parsed = json.loads(content)
+        except Exception as error:
+            raise ValidationError(f"invalid JSON: {error}")
+        if not isinstance(parsed, dict):
+            raise ValidationError("the field cache must be a JSON object")
+        path = self._field_cache_path()
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(parsed, indent=2), "utf-8")
+            os.replace(tmp, path)
+        except OSError as error:
+            raise ValidationError(f"could not write file: {error}")
+        # Reload into memory so the edit takes effect immediately.
+        self._field_cache.clear()
+        self._field_types.clear()
+        self._field_overrides_global.clear()
+        self._field_overrides_stream.clear()
+        self._load_field_cache()
+        self._field_cache_dirty = False
+        return {"ok": True, "path": str(path)}
+
     # ------------------------------------------------------------------ core io
     def publish(
         self,
