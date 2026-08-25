@@ -127,6 +127,16 @@ collisions.
 A chat client can also merge several mailboxes into one view on its side; the
 `merge:` virtual mailbox is the server-side equivalent, shareable across places.
 
+* **Runtime virtual mailboxes.** A client can also save a virtual mailbox on the
+  fly with `POST /mailbox/create` by passing a virtual `source` (`merge:…`,
+  `self:…`, a disk `…json`, or `http(s)://…`) instead of the default `jsonl`.
+  These are read-only, durable (persisted to `virtual_mailboxes.json` and
+  rehydrated on start), and deletable with `POST /mailbox/delete`; config entries
+  are re-applied on top and win on name clashes. This is what the chat's
+  "Save as stream" button does with a merge combo. A virtual descriptor also
+  reports `definition` (the raw source) and, for a merge, `members` (the merged
+  mailbox names).
+
 ## Agents (users)
 
 `GET /mailbox/agents` is the users/identity directory: the operator, registered

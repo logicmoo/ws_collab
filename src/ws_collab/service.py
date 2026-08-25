@@ -170,17 +170,19 @@ class WsCollabService:
         self._agents: dict[str, dict[str, Any]] = {}
         self._load_agent_registry()
 
-        # Config-declared virtual (emulated) read-only mailboxes: name -> spec.
-        # Each projects a source (a disk JSON file, or a self:/http endpoint) as
-        # a read-only mailbox. server-agents is just the default entry.
-        self._virtual: dict[str, dict[str, str]] = {
-            str(entry.get("mailbox")): {
-                "source": str(entry.get("source", "")),
-                "purpose": str(entry.get("purpose", "")),
-            }
-            for entry in (getattr(config, "virtual_mailboxes", None) or [])
-            if entry.get("mailbox") and entry.get("source")
-        }
+        # Virtual (emulated) read-only mailboxes: name -> spec. Each projects a
+        # source (a disk JSON file, a self:/http endpoint, or a merge: of other
+        # mailboxes) as a read-only mailbox. server-agents is the default entry.
+        # Runtime-created ones (e.g. a saved merge combo) are durable and marked
+        # runtime="1"; config entries are re-applied on top and win on clashes.
+        self._virtual: dict[str, dict[str, str]] = {}
+        self._load_virtual_registry()
+        for entry in (getattr(config, "virtual_mailboxes", None) or []):
+            if entry.get("mailbox") and entry.get("source"):
+                self._virtual[str(entry.get("mailbox"))] = {
+                    "source": str(entry.get("source", "")),
+                    "purpose": str(entry.get("purpose", "")),
+                }
         # Global namespace prefix for this server's mailboxes (federation).
         self._global_name = str(getattr(config, "global_name", "") or "").strip()
 
@@ -390,6 +392,43 @@ class WsCollabService:
         except OSError:
             pass
 
+    # ------------------------------------------ virtual mailbox registry (durable)
+    def _virtual_registry_path(self) -> Path:
+        return Path(self.store.directory) / "virtual_mailboxes.json"
+
+    def _load_virtual_registry(self) -> None:
+        """Rehydrate runtime-created virtual mailboxes (e.g. saved merge combos)."""
+        import json
+
+        try:
+            raw = json.loads(self._virtual_registry_path().read_text("utf-8"))
+        except Exception:
+            return
+        if not isinstance(raw, dict):
+            return
+        for name, spec in raw.items():
+            if not isinstance(name, str) or name in STREAMS or not isinstance(spec, dict):
+                continue
+            if not spec.get("source"):
+                continue
+            entry = {str(k): str(v) for k, v in spec.items()}
+            entry["runtime"] = "1"
+            self._virtual[name] = entry
+
+    def _save_virtual_registry(self) -> None:
+        """Persist only runtime-created virtual mailboxes; config ones stay in config."""
+        import json
+        import os
+
+        runtime = {n: s for n, s in self._virtual.items() if s.get("runtime") == "1"}
+        path = self._virtual_registry_path()
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(runtime, indent=2), "utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
     def _known_mailbox(self, name: str) -> bool:
         return name in STREAMS or name in self._dynamic_mailboxes or name in self._virtual
 
@@ -581,6 +620,16 @@ class WsCollabService:
                 count = len(self.mailbox_agents().get("agents", []))
             except Exception:
                 count = 0
+        elif source.startswith("merge:"):
+            try:
+                count = len(self.mailbox_messages(name, limit=2000).get("messages", []))
+            except Exception:
+                count = 0
+        members = (
+            [n.strip() for n in source[len("merge:"):].split(",") if n.strip()]
+            if source.startswith("merge:")
+            else []
+        )
         return {
             "id": name,
             "name": name,
@@ -588,6 +637,8 @@ class WsCollabService:
             "purpose": spec.get("purpose", ""),
             "kind": "merge" if source.startswith("merge:") else "registry",
             "source": "virtual",
+            "definition": source,
+            "members": members,
             "transports": ["jsonl"],
             "hidden": False,
             "writable": False,
@@ -617,6 +668,27 @@ class WsCollabService:
             )
         if name in STREAMS:
             raise ConflictError(f"{name!r} is a built-in mailbox")
+        source = str(source or "jsonl").strip()
+        # A virtual source (merge:/self:/disk:/http) makes a read-only projected
+        # mailbox rather than a hosted JSONL stream — this is what "save this
+        # merge combo as a stream" produces. It is durable across restarts.
+        if source.startswith(("merge:", "self:", "disk:", "http://", "https://")):
+            if name in self._dynamic_mailboxes:
+                raise ConflictError(f"{name!r} already exists as a hosted mailbox")
+            if name in self._virtual:
+                return {"created": False, "mailbox": self._virtual_descriptor(name)}
+            spec: dict[str, str] = {
+                "source": source,
+                "purpose": str(purpose or ""),
+                "runtime": "1",
+                "created_by": str(created_by or "operator"),
+                "created_at": utc_now_iso(),
+            }
+            if global_name:
+                spec["global_name"] = str(global_name)
+            self._virtual[name] = spec
+            self._save_virtual_registry()
+            return {"created": True, "mailbox": self._virtual_descriptor(name)}
         if name in self._dynamic_mailboxes:
             return {"created": False, "mailbox": self._mailbox_descriptor(name)}
         self._dynamic_mailboxes[name] = {
@@ -624,7 +696,7 @@ class WsCollabService:
             "hidden": bool(hidden),
             "writable": bool(writable),
             "global_name": str(global_name or ""),
-            "source": str(source or "jsonl"),
+            "source": source,
             "created_at": utc_now_iso(),
             "created_by": str(created_by or "operator"),
         }
@@ -639,6 +711,12 @@ class WsCollabService:
         name = str(name or "").strip()
         if name in STREAMS:
             raise ConflictError(f"cannot delete built-in mailbox {name!r}")
+        if name in self._virtual:
+            if self._virtual[name].get("runtime") == "1":
+                self._virtual.pop(name, None)
+                self._save_virtual_registry()
+                return {"id": name, "deleted": True}
+            raise ConflictError(f"cannot delete config-declared virtual mailbox {name!r}")
         existed = name in self._dynamic_mailboxes
         if existed:
             self._dynamic_mailboxes.pop(name, None)
