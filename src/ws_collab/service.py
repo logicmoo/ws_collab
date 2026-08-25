@@ -411,7 +411,13 @@ class WsCollabService:
                 continue
             if not spec.get("source"):
                 continue
-            entry = {str(k): str(v) for k, v in spec.items()}
+            entry: dict[str, Any] = {}
+            for k, v in spec.items():
+                key = str(k)
+                if key == "rules" and isinstance(v, list):
+                    entry[key] = [r for r in v if isinstance(r, dict)]
+                else:
+                    entry[key] = v if isinstance(v, (str, int, float, bool)) else str(v)
             entry["runtime"] = "1"
             self._virtual[name] = entry
 
@@ -625,11 +631,10 @@ class WsCollabService:
                 count = len(self.mailbox_messages(name, limit=2000).get("messages", []))
             except Exception:
                 count = 0
-        members = (
-            [n.strip() for n in source[len("merge:"):].split(",") if n.strip()]
-            if source.startswith("merge:")
-            else []
-        )
+        members = []
+        if source.startswith("merge:"):
+            target = source[len("merge:"):].strip()
+            members = ["*"] if target in ("*", "all") else [n.strip() for n in target.split(",") if n.strip()]
         return {
             "id": name,
             "name": name,
@@ -639,6 +644,8 @@ class WsCollabService:
             "source": "virtual",
             "definition": source,
             "members": members,
+            "rules": spec.get("rules") or [],
+            "policy": spec.get("policy") or "relay",
             "transports": ["jsonl"],
             "hidden": False,
             "writable": False,
@@ -656,10 +663,16 @@ class WsCollabService:
         writable: bool = True,
         global_name: str = "",
         source: str = "jsonl",
+        rules: Any = None,
+        policy: str = "",
         created_by: str = "operator",
     ) -> dict[str, Any]:
         """Begin hosting a new client-created mailbox (a durable JSONL stream).
-        Idempotent: recreating an existing dynamic mailbox returns it unchanged."""
+        Idempotent: recreating an existing dynamic mailbox returns it unchanged.
+
+        A virtual ``source`` (merge:/self:/disk:/http) creates a read-only projected
+        stream instead; ``merge:*`` merges every real stream. ``rules``/``policy``
+        add firewall-style RELAY/DROP filtering over the projected messages."""
         name = str(name or "").strip()
         if not self._MAILBOX_NAME_RE.match(name):
             raise ValidationError(
@@ -677,7 +690,7 @@ class WsCollabService:
                 raise ConflictError(f"{name!r} already exists as a hosted mailbox")
             if name in self._virtual:
                 return {"created": False, "mailbox": self._virtual_descriptor(name)}
-            spec: dict[str, str] = {
+            spec: dict[str, Any] = {
                 "source": source,
                 "purpose": str(purpose or ""),
                 "runtime": "1",
@@ -686,6 +699,10 @@ class WsCollabService:
             }
             if global_name:
                 spec["global_name"] = str(global_name)
+            if isinstance(rules, list) and rules:
+                spec["rules"] = [r for r in rules if isinstance(r, dict)]
+            if policy:
+                spec["policy"] = str(policy)
             self._virtual[name] = spec
             self._save_virtual_registry()
             return {"created": True, "mailbox": self._virtual_descriptor(name)}
@@ -754,6 +771,67 @@ class WsCollabService:
             pass
         return {"agents": [entry for entry in directory.values() if entry.get("id")]}
 
+    def _apply_filter_rules(
+        self, messages: list[dict[str, Any]], rules: Any, policy: Any = None
+    ) -> list[dict[str, Any]]:
+        """Firewall-style, first-match RELAY/DROP filtering for a virtual stream.
+
+        ``rules`` is an ordered list of ``{field, op, value, action}``. The first
+        rule that matches a message decides its fate; if none match, the default
+        ``policy`` applies (``relay`` unless set to ``drop``). Fields:
+        ``any|type|text|from|to|send_to|source_id|source_kind|mailbox``. Ops:
+        ``contains|equals|prefix|regex|present`` (case-insensitive). Actions and
+        the policy accept synonyms: relay/accept/allow/pass vs drop/reject/deny.
+        """
+        import json as _json
+        import re as _re
+
+        rule_list = [r for r in rules if isinstance(r, dict)] if isinstance(rules, list) else []
+        if not rule_list:
+            return messages
+        drop_words = {"drop", "reject", "deny", "block"}
+        default_relay = str(policy or "relay").strip().lower() not in drop_words
+
+        def field_value(m: dict[str, Any], field: str) -> str:
+            field = (field or "any").strip().lower()
+            if field in ("any", "*", ""):
+                raw = m.get("raw")
+                base = " ".join(
+                    str(m.get(k, "") or "")
+                    for k in ("type", "text", "from", "to", "send_to", "source_id", "source_kind", "mailboxName", "mailboxId")
+                )
+                return base + (" " + _json.dumps(raw, default=str) if raw is not None else "")
+            alias = {"mailbox": "mailboxName", "stream": "mailboxName", "sender": "from"}.get(field, field)
+            return str(m.get(alias, "") or "")
+
+        def matches(m: dict[str, Any], rule: dict[str, Any]) -> bool:
+            op = str(rule.get("op", "contains")).strip().lower()
+            val = str(rule.get("value", ""))
+            hay = field_value(m, str(rule.get("field", "any")))
+            if op == "present":
+                return hay.strip() != ""
+            if op == "equals":
+                return hay.lower() == val.lower()
+            if op == "prefix":
+                return hay.lower().startswith(val.lower())
+            if op == "regex":
+                try:
+                    return _re.search(val, hay, _re.IGNORECASE) is not None
+                except _re.error:
+                    return False
+            return val.lower() in hay.lower()
+
+        out: list[dict[str, Any]] = []
+        for m in messages:
+            relay = default_relay
+            for rule in rule_list:
+                if matches(m, rule):
+                    relay = str(rule.get("action", "relay")).strip().lower() not in drop_words
+                    break
+            if relay:
+                out.append(m)
+        return out
+
     def mailbox_messages(
         self,
         mailbox: str,
@@ -765,6 +843,7 @@ class WsCollabService:
         do_filter: bool = False,
         limit: int = 300,
         filters: dict[str, Any] | None = None,
+        _chain: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         """Messages in a mailbox = events in that stream (newest last).
 
@@ -774,17 +853,42 @@ class WsCollabService:
         the routed mailbox (null == this mailbox) and ``text`` a case-insensitive
         substring."""
         if mailbox in self._virtual:
-            source = str(self._virtual[mailbox].get("source", ""))
+            # Loop prevention: a virtual stream already being resolved higher in the
+            # chain reads as empty (breaks virtual→virtual cycles at the call level).
+            if mailbox in _chain:
+                return {"messages": [], "user": sender or "", "peer": mailbox}
+            child_chain = _chain | {mailbox}
+            spec = self._virtual[mailbox]
+            source = str(spec.get("source", ""))
             if source.startswith("merge:"):
-                subs = [n.strip() for n in source[len("merge:"):].split(",") if n.strip() and n.strip() != mailbox]
+                target = source[len("merge:"):].strip()
+                if target in ("*", "all"):
+                    # "all streams" = the real streams only (built-in + dynamic),
+                    # never other virtuals, so * stays a flat fan-in.
+                    subs = [s for s in STREAMS]
+                    subs += [m for m, meta in self._dynamic_mailboxes.items() if not (isinstance(meta, dict) and meta.get("hidden"))]
+                else:
+                    subs = [n.strip() for n in target.split(",") if n.strip()]
                 merged: list[dict[str, Any]] = []
                 for sub in subs:
-                    merged.extend(self.mailbox_messages(sub, limit=limit).get("messages", []))
+                    if sub == mailbox or sub in child_chain:
+                        continue  # skip self and any stream already in the relay chain
+                    merged.extend(self.mailbox_messages(sub, limit=limit, _chain=child_chain).get("messages", []))
                 merged.sort(key=lambda m: str(m.get("timestamp") or ""))
                 messages = merged[-max(1, min(limit, 2000)):]
             else:
                 records = self._resolve_virtual_records(mailbox)
                 messages = [self._virtual_message(mailbox, record) for record in records]
+            messages = self._apply_filter_rules(messages, spec.get("rules"), spec.get("policy"))
+            # Stamp provenance and drop anything this stream already forwarded
+            # (message-level loop prevention across diamond/merge topologies).
+            relayed: list[dict[str, Any]] = []
+            for m in messages:
+                fwd = list(m.get("forwarded_by") or [])
+                if mailbox in fwd:
+                    continue
+                relayed.append({**m, "forwarded_by": [*fwd, mailbox]})
+            messages = relayed
             if do_filter and text:
                 needle = text.lower()
                 messages = [m for m in messages if needle in (m.get("text") or "").lower()]
