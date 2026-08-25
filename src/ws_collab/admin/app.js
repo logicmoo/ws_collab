@@ -21,7 +21,11 @@ const BASE = (() => {
   if (match) return match[1];
   return "/ws_collab";
 })();
-const V1 = BASE + "/v1";
+/* The API answers at /, /v1, /ws_collab, and /ws_collab/v1, and the admin page
+ * is served beneath each of them. When the page is already inside a versioned
+ * mount the prefix ends with /v1, so appending it again would ask for the
+ * nonexistent /v1/v1. */
+const V1 = /\/v1$/.test(BASE) ? BASE : BASE + "/v1";
 const ROW_H = 22;
 const MAX_BUFFER = 5000;
 
@@ -1326,6 +1330,9 @@ async function refreshStatusBar() {
     $("sb-state").textContent = `state ${state.config ? state.config.state_dir : "—"}`;
     $("sb-agents").textContent = `agents ${(state.config && state.config.agents ? state.config.agents.length : 0)}`;
     $("sb-workers").textContent = `workers ${diag.workers}`;
+    // Keep the Workers nav badge live from any page, so an agent that joins
+    // (registers/among the fleet) is visible without opening the Workers page.
+    if ($("badge-workers")) $("badge-workers").textContent = diag.workers;
     $("sb-listen").textContent = capture.listening ? `listening ${capture.device_id}` : "listening off";
     $("sb-tts").textContent = diag.tts.is_speaking ? `tts speaking (${diag.tts.queue.length} queued)` : `tts idle (${diag.tts.queue.length} queued)`;
     $("sb-clients").textContent = `clients ${diag.broker.subscriptions}`;
