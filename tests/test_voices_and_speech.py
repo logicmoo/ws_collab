@@ -112,6 +112,26 @@ def test_running_out_of_unique_voices_warns_instead_of_failing(voices) -> None:
     assert result["warnings"], "sharing a voice must be reported, not silent"
 
 
+def test_out_of_unique_voices_varies_pitch_and_speed(voices) -> None:
+    """Once base voices run out, each agent still sounds distinct: the policy
+    reuses a base voice with a distinct (rate, pitch) variation."""
+
+    count = len(voices.list_voices())
+    agents = [{"agent_id": f"a{i}"} for i in range(count + 3)]
+    result = voices.auto_assign(agents, "unique_when_possible")
+    assert result["warnings"], "using a varied voice must be reported"
+
+    combos = set()
+    for agent in agents:
+        profile = voices.get_profile(agent["agent_id"])
+        assert profile is not None
+        combos.add((profile.voice_id, round(profile.rate, 3), round(profile.pitch, 3)))
+    # No two agents share the same (voice, rate, pitch) -- all sound different.
+    assert len(combos) == len(agents), "each agent must get a distinct-sounding voice"
+    # At least the overflow agents use a non-default variation (a synthesized voice).
+    assert any(rate != 1.0 or pitch != 0.0 for _voice, rate, pitch in combos)
+
+
 def test_unknown_policy_is_rejected(voices) -> None:
     with pytest.raises(ValidationError):
         voices.auto_assign([{"agent_id": "a1"}], "telepathy")

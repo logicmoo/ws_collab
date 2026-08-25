@@ -42,6 +42,7 @@ class TtsItem:
     voice_id: str = field(default="fake:aria", compare=False)
     requested_voice_id: str = field(default="", compare=False)
     rate: float = field(default=1.0, compare=False)
+    pitch: float = field(default=0.0, compare=False)
     volume: float = field(default=1.0, compare=False)
     device: str = field(default="default", compare=False)
     correlation_id: str | None = field(default=None, compare=False)
@@ -60,6 +61,8 @@ class TtsItem:
             "voice_id": self.voice_id,
             "requested_voice_id": self.requested_voice_id,
             "priority": self.priority,
+            "rate": self.rate,
+            "pitch": self.pitch,
             "device": self.device,
             "correlation_id": self.correlation_id,
             "cancelled": self.cancelled,
@@ -150,6 +153,7 @@ class TtsEngine:
         voice_id: str,
         requested_voice_id: str = "",
         rate: float = 1.0,
+        pitch: float = 0.0,
         volume: float = 1.0,
         device: str = "default",
         priority: int = 5,
@@ -177,6 +181,7 @@ class TtsEngine:
                 voice_id=voice_id,
                 requested_voice_id=requested_voice_id or voice_id,
                 rate=rate,
+                pitch=pitch,
                 volume=volume,
                 device=device,
                 correlation_id=correlation_id,

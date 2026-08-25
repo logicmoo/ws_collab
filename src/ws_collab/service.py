@@ -522,6 +522,7 @@ class WsCollabService:
             voice_id=resolution["voice_id"],
             requested_voice_id=resolution["requested_voice_id"],
             rate=profile.rate if profile else 1.0,
+            pitch=profile.pitch if profile else 0.0,
             volume=profile.volume if profile else 1.0,
             device=profile.output_device if profile else "default",
             priority=effective_priority,

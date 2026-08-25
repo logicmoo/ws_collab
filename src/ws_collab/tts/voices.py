@@ -30,6 +30,22 @@ VOICE_POLICIES = {
 
 FALLBACK_POLICIES = {"fail", "agent_fallback", "role_default", "system_default", "operator_approval"}
 
+# Perceptually distinct (rate, pitch) pairs. Once the unique-voice policy runs
+# out of distinct base voices it reuses a base voice with one of these variations
+# so each agent still sounds different -- a synthesized "new" voice. ``rate`` is a
+# speed multiplier; ``pitch`` is an offset the backend clamps to its own range.
+VOICE_VARIATIONS: list[tuple[float, float]] = [
+    (1.0, 0.0),
+    (1.0, 4.0),
+    (1.0, -4.0),
+    (1.15, 2.0),
+    (0.9, -2.0),
+    (1.1, -4.0),
+    (0.92, 4.0),
+    (1.2, 0.0),
+    (0.85, 0.0),
+]
+
 
 @dataclass
 class Voice:
@@ -279,43 +295,54 @@ class VoiceManager:
             if policy == "manual_only":
                 return {"policy": policy, "assignments": {}, "warnings": ["manual_only: no automatic assignment"]}
 
-            used: set[str] = set()
+            used: set[tuple[str, float, float]] = set()
             for index, agent in enumerate(agents):
                 agent_id = agent["agent_id"] if isinstance(agent, dict) else str(agent)
                 chosen = self._choose_voice(policy, agent, index, voices, used, warnings)
                 if chosen is None:
                     warnings.append(f"no voice available for {agent_id}")
                     continue
-                used.add(chosen.id)
-                assignments[agent_id] = chosen.id
-                self.set_profile(agent_id, {"voice_id": chosen.id, "engine": chosen.provider, "language": chosen.language})
+                voice, rate, pitch = chosen
+                used.add((voice.id, round(rate, 3), round(pitch, 3)))
+                assignments[agent_id] = voice.id
+                self.set_profile(agent_id, {
+                    "voice_id": voice.id, "engine": voice.provider, "language": voice.language,
+                    "rate": rate, "pitch": pitch,
+                })
             return {"policy": policy, "assignments": assignments, "warnings": warnings}
 
-    def _choose_voice(self, policy, agent, index, voices, used, warnings) -> Voice | None:
+    def _choose_voice(self, policy, agent, index, voices, used, warnings) -> tuple[Voice, float, float] | None:
         if not voices:
             return None
         agent_language = (agent.get("language") if isinstance(agent, dict) else "") or "en"
         role = (agent.get("role") if isinstance(agent, dict) else "") or ""
         if policy == "shared_default":
-            return voices[0]
+            return (voices[0], 1.0, 0.0)
         if policy == "round_robin":
             voice = voices[(self._round_robin_index) % len(voices)]
             self._round_robin_index += 1
-            return voice
+            return (voice, 1.0, 0.0)
         if policy == "language_based":
             matches = [v for v in voices if v.language.lower().startswith(agent_language.lower()[:2])]
-            return matches[0] if matches else voices[index % len(voices)]
+            return (matches[0] if matches else voices[index % len(voices)], 1.0, 0.0)
         if policy == "role_based":
-            if role:
-                pick = voices[hash(role) % len(voices)]
-                return pick
-            return voices[index % len(voices)]
-        # unique_when_possible (default): prefer an unused voice.
-        for voice in voices:
-            if voice.id not in used:
-                return voice
-        warnings.append("ran out of unique voices; sharing a voice (intentional collision)")
-        return voices[index % len(voices)]
+            pick = voices[hash(role) % len(voices)] if role else voices[index % len(voices)]
+            return (pick, 1.0, 0.0)
+        # unique_when_possible (default): hand out every distinct base voice
+        # first; once those run out keep agents distinct by reusing a base voice
+        # with an unused (rate, pitch) variation -- a synthesized "new" voice.
+        for rate, pitch in VOICE_VARIATIONS:
+            for voice in voices:
+                key = (voice.id, round(rate, 3), round(pitch, 3))
+                if key not in used:
+                    if (rate, pitch) != (1.0, 0.0):
+                        warnings.append(
+                            f"out of unique voices; using {voice.id} with a distinct "
+                            f"variation (rate {rate:g}, pitch {pitch:+g}) so it sounds like a new voice"
+                        )
+                    return (voice, rate, pitch)
+        warnings.append("ran out of unique voice variations; sharing a voice (intentional collision)")
+        return (voices[index % len(voices)], 1.0, 0.0)
 
     # --------------------------------------------------------------- resolution
     def resolve_for_speak(self, agent_id: str) -> dict[str, Any]:
