@@ -29,7 +29,7 @@ All paths below are under the REST mount `/ws_collab/v1` (also mounted at
 | GET·POST | `/mailbox/mailbox-config` | viewer·operator | Read / set a per-mailbox config object |
 | GET·POST·DELETE | `/mailbox/cursor` | viewer·operator | Inspect / move / clear an agent's cursor |
 | POST | `/mailbox/subscription` | operator | Set / clear an agent's subscription intent |
-| POST | `/mailbox/agents` | worker | Register / echo an agent id |
+| POST | `/mailbox/agents` | worker | Create/update an agent (user) with arbitrary properties `{id, properties}` |
 | POST | `/mailbox/entity` | operator | Edit an agent / mailbox registry object |
 
 ### Resource × method matrix
@@ -64,6 +64,7 @@ All paths below are under the REST mount `/ws_collab/v1` (also mounted at
   "source": "jsonl",
   "transports": ["jsonl", "ws"],
   "hidden": false,
+  "writable": true,
   "messages": 16,
   "filename": "conversation.jsonl",
   "endpoints": {
@@ -93,6 +94,28 @@ The directory response is `{ "place": "ws_collab", "mailboxes": [...], "server_t
 `send_to: null` means the message's own mailbox. On send, the destination topic
 is the first mailbox name among `send_to`, then `to`, else `conversation`; a
 distinct recipient is kept in `data.to`.
+
+## Writable and virtual mailboxes
+
+* Each mailbox declares `writable`. Built-in streams and dynamic mailboxes are
+  writable by default; a dynamic mailbox may be created read-only with
+  `writable: false`. Posting (`send`) or editing (`record`) a non-writable
+  mailbox is refused (a `send` simply falls back to `conversation`).
+* A server may **emulate** read-only mailboxes that project internal state as a
+  JSONL stream instead of a durable file. ws_collab exposes `server-agents`
+  (`source: "virtual"`, `writable: false`): reading it returns the agents/users
+  directory, one agent per message. Its `raw` field is the full agent record.
+
+## Agents (users)
+
+`GET /mailbox/agents` is the users/identity directory: the operator, registered
+workers, agents in the durable registry, and any distinct `source_id`s seen in
+the conversation. Each entry carries arbitrary properties (e.g. `display_name`,
+`color`, `role`, `voice`), and the server hosts a per-agent cursor per mailbox.
+
+`POST /mailbox/agents {id, properties}` creates/updates an agent's arbitrary
+properties (persisted in `agents.json`). The same directory is also readable as
+the emulated `server-agents` mailbox.
 
 ## Dynamic and hidden mailboxes
 

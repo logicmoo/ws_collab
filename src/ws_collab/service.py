@@ -166,6 +166,10 @@ class WsCollabService:
         self._dynamic_mailboxes: dict[str, dict[str, Any]] = {}
         self._load_mailbox_registry()
 
+        # Agent (user) registry: arbitrary per-identity properties, durable.
+        self._agents: dict[str, dict[str, Any]] = {}
+        self._load_agent_registry()
+
     # ------------------------------------------------------------------ core io
     def publish(
         self,
@@ -372,8 +376,81 @@ class WsCollabService:
         except OSError:
             pass
 
+    # Read-only "virtual" mailboxes the server emulates by projecting internal
+    # state as a JSONL stream (e.g. the agents/users directory).
+    VIRTUAL_MAILBOXES = {"server-agents": "Agents/users directory, emulated as a read-only stream."}
+
     def _known_mailbox(self, name: str) -> bool:
-        return name in STREAMS or name in self._dynamic_mailboxes
+        return name in STREAMS or name in self._dynamic_mailboxes or name in self.VIRTUAL_MAILBOXES
+
+    def _writable_mailbox(self, name: str) -> bool:
+        if name in self.VIRTUAL_MAILBOXES:
+            return False
+        if name in self._dynamic_mailboxes:
+            return self._dynamic_mailboxes[name].get("writable", True) is not False
+        return name in STREAMS
+
+    # -------------------------------------------------- agent (user) registry
+    def _agent_registry_path(self) -> Path:
+        return Path(self.store.directory) / "agents.json"
+
+    def _load_agent_registry(self) -> None:
+        import json
+
+        try:
+            raw = json.loads(self._agent_registry_path().read_text("utf-8"))
+        except Exception:
+            return
+        if isinstance(raw, dict):
+            for name, props in raw.items():
+                if isinstance(name, str):
+                    self._agents[name] = props if isinstance(props, dict) else {}
+
+    def _save_agent_registry(self) -> None:
+        import json
+        import os
+
+        path = self._agent_registry_path()
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(self._agents, indent=2), "utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def set_agent(self, agent_id: str, properties: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Create or update an agent (user) with arbitrary properties."""
+        agent_id = str(agent_id or "").strip()
+        if not agent_id:
+            raise ValidationError("agent id is required")
+        record = dict(self._agents.get(agent_id) or {})
+        if isinstance(properties, dict):
+            record.update(properties)
+        record.setdefault("created_at", utc_now_iso())
+        record["updated_at"] = utc_now_iso()
+        self._agents[agent_id] = record
+        self._save_agent_registry()
+        return {"id": agent_id, "properties": record}
+
+    @staticmethod
+    def _agent_as_message(agent: dict[str, Any]) -> dict[str, Any]:
+        """Project one agent (user) as a message record for the emulated
+        `server-agents` mailbox."""
+        agent_id = str(agent.get("id") or "")
+        return {
+            "id": f"agent:{agent_id}",
+            "timestamp": agent.get("updated_at") or agent.get("created_at"),
+            "from": "server",
+            "to": agent_id,
+            "send_to": "server-agents",
+            "text": agent_id,
+            "type": "AGENT",
+            "mailboxId": "server-agents",
+            "author": "server",
+            "authorName": "server",
+            "mailboxName": "server-agents",
+            "raw": agent,
+        }
 
     _MAILBOX_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -391,6 +468,7 @@ class WsCollabService:
             "source": dyn.get("source") or "jsonl",
             "transports": ["jsonl", "ws"],
             "hidden": bool(dyn.get("hidden", False)),
+            "writable": self._writable_mailbox(name),
             "messages": int((stats.get(name) or {}).get("seq") or 0),
             "filename": STREAMS.get(name) or f"{name}.jsonl",
             "endpoints": {
@@ -413,7 +491,26 @@ class WsCollabService:
             for name in names
             if not self._dynamic_mailboxes.get(name, {}).get("hidden")
         ]
+        for vname, vpurpose in self.VIRTUAL_MAILBOXES.items():
+            mailboxes.append(self._virtual_descriptor(vname, vpurpose))
         return {"place": "ws_collab", "mailboxes": mailboxes, "server_time": utc_now_iso()}
+
+    def _virtual_descriptor(self, name: str, purpose: str) -> dict[str, Any]:
+        """Descriptor for an emulated read-only mailbox (projected server state)."""
+        count = len(self.mailbox_agents().get("agents", [])) if name == "server-agents" else 0
+        return {
+            "id": name,
+            "name": name,
+            "purpose": purpose,
+            "kind": "registry",
+            "source": "virtual",
+            "transports": ["jsonl"],
+            "hidden": False,
+            "writable": False,
+            "messages": count,
+            "filename": None,
+            "endpoints": {"read": f"/ws_collab/v1/mailbox/messages?mailbox={name}"},
+        }
 
     def create_mailbox(
         self,
@@ -421,6 +518,7 @@ class WsCollabService:
         *,
         purpose: str = "",
         hidden: bool = False,
+        writable: bool = True,
         source: str = "jsonl",
         created_by: str = "operator",
     ) -> dict[str, Any]:
@@ -439,6 +537,7 @@ class WsCollabService:
         self._dynamic_mailboxes[name] = {
             "purpose": str(purpose or ""),
             "hidden": bool(hidden),
+            "writable": bool(writable),
             "source": str(source or "jsonl"),
             "created_at": utc_now_iso(),
             "created_by": str(created_by or "operator"),
@@ -462,15 +561,34 @@ class WsCollabService:
         return {"id": name, "deleted": existed}
 
     def mailbox_agents(self) -> dict[str, Any]:
-        """Agents for the YOU/TO pickers: the operator plus registered workers."""
-        agents: list[dict[str, Any]] = [{"id": "operator", "kind": "operator"}]
-        seen = {"operator"}
+        """The users/identity directory: the operator, registered workers, agents
+        in the durable registry, and any distinct source_ids seen in the
+        conversation. Registry properties are merged in; ``id`` and ``kind`` win."""
+        directory: dict[str, dict[str, Any]] = {}
+
+        def ensure(agent_id: str) -> dict[str, Any]:
+            agent_id = str(agent_id or "").strip()
+            entry = directory.get(agent_id)
+            if entry is None and agent_id:
+                entry = {**(self._agents.get(agent_id) or {}), "id": agent_id}
+                directory[agent_id] = entry
+            return entry or {}
+
+        ensure("operator")["kind"] = "operator"
         for worker in self.workers.list_workers():
             worker_id = str(worker.get("worker_id") or worker.get("id") or "")
-            if worker_id and worker_id not in seen:
-                seen.add(worker_id)
-                agents.append({**worker, "id": worker_id, "kind": "worker"})
-        return {"agents": agents}
+            if worker_id:
+                entry = ensure(worker_id)
+                entry.update({key: value for key, value in worker.items() if key != "id"})
+                entry["kind"] = "worker"
+        for agent_id in list(self._agents):
+            ensure(agent_id).setdefault("kind", "agent")
+        try:
+            for event in self.store.tail("conversation", 500):
+                ensure(str(event.to_dict().get("source_id") or "")).setdefault("kind", "agent")
+        except Exception:
+            pass
+        return {"agents": [entry for entry in directory.values() if entry.get("id")]}
 
     def mailbox_messages(
         self,
@@ -491,6 +609,12 @@ class WsCollabService:
         YOU (the message ``from``), ``to`` the addressed recipient, ``send_to``
         the routed mailbox (null == this mailbox) and ``text`` a case-insensitive
         substring."""
+        if mailbox in self.VIRTUAL_MAILBOXES:
+            messages = [self._agent_as_message(agent) for agent in self.mailbox_agents().get("agents", [])]
+            if do_filter and text:
+                needle = text.lower()
+                messages = [m for m in messages if needle in (m.get("text") or "").lower()]
+            return {"messages": messages, "user": sender or "", "peer": mailbox}
         if not self._known_mailbox(mailbox):
             return {"messages": [], "user": sender or "", "peer": mailbox}
         events = self.store.tail(mailbox, max(1, min(limit, 2000)), _build_predicate(filters))
@@ -532,7 +656,7 @@ class WsCollabService:
         # send_to / to are mailbox names (topics). Route to the first that names a
         # real mailbox; a non-mailbox value (e.g. an agent or the default peer)
         # simply falls through to the shared conversation.
-        topic = next((name for name in (send_to, to) if name and self._known_mailbox(name)), STREAM_CONVERSATION)
+        topic = next((name for name in (send_to, to) if name and self._writable_mailbox(name)), STREAM_CONVERSATION)
         data: dict[str, Any] = {"text": text}
         if to and to != topic:
             data["to"] = to
@@ -585,8 +709,8 @@ class WsCollabService:
         if inner is None:
             inner = {"text": record.get("text") or ""}
         stream = record.get("stream") or record.get("mailboxId") or raw.get("stream") or "conversation"
-        if not self._known_mailbox(stream):
-            raise ValidationError(f"unknown mailbox: {stream!r}", details={"allowed": sorted(STREAMS)})
+        if not self._writable_mailbox(stream):
+            raise ValidationError(f"mailbox {stream!r} is not writable", details={"mailbox": stream})
         event_type = record.get("type") or raw.get("type") or CONVERSATION_MESSAGE
         source_id = record.get("source_id") or record.get("author") or record.get("from") or raw.get("source_id") or "operator"
         source_kind = record.get("source_kind") or raw.get("source_kind") or "operator"

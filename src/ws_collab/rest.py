@@ -431,7 +431,8 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         agent_id = str(body.get("id") or "").strip()
         if not agent_id:
             raise HTTPException(status_code=400, detail={"code": "invalid", "message": "id is required"})
-        return {"id": agent_id, "created": True}
+        props = body.get("properties") if isinstance(body.get("properties"), dict) else None
+        return guarded(service.set_agent, agent_id, props)
 
     @router.post(f"{mount}/mailbox/create")
     async def mailbox_create(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
@@ -441,6 +442,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             str(body.get("id") or body.get("name") or ""),
             purpose=str(body.get("purpose") or ""),
             hidden=bool(body.get("hidden", False)),
+            writable=bool(body.get("writable", True)),
             source=str(body.get("source") or "jsonl"),
             created_by=body.get("created_by") or auth.principal.label or "operator",
         )
@@ -454,6 +456,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             str(body.get("id") or body.get("name") or ""),
             purpose=str(body.get("purpose") or ""),
             hidden=bool(body.get("hidden", False)),
+            writable=bool(body.get("writable", True)),
             source=str(body.get("source") or "jsonl"),
             created_by=body.get("created_by") or auth.principal.label or "operator",
         )
