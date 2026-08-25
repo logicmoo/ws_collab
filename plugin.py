@@ -28,6 +28,29 @@ def _mode() -> str:
     return (os.environ.get("WS_COLLAB_PLUGIN_MODE") or "standalone").strip().lower()
 
 
+def resolve_ui_pages(manifest: dict[str, Any], pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Resolve where this plugin's declared pages live.
+
+    WS_COLLAB serves its own administration console, so every page is an
+    absolute URL under the manifest's ``configPage`` base rather than a
+    workbench-rendered descriptor. A relative descriptor is joined onto that
+    base, and any fragment the manifest declares is preserved.
+    """
+
+    base = str(manifest.get("configPage") or "").rstrip("/")
+    resolved: list[dict[str, Any]] = []
+    for page in pages:
+        descriptor = str(page.get("descriptor") or "")
+        if descriptor.startswith(("http://", "https://")):
+            address = descriptor
+        elif base:
+            address = f"{base}/{descriptor.lstrip('/')}" if descriptor else base
+        else:
+            address = descriptor
+        resolved.append({**page, "address": address, "external": address.startswith(("http://", "https://"))})
+    return resolved
+
+
 def create_router(manifest: dict[str, Any] | None = None):
     """Delegate to the selected runner's ``create_router``."""
 
@@ -38,4 +61,4 @@ def create_router(manifest: dict[str, Any] | None = None):
     return _create_router(manifest)
 
 
-__all__ = ["create_router"]
+__all__ = ["create_router", "resolve_ui_pages"]

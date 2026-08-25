@@ -2,25 +2,32 @@
   "id": "ws_collab",
   "label": "WS_COLLAB",
   "description": "Coordination, audio, transcription, and administration infrastructure for Codex/Copilot workers over durable JSONL event streams with HTTP/HTTPS/WS/WSS parity.",
+  "summary": "Run the WS_COLLAB server, review its transports, and open its administration console.",
   "version": "1.0.0",
   "entrypoint": "plugin.py",
   "scan": "startup",
   "routePrefix": "/ws_collab",
-  "requestTimeoutSeconds": 0,
+  "configPage": "http://127.0.0.1:5173/ws_collab/admin",
+  "docs": "README.md",
   "kind": "custom",
-  "install": {
-    "requires": [
-    ],
-    "install": "python -m pip install -e \"../ws_collab[all]\""
+  "requestTimeoutSeconds": 0,
+  "plugin-install": {
+    "requires": [],
+    "install": "python -m pip install -e \"../ws_collab[all]\"",
+    "files": [],
+    "steps": [
+      "Install the WS_COLLAB package into the repository .venv.",
+      "Start the standalone server, or set WS_COLLAB_PLUGIN_MODE=embedded to mount it in-process.",
+      "Open the administration console and confirm the transports answer."
+    ]
   },
-
   "plugin-init": [
-      {
-        "command": "web_proxy",
-        "description": "Redirects /ws_collab to the Workspace Collab plugin.",
-        "redirect": "http://127.0.0.1:8802/ws_collab",
-        "path": "/ws_collab"
-      }
+    {
+      "command": "web_proxy",
+      "description": "Redirects /ws_collab to the Workspace Collab plugin.",
+      "redirect": "http://127.0.0.1:8802/ws_collab",
+      "path": "/ws_collab"
+    }
   ],
   "ui": {
     "pages": [
@@ -28,24 +35,24 @@
         "id": "configure",
         "label": "Configure Workspace Collab",
         "kind": "admin",
-        "descriptor": "/ws_collab/admin",
-        "glyph": "?",
+        "descriptor": "http://127.0.0.1:5173/ws_collab/admin",
+        "glyph": "⚙",
         "group": "PLUGINS"
       },
       {
         "id": "audio",
         "label": "Workspace Collab Audio",
         "kind": "admin",
-        "descriptor": "/ws_collab/admin/#audio",
-        "glyph": "?",
+        "descriptor": "http://127.0.0.1:5173/ws_collab/admin/#audio",
+        "glyph": "♪",
         "group": "PLUGINS"
       },
       {
         "id": "monitor",
         "label": "Workspace Collab Monitor",
         "kind": "user",
-        "descriptor": "/monitor/ws_collab",
-        "glyph": "?",
+        "descriptor": "http://127.0.0.1:5173/ws_collab/admin/#monitor",
+        "glyph": "◉",
         "group": "PLUGINS"
       }
     ]
