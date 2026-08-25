@@ -209,46 +209,56 @@ class WsCollabService:
     _FIELD_CACHE_SKIP = {"id", "raw", "text", "timestamp", "ts", "seq", "mailboxId", "forwarded_by"}
     _FIELD_CACHE_MAX = 16
 
-    def _field_cache_path(self) -> Path:
-        return Path(self.store.directory) / "cached_stream_feilds.json"
+    def _cache_config_path(self) -> Path:
+        return Path(self.store.directory) / "field_cache_config.json"
+
+    def _cache_data_path(self) -> Path:
+        return Path(self.store.directory) / "fields_seen_in_streams.json"
 
     def _load_field_cache(self) -> None:
         import json
 
+        # --- config: layered per-field cache-limit overrides ------------------
         try:
-            raw = json.loads(self._field_cache_path().read_text("utf-8"))
+            cfg = json.loads(self._cache_config_path().read_text("utf-8"))
         except Exception:
-            return
-        if not isinstance(raw, dict):
-            return
-        # Top-level "cache-overrides": global per-field limits (e.g. {"kind": 400}).
-        glob = raw.get("cache-overrides")
-        if isinstance(glob, dict):
-            for field, lim in glob.items():
-                if isinstance(field, str) and isinstance(lim, (int, float)) and int(lim) > 0:
-                    self._field_overrides_global[field] = int(lim)
-        for stream, entry in raw.items():
-            if stream == "cache-overrides" or not isinstance(stream, str) or not isinstance(entry, dict):
-                continue
-            out: dict[str, list[str]] = {}
-            out_types: dict[str, str] = {}
-            # Per-stream "cache-overrides": {field: limit} beats the global ones.
-            s_over = entry.get("cache-overrides")
-            if isinstance(s_over, dict):
-                self._field_overrides_stream[stream] = {
-                    str(f): int(v) for f, v in s_over.items() if isinstance(v, (int, float)) and int(v) > 0
-                }
-            fields = entry.get("fields") if isinstance(entry.get("fields"), dict) else {}
-            for field, decl in fields.items():
-                if not isinstance(field, str) or not isinstance(decl, dict):
+            cfg = {}
+        if isinstance(cfg, dict):
+            glob = cfg.get("cache-overrides")
+            if isinstance(glob, dict):
+                for field, lim in glob.items():
+                    if isinstance(field, str) and isinstance(lim, (int, float)) and int(lim) > 0:
+                        self._field_overrides_global[field] = int(lim)
+            streams_cfg = cfg.get("streams")
+            if isinstance(streams_cfg, dict):
+                for stream, over in streams_cfg.items():
+                    if isinstance(stream, str) and isinstance(over, dict):
+                        self._field_overrides_stream[stream] = {
+                            str(f): int(v) for f, v in over.items() if isinstance(v, (int, float)) and int(v) > 0
+                        }
+
+        # --- data: cached values + inferred types ----------------------------
+        try:
+            data = json.loads(self._cache_data_path().read_text("utf-8"))
+        except Exception:
+            data = {}
+        if isinstance(data, dict):
+            for stream, entry in data.items():
+                if not isinstance(stream, str) or not isinstance(entry, dict):
                     continue
-                values = decl.get("values")
-                if not isinstance(values, list):
-                    continue
-                out_types[field] = str(decl.get("type") or "string")
-                out[field] = [str(v) for v in values][-self._field_limit(stream, field):]
-            self._field_cache[stream] = out
-            self._field_types[stream] = out_types
+                out: dict[str, list[str]] = {}
+                out_types: dict[str, str] = {}
+                fields = entry.get("fields") if isinstance(entry.get("fields"), dict) else {}
+                for field, decl in fields.items():
+                    if not isinstance(field, str) or not isinstance(decl, dict):
+                        continue
+                    values = decl.get("values")
+                    if not isinstance(values, list):
+                        continue
+                    out_types[field] = str(decl.get("type") or "string")
+                    out[field] = [str(v) for v in values][-self._field_limit(stream, field):]
+                self._field_cache[stream] = out
+                self._field_types[stream] = out_types
 
     def _field_limit(self, stream: str, field: str) -> int:
         """Effective cache limit: per-(stream,field) > global by-field > default."""
@@ -259,6 +269,45 @@ class WsCollabService:
             return self._field_overrides_global[field]
         return self._FIELD_CACHE_MAX
 
+    def _cache_config_doc(self) -> dict[str, Any]:
+        # cache_config.json: default + layered per-field limit overrides (editable).
+        cfg: dict[str, Any] = {"default_limit": self._FIELD_CACHE_MAX}
+        if self._field_overrides_global:
+            cfg["cache-overrides"] = dict(self._field_overrides_global)
+        streams = {s: dict(o) for s, o in self._field_overrides_stream.items() if o}
+        if streams:
+            cfg["streams"] = streams
+        return cfg
+
+    def _cache_data_doc(self) -> dict[str, Any]:
+        # cache_data.json: the cached values per stream (auto-generated).
+        return {
+            stream: {
+                "cached_limit": self._FIELD_CACHE_MAX,
+                "fields": {
+                    field: {
+                        "type": self._field_types.get(stream, {}).get(field, "string"),
+                        "cached_limit": self._field_limit(stream, field),
+                        "values": values,
+                    }
+                    for field, values in fields.items()
+                },
+            }
+            for stream, fields in self._field_cache.items()
+        }
+
+    def _save_cache_config(self) -> None:
+        import json
+        import os
+
+        path = self._cache_config_path()
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(self._cache_config_doc(), indent=2), "utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
     def _save_field_cache(self, *, force: bool = False) -> None:
         import json
         import os
@@ -268,31 +317,10 @@ class WsCollabService:
         now = time.time()
         if not force and (now - self._field_cache_saved_at) < 2.0:
             return
-        # On-disk shape:
-        #   { "cache-overrides": { <field>: <limit> },              # global by-field
-        #     <stream>: { "cached_limit": 16,
-        #                 "cache-overrides": { <field>: <limit> },  # per-stream (wins)
-        #                 "fields": { <field>: { "type", "cached_limit", "values" } } } }
-        serializable: dict[str, Any] = {}
-        if self._field_overrides_global:
-            serializable["cache-overrides"] = dict(self._field_overrides_global)
-        for stream, fields in self._field_cache.items():
-            entry: dict[str, Any] = {"cached_limit": self._FIELD_CACHE_MAX}
-            if self._field_overrides_stream.get(stream):
-                entry["cache-overrides"] = dict(self._field_overrides_stream[stream])
-            entry["fields"] = {
-                field: {
-                    "type": self._field_types.get(stream, {}).get(field, "string"),
-                    "cached_limit": self._field_limit(stream, field),
-                    "values": values,
-                }
-                for field, values in fields.items()
-            }
-            serializable[stream] = entry
-        path = self._field_cache_path()
+        path = self._cache_data_path()
         tmp = path.with_name(path.name + ".tmp")
         try:
-            tmp.write_text(json.dumps(serializable, indent=2), "utf-8")
+            tmp.write_text(json.dumps(self._cache_data_doc(), indent=2), "utf-8")
             os.replace(tmp, path)
             self._field_cache_dirty = False
             self._field_cache_saved_at = now
@@ -410,20 +438,33 @@ class WsCollabService:
                 if len(seq) > eff:
                     del seq[: len(seq) - eff]
         self._field_cache_dirty = True
+        self._save_cache_config()
         self._save_field_cache(force=True)
         return {"stream": stream or "*", "field": field, "cached_limit": lim}
 
-    def get_field_cache_file(self) -> dict[str, Any]:
-        """Raw contents of the field-cache config file, for a universal file editor."""
-        path = self._field_cache_path()
+    def get_cache_config_file(self) -> dict[str, Any]:
+        """Raw contents of the editable field-cache CONFIG file (limit overrides)."""
+        path = self._cache_config_path()
+        try:
+            content = path.read_text("utf-8")
+        except Exception:
+            import json
+
+            content = json.dumps(self._cache_config_doc(), indent=2)
+        return {"path": str(path), "content": content}
+
+    def get_cache_data_file(self) -> dict[str, Any]:
+        """Raw contents of the auto-generated field-cache DATA file (seen values)."""
+        path = self._cache_data_path()
         try:
             content = path.read_text("utf-8")
         except Exception:
             content = "{}"
         return {"path": str(path), "content": content}
 
-    def set_field_cache_file(self, content: str) -> dict[str, Any]:
-        """Overwrite the field-cache config file with edited JSON, then reload it."""
+    def set_cache_config_file(self, content: str) -> dict[str, Any]:
+        """Overwrite the field-cache CONFIG file with edited JSON, then reload it and
+        re-trim the cached data to the new limits."""
         import json
         import os
 
@@ -432,21 +473,36 @@ class WsCollabService:
         except Exception as error:
             raise ValidationError(f"invalid JSON: {error}")
         if not isinstance(parsed, dict):
-            raise ValidationError("the field cache must be a JSON object")
-        path = self._field_cache_path()
+            raise ValidationError("the cache config must be a JSON object")
+        path = self._cache_config_path()
         tmp = path.with_name(path.name + ".tmp")
         try:
             tmp.write_text(json.dumps(parsed, indent=2), "utf-8")
             os.replace(tmp, path)
         except OSError as error:
             raise ValidationError(f"could not write file: {error}")
-        # Reload into memory so the edit takes effect immediately.
-        self._field_cache.clear()
-        self._field_types.clear()
+        # Reload overrides and re-trim existing values to the new effective limits.
         self._field_overrides_global.clear()
         self._field_overrides_stream.clear()
-        self._load_field_cache()
-        self._field_cache_dirty = False
+        glob = parsed.get("cache-overrides")
+        if isinstance(glob, dict):
+            for f, lim in glob.items():
+                if isinstance(f, str) and isinstance(lim, (int, float)) and int(lim) > 0:
+                    self._field_overrides_global[f] = int(lim)
+        streams_cfg = parsed.get("streams")
+        if isinstance(streams_cfg, dict):
+            for s, over in streams_cfg.items():
+                if isinstance(s, str) and isinstance(over, dict):
+                    self._field_overrides_stream[s] = {
+                        str(f): int(v) for f, v in over.items() if isinstance(v, (int, float)) and int(v) > 0
+                    }
+        for s, fields in self._field_cache.items():
+            for f, seq in fields.items():
+                eff = self._field_limit(s, f)
+                if len(seq) > eff:
+                    del seq[: len(seq) - eff]
+        self._field_cache_dirty = True
+        self._save_field_cache(force=True)
         return {"ok": True, "path": str(path)}
 
     # ------------------------------------------------------------------ core io
