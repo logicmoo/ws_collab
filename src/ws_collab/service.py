@@ -869,8 +869,13 @@ class WsCollabService:
                     return self.list_mailboxes().get("mailboxes", [])
                 return []
         # disk JSON file (relative paths resolve under the state directory)
-        if source.startswith(("file:", "./", "../", "/")) or source.endswith(".json"):
-            path_str = source[5:] if source.startswith("file:") else source
+        if source.startswith("disk:") or source.startswith(("file:", "./", "../", "/")) or source.endswith(".json"):
+            if source.startswith("disk:"):
+                path_str = source[len("disk:"):]
+            elif source.startswith("file:"):
+                path_str = source[len("file:"):]
+            else:
+                path_str = source
             path = Path(path_str)
             if not path.is_absolute():
                 path = Path(self.store.directory) / path
