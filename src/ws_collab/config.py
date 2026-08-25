@@ -24,6 +24,25 @@ _FALSE = {"0", "false", "no", "off", "n", ""}
 ROLE_ORDER = ["viewer", "worker", "operator", "admin"]
 
 
+def _plugin_env_variables() -> dict[str, str]:
+    """The ``"env:variables"`` map declared in the sibling ``plugin.json``.
+
+    Lets the plugin manifest set environment variables (e.g.
+    ``WS_COLLAB_AUDIO_ENABLED``) for the server without touching the OS
+    environment. Best-effort: a missing or malformed manifest yields ``{}``.
+    """
+
+    try:
+        manifest_path = Path(__file__).resolve().parent.parent / "plugin.json"
+        data = json.loads(manifest_path.read_text("utf-8"))
+    except Exception:
+        return {}
+    raw = data.get("env:variables") if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if k}
+
+
 def _as_bool(value: str | None, default: bool) -> bool:
     if value is None:
         return default
@@ -246,7 +265,14 @@ class Config:
     # ------------------------------------------------------------------ loading
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
+        use_manifest = env is None
         env = dict(os.environ if env is None else env)
+        # Apply plugin.json "env:variables" as defaults so the manifest can enable
+        # features (e.g. audio) without OS env edits. Real env still wins; skipped
+        # when an explicit env dict is passed (keeps tests hermetic).
+        if use_manifest:
+            for _name, _value in _plugin_env_variables().items():
+                env.setdefault(_name, _value)
 
         def get(name: str) -> str | None:
             return env.get(f"WS_COLLAB_{name}")

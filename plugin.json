@@ -11,6 +11,9 @@
   "docs": "README.md",
   "kind": "custom",
   "requestTimeoutSeconds": 0,
+  "env:variables": {
+    "WS_COLLAB_AUDIO_ENABLED": "1"
+  },
   "plugin-install": {
     "requires": [],
     "install": "python -m pip install -e \"../ws_collab[all]\"",

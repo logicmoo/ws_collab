@@ -225,7 +225,11 @@ def main(argv: list[str] | None = None) -> None:
         env_overrides["WS_COLLAB_HTTPS_PORT"] = argv[2]
     import os
 
-    merged = {**os.environ, **env_overrides}
+    from .config import _plugin_env_variables
+
+    # plugin.json "env:variables" are the lowest-precedence defaults; the real OS
+    # environment and CLI positional args still override them.
+    merged = {**_plugin_env_variables(), **os.environ, **env_overrides}
     run(Config.from_env(merged))
 
 
