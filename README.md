@@ -6,10 +6,17 @@ WebSocket parity.
 
 WS_COLLAB runs two ways:
 
-* **As a workbench plugin** — `plugin.json` + `plugin.py` mount every route under
-  `/ws_collab` in the host application.
-* **As a standalone server** — `python -m ws_collab.server` binds HTTP/HTTPS/WS/WSS
-  and prints a startup report.
+* **As a standalone server (recommended)** — `python -m ws_collab.server` binds
+  HTTP/HTTPS/WS/WSS and prints a startup report. A host application (e.g. the
+  workbench) then mounts it with a lightweight HTTP `web_proxy` at `/ws_collab`,
+  so the host never imports WS_COLLAB and stays free of its dependencies.
+* **As an in-process workbench plugin** — `plugin.json` + `plugin.py` include the
+  router directly into the host app under `/ws_collab`. This is supported and works,
+  but it is **not tested as thoroughly** as the standalone path, and — because the
+  shared service layer eagerly wires up the audio, STT, and TTS subsystems —
+  importing it **pulls the full WS_COLLAB dependency stack (audio/STT/TTS) into the
+  host process**. Prefer the standalone + `web_proxy` deployment unless you
+  specifically want everything in one process.
 
 ```
   microphone ─▶ VAD ─▶ segment ─┬─▶ STT engine A ─┐
