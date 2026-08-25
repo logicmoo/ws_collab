@@ -67,6 +67,11 @@ from . import __version__
 # The canonical capture source that STT engine routes hang off.
 DEFAULT_ROUTE_SOURCE = "microphone"
 
+# Safety ceiling for a single read scan. `limit` is meant to bound the PRODUCED
+# stream, not the pre-filter read window, so virtual/merge streams scan sources up
+# to this ceiling (effectively "all") and only truncate the final result.
+_MAX_SCAN = 100_000
+
 
 def _markdown_title(path: Path) -> str:
     """First heading of a markdown file, for a readable document list."""
@@ -628,7 +633,7 @@ class WsCollabService:
                 count = 0
         elif source.startswith("merge:"):
             try:
-                count = len(self.mailbox_messages(name, limit=2000).get("messages", []))
+                count = len(self.mailbox_messages(name, limit=_MAX_SCAN).get("messages", []))
             except Exception:
                 count = 0
         members = []
@@ -873,9 +878,10 @@ class WsCollabService:
                 for sub in subs:
                     if sub == mailbox or sub in child_chain:
                         continue  # skip self and any stream already in the relay chain
-                    merged.extend(self.mailbox_messages(sub, limit=limit, _chain=child_chain).get("messages", []))
+                    # Read sources unbounded — limit applies to the produced stream only.
+                    merged.extend(self.mailbox_messages(sub, limit=_MAX_SCAN, _chain=child_chain).get("messages", []))
                 merged.sort(key=lambda m: str(m.get("timestamp") or ""))
-                messages = merged[-max(1, min(limit, 2000)):]
+                messages = merged
             else:
                 records = self._resolve_virtual_records(mailbox)
                 messages = [self._virtual_message(mailbox, record) for record in records]
@@ -892,10 +898,13 @@ class WsCollabService:
             if do_filter and text:
                 needle = text.lower()
                 messages = [m for m in messages if needle in (m.get("text") or "").lower()]
+            # Limit the PRODUCED stream only, after filtering.
+            if limit and limit > 0:
+                messages = messages[-min(limit, _MAX_SCAN):]
             return {"messages": messages, "user": sender or "", "peer": mailbox}
         if not self._known_mailbox(mailbox):
             return {"messages": [], "user": sender or "", "peer": mailbox}
-        events = self.store.tail(mailbox, max(1, min(limit, 2000)), _build_predicate(filters))
+        events = self.store.tail(mailbox, max(1, min(limit, _MAX_SCAN)), _build_predicate(filters))
         messages = [self._event_to_message(event.to_dict()) for event in events]
         if do_filter:
             needle = (text or "").lower()
