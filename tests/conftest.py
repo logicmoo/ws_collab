@@ -51,6 +51,8 @@ def make_config(tmp_path: Path, **overrides: str) -> Config:
         "WS_COLLAB_STATE_DIR": str(tmp_path / "collab_state"),
         "WS_COLLAB_TOKENS": f"{ADMIN_TOKEN}=admin,{WORKER_TOKEN}=worker,{VIEWER_TOKEN}=viewer",
         "WS_COLLAB_SESSION_SECRET": "unit-test-session-secret",
+        # Tests exercise the real auth mechanism; the product default is auth-off.
+        "WS_COLLAB_AUTH_DISABLED": "0",
         "WS_COLLAB_AUDIO_ENABLED": "1",
         "WS_COLLAB_HOST": "127.0.0.1",
         # Hermetic backends: no hardware, no models, no network.

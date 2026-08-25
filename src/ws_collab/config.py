@@ -100,6 +100,11 @@ class Config:
     network_allowlist: list[str] = field(default_factory=list)
     require_tls: bool = True
     dev_insecure: bool = False
+    # Authentication is optional. It defaults to OFF so local (loopback) use needs
+    # no token; validate() auto-enables it when the server is exposed beyond
+    # loopback (unless DEV_INSECURE opts out). Override with WS_COLLAB_AUTH_DISABLED
+    # or WS_COLLAB_REQUIRE_AUTH.
+    auth_disabled: bool = True
     rate_limit_rps: int = 50
     max_body_bytes: int = 1 * 1024 * 1024
     max_ws_message_bytes: int = 1 * 1024 * 1024
@@ -239,6 +244,10 @@ class Config:
         cfg.network_allowlist = _as_list(get("ALLOWLIST"))
         cfg.require_tls = _as_bool(get("REQUIRE_TLS"), cfg.require_tls)
         cfg.dev_insecure = _as_bool(get("DEV_INSECURE"), cfg.dev_insecure)
+        cfg.auth_disabled = _as_bool(get("AUTH_DISABLED"), cfg.auth_disabled)
+        require_auth = get("REQUIRE_AUTH")
+        if require_auth is not None:
+            cfg.auth_disabled = not _as_bool(require_auth, True)
         cfg.rate_limit_rps = _as_int(get("RATE_LIMIT_RPS"), cfg.rate_limit_rps)
         cfg.max_body_bytes = _as_int(get("MAX_BODY_BYTES"), cfg.max_body_bytes)
         cfg.max_ws_message_bytes = _as_int(get("MAX_WS_MESSAGE_BYTES"), cfg.max_ws_message_bytes)
@@ -305,7 +314,22 @@ class Config:
                 "hypotheses is not guaranteed"
             )
 
-        if not self.tokens:
+        # Authentication policy. Disabled by default so local (loopback) use needs
+        # no credentials; auto-enabled when the server is exposed beyond loopback
+        # unless DEV_INSECURE explicitly keeps it off.
+        if self.auth_disabled and not self.is_loopback_only and not self.dev_insecure:
+            self.auth_disabled = False
+            self.warnings.append(
+                "authentication auto-enabled: binding is not loopback-only "
+                "(set WS_COLLAB_DEV_INSECURE=1 to keep authentication off on an exposed bind)"
+            )
+        if self.auth_disabled:
+            self.warnings.append(
+                "AUTHENTICATION DISABLED: every request is treated as a local admin. "
+                "Set WS_COLLAB_REQUIRE_AUTH=1 (or WS_COLLAB_AUTH_DISABLED=0) to require tokens."
+            )
+
+        if not self.tokens and not self.auth_disabled:
             token = new_token()
             self.tokens[token] = {"role": "admin", "label": "generated-admin"}
             self.generated_admin_token = token

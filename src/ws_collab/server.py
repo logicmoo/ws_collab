@@ -144,7 +144,10 @@ def build_startup_report(config: Config, bound: list[dict[str, Any]], failed: li
             lines.append(f"  discoverable LAN: {example['scheme']}://{ip}:{example['port']}/ws_collab")
     lines.append("-" * 68)
     lines.append(f"  TLS:            {'enabled' if config.https_enabled else 'DISABLED'}")
-    lines.append(f"  authentication: required (bearer token / session)")
+    if config.auth_disabled:
+        lines.append("  authentication: DISABLED (every caller is a local admin)")
+    else:
+        lines.append("  authentication: required (bearer token / session)")
     lines.append(f"  admin access:   {'remote enabled' if config.admin_remote else 'loopback only'}")
     lines.append(f"  writable state: {config.state_dir}")
     if config.generated_admin_token:

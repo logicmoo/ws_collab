@@ -114,6 +114,18 @@ class Security:
         return text
 
     # ------------------------------------------------------------ token auth
+    def default_principal(self) -> Principal | None:
+        """Identity for a request that carries no (or invalid) credentials.
+
+        Authentication is optional. When it is disabled -- the default for
+        loopback-only deployments, controlled by ``WS_COLLAB_AUTH_DISABLED`` --
+        every caller is treated as a local administrator. When authentication is
+        required this returns ``None`` so the usual 401/403 handling applies.
+        """
+        if getattr(self.config, "auth_disabled", False):
+            return Principal(kind="token", id="admin", role="admin", label="local")
+        return None
+
     def authenticate_token(self, authorization: str | None, query_token: str | None = None) -> Principal | None:
         token = None
         if authorization:
@@ -125,11 +137,11 @@ class Security:
         if not token and query_token:
             token = query_token.strip()
         if not token:
-            return None
+            return self.default_principal()
         for candidate, descriptor in self.config.tokens.items():
             if hmac.compare_digest(candidate, token):
                 return Principal(kind="token", id=descriptor["label"], role=descriptor["role"], label=descriptor["label"])
-        return None
+        return self.default_principal()
 
     # ------------------------------------------------------------ sessions/csrf
     def _sign(self, value: str) -> str:

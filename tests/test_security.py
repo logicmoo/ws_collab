@@ -36,18 +36,35 @@ def test_missing_credentials_are_rejected(security) -> None:
     assert security.authenticate_token("") is None
 
 
-def test_there_is_no_authentication_bypass(config) -> None:
-    """Even with no tokens configured, a random admin token is required."""
+def test_no_bypass_when_authentication_is_required(config) -> None:
+    """With auth required, even zero configured tokens still demand one."""
 
-    bare = make_config.__wrapped__ if hasattr(make_config, "__wrapped__") else None
     from ws_collab.config import Config
 
-    generated = Config.from_env({"WS_COLLAB_STATE_DIR": str(config.state_dir)})
+    generated = Config.from_env({
+        "WS_COLLAB_STATE_DIR": str(config.state_dir),
+        "WS_COLLAB_REQUIRE_AUTH": "1",
+    })
     assert generated.tokens, "a token must always exist"
     assert generated.generated_admin_token, "the generated token must be reported to the operator"
     security = Security(generated)
     assert security.authenticate_token("Bearer ") is None
-    assert bare is None or True
+    assert security.authenticate_token(None) is None
+
+
+def test_auth_can_be_disabled_for_loopback(tmp_path) -> None:
+    """Opt-in bypass: with authentication disabled every caller is a local admin."""
+
+    from ws_collab.config import Config
+
+    open_cfg = Config.from_env({
+        "WS_COLLAB_STATE_DIR": str(tmp_path / "state"),
+        "WS_COLLAB_AUTH_DISABLED": "1",
+    })
+    assert open_cfg.auth_disabled is True
+    security = Security(open_cfg)
+    principal = security.authenticate_token(None)
+    assert principal is not None and principal.role == "admin"
 
 
 # ------------------------------------------------------------ authorization

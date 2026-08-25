@@ -20,21 +20,27 @@ def _env(tmp_path: Path, **overrides: str) -> dict[str, str]:
 
 
 # ------------------------------------------------------------------ defaults
-def test_defaults_are_loopback_and_authenticated(tmp_path) -> None:
+def test_defaults_are_loopback_and_auth_optional(tmp_path) -> None:
     config = Config.from_env(_env(tmp_path))
     assert config.is_loopback_only is True
-    assert config.tokens, "authentication is always required"
+    assert config.auth_disabled is True, "authentication is off by default for loopback"
     assert config.admin_remote is False, "administration defaults to loopback"
 
 
-def test_a_token_always_exists_even_if_none_configured(tmp_path) -> None:
-    config = Config.from_env({"WS_COLLAB_STATE_DIR": str(tmp_path / "state")})
+def test_a_token_always_exists_when_auth_required(tmp_path) -> None:
+    config = Config.from_env({
+        "WS_COLLAB_STATE_DIR": str(tmp_path / "state"),
+        "WS_COLLAB_REQUIRE_AUTH": "1",
+    })
     assert config.tokens and config.generated_admin_token
     assert any("generated" in w for w in config.warnings), "the operator must be told"
 
 
 def test_generated_token_is_written_to_the_state_directory_not_logged(tmp_path) -> None:
-    config = Config.from_env({"WS_COLLAB_STATE_DIR": str(tmp_path / "state")})
+    config = Config.from_env({
+        "WS_COLLAB_STATE_DIR": str(tmp_path / "state"),
+        "WS_COLLAB_REQUIRE_AUTH": "1",
+    })
     config.prepare_state_dir()
     written = config.generated_token_path.read_text(encoding="utf-8").strip()
     assert written == config.generated_admin_token
@@ -160,7 +166,10 @@ def test_report_warns_prominently_when_exposed(tmp_path) -> None:
 
 
 def test_report_never_prints_a_secret(tmp_path) -> None:
-    config = Config.from_env({"WS_COLLAB_STATE_DIR": str(tmp_path / "state")})
+    config = Config.from_env({
+        "WS_COLLAB_STATE_DIR": str(tmp_path / "state"),
+        "WS_COLLAB_REQUIRE_AUTH": "1",
+    })
     report = build_startup_report(config, [{"host": "127.0.0.1", "port": 8802, "scheme": "http"}], [])
     assert config.generated_admin_token not in report
     assert str(config.generated_token_path) in report, "the operator is told where to find it"
