@@ -10,6 +10,7 @@ idempotency, filters, validation, auditing, and worker/routing/prompt logic.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from .errors import AuthorizationError, ConflictError, NotFoundError, Validation
 from .events import (
     AGENT_SPEECH_STARTED,
     CONVERSATION_MESSAGE,
+    DYNAMIC_STREAMS,
     HEARD_SPEECH,
     STREAM_AUDIT,
     STREAM_CONVERSATION,
@@ -158,6 +160,11 @@ class WsCollabService:
 
         self._monitor_task: asyncio.Task | None = None
         self._warnings = list(config.warnings) + list(self.stt_warnings)
+
+        # Client-created ("dynamic") mailboxes the server hosts, restored from a
+        # durable registry so they survive restarts.
+        self._dynamic_mailboxes: dict[str, dict[str, Any]] = {}
+        self._load_mailbox_registry()
 
     # ------------------------------------------------------------------ core io
     def publish(
@@ -333,34 +340,126 @@ class WsCollabService:
             "raw": event,
         }
 
-    def list_mailboxes(self) -> dict[str, Any]:
-        """This place's directory of mailboxes. Each entry is self-describing:
-        name, purpose, backing source + transports, live counts, and the
-        endpoints for reading/sending/tailing/streaming it, so a consumer can
-        discover and use a mailbox without hard-coding routes."""
+    # -------------------------------------------- dynamic mailbox registry
+    def _mailbox_registry_path(self) -> Path:
+        return Path(self.store.directory) / "mailboxes.json"
+
+    def _load_mailbox_registry(self) -> None:
+        import json
+
+        try:
+            raw = json.loads(self._mailbox_registry_path().read_text("utf-8"))
+        except Exception:
+            return
+        if not isinstance(raw, dict):
+            return
+        for name, meta in raw.items():
+            if not isinstance(name, str) or name in STREAMS:
+                continue
+            self._dynamic_mailboxes[name] = meta if isinstance(meta, dict) else {}
+            self.store.register_mailbox(name)
+            DYNAMIC_STREAMS.add(name)
+
+    def _save_mailbox_registry(self) -> None:
+        import json
+        import os
+
+        path = self._mailbox_registry_path()
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(self._dynamic_mailboxes, indent=2), "utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _known_mailbox(self, name: str) -> bool:
+        return name in STREAMS or name in self._dynamic_mailboxes
+
+    _MAILBOX_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+    def _mailbox_descriptor(self, name: str, stats: dict[str, Any] | None = None) -> dict[str, Any]:
+        if stats is None:
+            stats = {row["stream"]: row for row in self.store.stats()}
         v1 = "/ws_collab/v1"
         mount = "/ws_collab"
+        dyn = self._dynamic_mailboxes.get(name) or {}
+        return {
+            "id": name,
+            "name": name,
+            "purpose": dyn.get("purpose") or STREAM_PURPOSES.get(name, ""),
+            "kind": "stream" if name in STREAMS else "mailbox",
+            "source": dyn.get("source") or "jsonl",
+            "transports": ["jsonl", "ws"],
+            "hidden": bool(dyn.get("hidden", False)),
+            "messages": int((stats.get(name) or {}).get("seq") or 0),
+            "filename": STREAMS.get(name) or f"{name}.jsonl",
+            "endpoints": {
+                "read": f"{v1}/mailbox/messages?mailbox={name}",
+                "send": f"{v1}/mailbox/send",
+                "tail": f"{v1}/streams/{name}/tail",
+                "ws": f"{mount}/ws",
+            },
+        }
+
+    def list_mailboxes(self) -> dict[str, Any]:
+        """This place's directory of mailboxes: built-in streams plus any
+        client-created mailboxes, each self-describing (name/purpose/source/
+        transports + read/send/tail/ws endpoints). Hidden mailboxes are omitted;
+        their unguessable name is the capability required to reach them."""
         stats = {row["stream"]: row for row in self.store.stats()}
+        names = list(STREAMS) + sorted(self._dynamic_mailboxes)
         mailboxes = [
-            {
-                "id": name,
-                "name": name,
-                "purpose": STREAM_PURPOSES.get(name, ""),
-                "kind": "stream",
-                "source": "jsonl",
-                "transports": ["jsonl", "ws"],
-                "messages": int((stats.get(name) or {}).get("seq") or 0),
-                "filename": filename,
-                "endpoints": {
-                    "read": f"{v1}/mailbox/messages?mailbox={name}",
-                    "send": f"{v1}/mailbox/send",
-                    "tail": f"{v1}/streams/{name}/tail",
-                    "ws": f"{mount}/ws",
-                },
-            }
-            for name, filename in STREAMS.items()
+            self._mailbox_descriptor(name, stats)
+            for name in names
+            if not self._dynamic_mailboxes.get(name, {}).get("hidden")
         ]
         return {"place": "ws_collab", "mailboxes": mailboxes, "server_time": utc_now_iso()}
+
+    def create_mailbox(
+        self,
+        name: str,
+        *,
+        purpose: str = "",
+        hidden: bool = False,
+        source: str = "jsonl",
+        created_by: str = "operator",
+    ) -> dict[str, Any]:
+        """Begin hosting a new client-created mailbox (a durable JSONL stream).
+        Idempotent: recreating an existing dynamic mailbox returns it unchanged."""
+        name = str(name or "").strip()
+        if not self._MAILBOX_NAME_RE.match(name):
+            raise ValidationError(
+                "mailbox name must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                details={"name": name},
+            )
+        if name in STREAMS:
+            raise ConflictError(f"{name!r} is a built-in mailbox")
+        if name in self._dynamic_mailboxes:
+            return {"created": False, "mailbox": self._mailbox_descriptor(name)}
+        self._dynamic_mailboxes[name] = {
+            "purpose": str(purpose or ""),
+            "hidden": bool(hidden),
+            "source": str(source or "jsonl"),
+            "created_at": utc_now_iso(),
+            "created_by": str(created_by or "operator"),
+        }
+        self.store.register_mailbox(name)
+        DYNAMIC_STREAMS.add(name)
+        self._save_mailbox_registry()
+        return {"created": True, "mailbox": self._mailbox_descriptor(name)}
+
+    def delete_mailbox(self, name: str) -> dict[str, Any]:
+        """Stop hosting a client-created mailbox. Built-in streams cannot be
+        deleted; the backing JSONL file is left on disk."""
+        name = str(name or "").strip()
+        if name in STREAMS:
+            raise ConflictError(f"cannot delete built-in mailbox {name!r}")
+        existed = name in self._dynamic_mailboxes
+        if existed:
+            self._dynamic_mailboxes.pop(name, None)
+            DYNAMIC_STREAMS.discard(name)
+            self._save_mailbox_registry()
+        return {"id": name, "deleted": existed}
 
     def mailbox_agents(self) -> dict[str, Any]:
         """Agents for the YOU/TO pickers: the operator plus registered workers."""
@@ -392,7 +491,7 @@ class WsCollabService:
         YOU (the message ``from``), ``to`` the addressed recipient, ``send_to``
         the routed mailbox (null == this mailbox) and ``text`` a case-insensitive
         substring."""
-        if mailbox not in STREAMS:
+        if not self._known_mailbox(mailbox):
             return {"messages": [], "user": sender or "", "peer": mailbox}
         events = self.store.tail(mailbox, max(1, min(limit, 2000)), _build_predicate(filters))
         messages = [self._event_to_message(event.to_dict()) for event in events]
@@ -433,7 +532,7 @@ class WsCollabService:
         # send_to / to are mailbox names (topics). Route to the first that names a
         # real mailbox; a non-mailbox value (e.g. an agent or the default peer)
         # simply falls through to the shared conversation.
-        topic = next((name for name in (send_to, to) if name and name in STREAMS), STREAM_CONVERSATION)
+        topic = next((name for name in (send_to, to) if name and self._known_mailbox(name)), STREAM_CONVERSATION)
         data: dict[str, Any] = {"text": text}
         if to and to != topic:
             data["to"] = to
@@ -486,7 +585,7 @@ class WsCollabService:
         if inner is None:
             inner = {"text": record.get("text") or ""}
         stream = record.get("stream") or record.get("mailboxId") or raw.get("stream") or "conversation"
-        if stream not in STREAMS:
+        if not self._known_mailbox(stream):
             raise ValidationError(f"unknown mailbox: {stream!r}", details={"allowed": sorted(STREAMS)})
         event_type = record.get("type") or raw.get("type") or CONVERSATION_MESSAGE
         source_id = record.get("source_id") or record.get("author") or record.get("from") or raw.get("source_id") or "operator"

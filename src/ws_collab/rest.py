@@ -433,17 +433,40 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             raise HTTPException(status_code=400, detail={"code": "invalid", "message": "id is required"})
         return {"id": agent_id, "created": True}
 
+    @router.post(f"{mount}/mailbox/create")
+    async def mailbox_create(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        auth = await _require(request, "worker", mutating=True)
+        return guarded(
+            service.create_mailbox,
+            str(body.get("id") or body.get("name") or ""),
+            purpose=str(body.get("purpose") or ""),
+            hidden=bool(body.get("hidden", False)),
+            source=str(body.get("source") or "jsonl"),
+            created_by=body.get("created_by") or auth.principal.label or "operator",
+        )
+
+    # Alias so the classic "add mailbox" control behaves like /mailbox/create.
     @router.post(f"{mount}/mailbox/mailboxes")
     async def mailbox_add(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        # Mailboxes are durable streams defined by the server; they are not
-        # created on demand. Report no-op so the UI stays consistent.
+        auth = await _require(request, "worker", mutating=True)
+        return guarded(
+            service.create_mailbox,
+            str(body.get("id") or body.get("name") or ""),
+            purpose=str(body.get("purpose") or ""),
+            hidden=bool(body.get("hidden", False)),
+            source=str(body.get("source") or "jsonl"),
+            created_by=body.get("created_by") or auth.principal.label or "operator",
+        )
+
+    @router.post(f"{mount}/mailbox/delete")
+    async def mailbox_delete_post(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
-        return {"id": str(body.get("id") or ""), "created": False}
+        return guarded(service.delete_mailbox, str(body.get("id") or body.get("name") or ""))
 
     @router.delete(f"{mount}/mailbox/mailboxes")
     async def mailbox_delete(request: Request, id: str = Query(...)) -> dict[str, Any]:  # noqa: A002 - matches UI param
         await _require(request, "operator", mutating=True)
-        return {"id": id, "deleted": False}
+        return guarded(service.delete_mailbox, id)
 
     @router.post(f"{mount}/mailbox/record")
     async def mailbox_record(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:

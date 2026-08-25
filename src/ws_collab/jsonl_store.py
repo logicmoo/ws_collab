@@ -49,7 +49,7 @@ class _StreamState:
     def __init__(self, name: str, directory: Path, rotate_max_bytes: int, retention_max_files: int):
         self.name = name
         self.directory = directory
-        self.filename = STREAMS[name]
+        self.filename = STREAMS.get(name) or f"{name}.jsonl"
         self.active_path = directory / self.filename
         self.rotate_max_bytes = rotate_max_bytes
         self.retention_max_files = retention_max_files
@@ -486,6 +486,7 @@ class JsonlStore:
         self.rotate_max_bytes = rotate_max_bytes
         self.retention_max_files = retention_max_files
         self._streams: dict[str, _StreamState] = {}
+        self._dynamic: set[str] = set()
         self._streams_lock = threading.Lock()
         self._owner_lock_handle = None
         self._acquire_owner_lock()
@@ -513,16 +514,24 @@ class JsonlStore:
             ) from error
 
     def stream(self, name: str) -> _StreamState:
-        if name not in STREAMS:
+        if name not in STREAMS and name not in self._dynamic:
             from .errors import ValidationError
 
-            raise ValidationError(f"unknown stream: {name!r}", details={"allowed": sorted(STREAMS)})
+            raise ValidationError(f"unknown stream: {name!r}", details={"allowed": sorted(STREAMS) + sorted(self._dynamic)})
         with self._streams_lock:
             state = self._streams.get(name)
             if state is None:
                 state = _StreamState(name, self.directory, self.rotate_max_bytes, self.retention_max_files)
                 self._streams[name] = state
             return state
+
+    def register_mailbox(self, name: str) -> None:
+        """Permit a client-created ("dynamic") mailbox to be hosted by name.
+
+        The backing JSONL file is created lazily on first append/read, exactly
+        like the built-in streams."""
+        with self._streams_lock:
+            self._dynamic.add(name)
 
     def append(self, event: Event, on_write: Callable[[Event], None] | None = None) -> AppendResult:
         return self.stream(event.stream).append(event, on_write=on_write)
@@ -540,7 +549,8 @@ class JsonlStore:
         return self.stream(stream).tail(count, predicate)
 
     def stats(self) -> list[dict[str, Any]]:
-        return [self.stream(name).stats() for name in STREAMS]
+        names = list(STREAMS) + sorted(self._dynamic)
+        return [self.stream(name).stats() for name in names]
 
     def close(self) -> None:
         if self._owner_lock_handle is not None:

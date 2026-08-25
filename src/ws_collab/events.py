@@ -67,6 +67,11 @@ STREAM_PURPOSES: dict[str, str] = {
     STREAM_PROMPT: "Prompt and version history.",
 }
 
+# Names of client-created ("dynamic") mailboxes the server has begun hosting.
+# Populated at runtime from the durable mailbox registry; kept beside STREAMS so
+# stream validation, publishing, and reads accept them just like built-ins.
+DYNAMIC_STREAMS: set[str] = set()
+
 # Semantic roles -> stream name(s). Clients, the admin UI, documentation, and
 # tests resolve streams through these roles instead of literal names, so a stream
 # can be renamed or split without breaking anything downstream. This registry is
@@ -214,10 +219,10 @@ class Event:
 
 
 def validate_stream(stream: str) -> str:
-    if stream not in STREAMS:
+    if stream not in STREAMS and stream not in DYNAMIC_STREAMS:
         raise ValidationError(
             f"unknown stream: {stream!r}",
-            details={"allowed": sorted(STREAMS)},
+            details={"allowed": sorted(STREAMS) + sorted(DYNAMIC_STREAMS)},
         )
     return stream
 
