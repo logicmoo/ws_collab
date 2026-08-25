@@ -283,6 +283,17 @@ class VoiceManager:
         with self._lock:
             return [dict(c) for c in self._clones.values()]
 
+    def delete_clone(self, clone_id: str, *, operator: str = "operator") -> bool:
+        with self._lock:
+            existed = clone_id in self._clones
+            self._clones.pop(clone_id, None)
+            self._voices.pop(clone_id, None)
+            if existed:
+                self._save_profiles()
+        if existed:
+            self._audit_event("VOICE_CLONE_DELETED", clone_id=clone_id, operator=operator)
+        return existed
+
     @property
     def backend(self) -> str:
         with self._lock:

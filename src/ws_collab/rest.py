@@ -543,6 +543,11 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             operator=auth.principal.label,
         )
 
+    @router.post(f"{mount}/voices/clone/delete")
+    async def delete_clone(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        auth = await _require(request, "operator", mutating=True)
+        return guarded(service.delete_clone, body.get("clone_id", ""), auth.principal.label)
+
     # Registered after the static routes above so "assign" is never captured as
     # an agent id by this parameterised path.
     @router.post(f"{mount}/voices/{{agent_id}}")

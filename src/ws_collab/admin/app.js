@@ -931,6 +931,13 @@ async function loadVoices() {
             } catch (error) { pushError(error.message); }
           }),
         );
+        if (String(v.id).startsWith("clone:")) {
+          actions.append(actionButton("Delete", "danger", async () => {
+            if (!confirm(`Delete cloned voice "${v.name}"?`)) return;
+            try { await api(`${V1}/voices/clone/delete`, { method: "POST", body: { clone_id: v.id } }); loadVoices(); }
+            catch (error) { pushError(error.message); }
+          }));
+        }
         return [mono(v.id), v.name, v.provider, v.language, v.style,
           badge(v.available ? "yes" : "no", v.available ? "ok" : "danger"), select, actions];
       })));

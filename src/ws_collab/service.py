@@ -576,6 +576,9 @@ class WsCollabService:
             base_voice_id, name, rate=rate, pitch=pitch, volume=volume, style=style, operator=operator
         )
 
+    def delete_clone(self, clone_id: str, operator: str = "operator") -> dict[str, Any]:
+        return {"deleted": self.voices.delete_clone(clone_id, operator=operator), "clone_id": clone_id}
+
     def set_voice_profile(self, agent_id: str, updates: dict[str, Any], operator: str = "operator") -> dict[str, Any]:
         return self.voices.set_profile(agent_id, updates, operator=operator).public()
 

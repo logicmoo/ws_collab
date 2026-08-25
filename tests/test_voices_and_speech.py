@@ -148,6 +148,14 @@ def test_clone_persists_across_reload(voices, config) -> None:
     assert any(v["id"] == "clone:persisted-clone" for v in reloaded.list_voices())
 
 
+def test_clone_can_be_deleted(voices) -> None:
+    base = voices.list_voices()[0]["id"]
+    clone = voices.clone_voice(base, "Temp Clone", rate=1.0, pitch=0.0)
+    assert voices.delete_clone(clone["id"]) is True
+    assert not any(v["id"] == clone["id"] for v in voices.list_voices())
+    assert voices.delete_clone(clone["id"]) is False  # idempotent
+
+
 def test_unknown_policy_is_rejected(voices) -> None:
     with pytest.raises(ValidationError):
         voices.auto_assign([{"agent_id": "a1"}], "telepathy")
