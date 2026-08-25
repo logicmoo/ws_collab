@@ -158,6 +158,21 @@ class CaptureService:
                 "error": self._stream_error,
             }
 
+    def set_preferred_device(self, device_id: str) -> None:
+        """Remember an input device to use, without starting a stream.
+
+        Used at startup to restore the operator's persisted capture-device choice
+        so the next :meth:`start` (and the reported state) uses it instead of the
+        config default. Ignored while already listening -- use
+        :meth:`select_device` for a live switch.
+        """
+
+        if not device_id:
+            return
+        with self._lock:
+            if not self._listening:
+                self._device_id = device_id
+
     def select_device(self, device_id: str) -> dict[str, Any]:
         device = self.devices.get(device_id)
         if device is None:

@@ -50,6 +50,7 @@ from .events import (
 )
 from .notify import Broker
 from .prompt import PromptManager
+from .sound_settings import SoundSettings
 from .stt import build_engines, run_stt
 from .stt.base import Hypothesis
 from .tts import accuracy as accuracy_metrics
@@ -135,6 +136,7 @@ class WsCollabService:
         self.cursors = CursorManager(config.cursors_dir, audit_sink=self._audit_sink)
         self.devices = DeviceRegistry(config)
         self.routing = RoutingManager(config.state_dir, audit_sink=self._audit_sink)
+        self.sound_settings = SoundSettings(config.state_dir)
         self.voices = VoiceManager(config, config.state_dir, audit_sink=self._audit_sink)
         self.workers = WorkerMonitor(config, self.publish, announce=self._announce)
         self.classifier = SourceClassifier(config.echo_policy)
@@ -144,6 +146,11 @@ class WsCollabService:
         self.capture = CaptureService(
             config, self.devices, self.publish, self.process_segment, is_tts_speaking=lambda: self.tts.is_speaking
         )
+        # Restore the operator's persisted capture-device choice so a restart
+        # resumes on the same input instead of the config/system default.
+        saved_capture_device = self.sound_settings.get("capture_device")
+        if saved_capture_device:
+            self.capture.set_preferred_device(saved_capture_device)
         self.prompt = PromptManager(config, self.publish, read_history=self._prompt_history_events)
         self.accuracy = accuracy_metrics.AccuracyAccumulator()
 
@@ -599,6 +606,7 @@ class WsCollabService:
             raise ValidationError(f"unknown STT engine: {engine!r}", details={"engines": sorted(known)})
         if not device_id:
             self.routing.delete_route(DEFAULT_ROUTE_SOURCE, engine, operator=operator)
+            self.sound_settings.set_engine_device(engine, None)
             return {"engine": engine, "device_id": None, "cleared": True}
         device = self.devices.get(device_id)
         if device is None:
@@ -615,6 +623,7 @@ class WsCollabService:
             command_eligible=device.direction != "loopback",
             tts_accuracy_eligible=device.direction == "loopback",
         )
+        self.sound_settings.set_engine_device(engine, device_id)
         return route.public()
 
     # ------------------------------------------------------- audio defaults
@@ -622,17 +631,28 @@ class WsCollabService:
     def _audio_defaults_path(self) -> Path:
         return Path(self.config.state_dir) / "audio_defaults.json"
 
-    def get_audio_defaults(self) -> dict[str, Any]:
+    def _legacy_agent_output_device(self) -> str:
+        """Read the agent output device from the pre-consolidation legacy file."""
+
         import json
 
-        data: dict[str, Any] = {}
         path = self._audio_defaults_path
         if path.is_file():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
+                return data.get("agent_output_device") or ""
             except (OSError, ValueError):
-                data = {}
-        device_id = data.get("agent_output_device") or ""
+                return ""
+        return ""
+
+    def get_audio_defaults(self) -> dict[str, Any]:
+        device_id = self.sound_settings.get("agent_output_device") or ""
+        if not device_id:
+            # One-time migration from the legacy audio_defaults.json file.
+            migrated = self._legacy_agent_output_device()
+            if migrated:
+                device_id = migrated
+                self.sound_settings.set("agent_output_device", migrated)
         device = self.devices.get(device_id) if device_id else None
         if device_id and device is None:
             # Persisted device is gone (unplugged, host API changed).
@@ -657,9 +677,6 @@ class WsCollabService:
     def set_default_output_device(self, device_id: str, *, operator: str = "operator") -> dict[str, Any]:
         """Set the output device agents speak through by default."""
 
-        import json
-        import os
-
         if device_id:
             device = self.devices.get(device_id)
             if device is None:
@@ -669,11 +686,7 @@ class WsCollabService:
                     "agents must speak through a playback-capable device",
                     details={"device": device.name, "direction": device.direction},
                 )
-        path = self._audio_defaults_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"agent_output_device": device_id}, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        self.sound_settings.set("agent_output_device", device_id or None)
 
         # Agents that never chose their own output device resolve the default at
         # speak time, so this change takes effect immediately with no per-profile
@@ -689,7 +702,10 @@ class WsCollabService:
 
     # ---------------------------------------------------------------- capture
     def start_capture(self, device_id: str | None = None) -> dict[str, Any]:
-        return self.capture.start(device_id=device_id)
+        state = self.capture.start(device_id=device_id)
+        # Persist the active input device so it survives a restart.
+        self.sound_settings.set("capture_device", state.get("device_id") or None)
+        return state
 
     def stop_capture(self) -> dict[str, Any]:
         return self.capture.stop()
