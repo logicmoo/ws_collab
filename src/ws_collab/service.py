@@ -261,6 +261,7 @@ class WsCollabService:
             "rest_base": "/ws_collab",
             "versioned_base": "/ws_collab/v1",
             "streams": STREAMS,
+            "mailboxes": STREAMS,
             "stream_roles": STREAM_ROLES,
             "auth_methods": ["bearer_token", "session_cookie"],
             "features": {
@@ -300,6 +301,199 @@ class WsCollabService:
             correlation_id=correlation_id,
             idempotency_key=idempotency_key,
         )
+
+    # ---------------------------------------------------- mailboxes (streams)
+    # The mailbox-admin chat UI treats every durable JSONL stream as a
+    # "mailbox": the stream file is the mailbox and its events are the messages.
+    # Exposing streams under a mailbox-shaped API lets the shared workbench
+    # ChatConversation browse ws_collab streams with no separate backend.
+    @staticmethod
+    def _event_to_message(event: dict[str, Any]) -> dict[str, Any]:
+        """Map a stream event to the ChatMessage shape ChatConversation reads."""
+        data = event.get("data") or {}
+        text = ""
+        for key in ("text", "message", "content", "summary", "utterance"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value
+                break
+        return {
+            "id": event.get("id"),
+            "timestamp": event.get("ts"),
+            "from": event.get("source_id"),
+            "to": data.get("to") or data.get("target") or event.get("stream"),
+            "send_to": data.get("send_to"),
+            "text": text,
+            "type": event.get("type"),
+            "mailboxId": event.get("stream"),
+            "author": event.get("source_id"),
+            "authorName": data.get("author_name") or event.get("source_id"),
+            "mailboxName": event.get("stream"),
+            "raw": event,
+        }
+
+    def list_mailboxes(self) -> dict[str, Any]:
+        """List every durable stream as a mailbox (one JSONL file each)."""
+        stats = {row["stream"]: row for row in self.store.stats()}
+        mailboxes = [
+            {
+                "id": name,
+                "kind": "stream",
+                "messages": int((stats.get(name) or {}).get("seq") or 0),
+                "name": name,
+                "filename": filename,
+            }
+            for name, filename in STREAMS.items()
+        ]
+        return {"mailboxes": mailboxes, "server_time": utc_now_iso()}
+
+    def mailbox_agents(self) -> dict[str, Any]:
+        """Agents for the YOU/TO pickers: the operator plus registered workers."""
+        agents: list[dict[str, Any]] = [{"id": "operator", "kind": "operator"}]
+        seen = {"operator"}
+        for worker in self.workers.list_workers():
+            worker_id = str(worker.get("worker_id") or worker.get("id") or "")
+            if worker_id and worker_id not in seen:
+                seen.add(worker_id)
+                agents.append({**worker, "id": worker_id, "kind": "worker"})
+        return {"agents": agents}
+
+    def mailbox_messages(
+        self,
+        mailbox: str,
+        *,
+        to: str | None = None,
+        sender: str | None = None,
+        send_to: str | None = None,
+        text: str | None = None,
+        do_filter: bool = False,
+        limit: int = 300,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Messages in a mailbox = events in that stream (newest last).
+
+        Unknown mailboxes read as empty rather than erroring. When ``do_filter``
+        is set, the require-match bar constraints apply: ``sender`` is the chat's
+        YOU (the message ``from``), ``to`` the addressed recipient, ``send_to``
+        the routed mailbox (null == this mailbox) and ``text`` a case-insensitive
+        substring."""
+        if mailbox not in STREAMS:
+            return {"messages": [], "user": sender or "", "peer": mailbox}
+        events = self.store.tail(mailbox, max(1, min(limit, 2000)), _build_predicate(filters))
+        messages = [self._event_to_message(event.to_dict()) for event in events]
+        if do_filter:
+            needle = (text or "").lower()
+
+            def keep(message: dict[str, Any]) -> bool:
+                if sender and message.get("from") != sender:
+                    return False
+                if to and message.get("to") != to:
+                    return False
+                if send_to and (message.get("send_to") or message.get("mailboxId")) != send_to:
+                    return False
+                if needle and needle not in (message.get("text") or "").lower():
+                    return False
+                return True
+
+            messages = [message for message in messages if keep(message)]
+        return {"messages": messages, "user": sender or "", "peer": mailbox}
+
+    def mailbox_send(
+        self,
+        *,
+        to: str,
+        text: str,
+        sender: str,
+        source_kind: str = "agent",
+        send_to: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Post into a mailbox. The message is published to the topic named by
+        the mailbox: an explicit SEND-TO mailbox wins, else the addressed name
+        when it is itself a mailbox/topic, else the shared conversation. The
+        sender is recorded as the event source; a distinct recipient (an agent
+        rather than a topic) is kept in ``data['to']``."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValidationError("message 'text' is required")
+        # send_to / to are mailbox names (topics). Route to the first that names a
+        # real mailbox; a non-mailbox value (e.g. an agent or the default peer)
+        # simply falls through to the shared conversation.
+        topic = next((name for name in (send_to, to) if name and name in STREAMS), STREAM_CONVERSATION)
+        data: dict[str, Any] = {"text": text}
+        if to and to != topic:
+            data["to"] = to
+        published = self.publish(
+            stream=topic,
+            type=CONVERSATION_MESSAGE,
+            data=data,
+            source_id=sender,
+            source_kind=source_kind,
+            idempotency_key=idempotency_key,
+        )
+        message = self._event_to_message({
+            "id": published.get("id"),
+            "ts": published.get("server_time"),
+            "source_id": sender,
+            "source_kind": source_kind,
+            "type": CONVERSATION_MESSAGE,
+            "stream": topic,
+            "data": data,
+        })
+        return {"message": {**message, "seq": published.get("seq"), "cursor": published.get("cursor")}}
+
+    def mailbox_cursor(self, mailbox: str, agent: str) -> dict[str, Any]:
+        """Cursor position of an agent on a mailbox. Streams are read
+        non-consumingly here, so this reports size and a zeroed position."""
+        stats = {row["stream"]: row for row in self.store.stats()}
+        total = int((stats.get(mailbox) or {}).get("seq") or 0)
+        return {
+            "mailbox": mailbox,
+            "agent": agent,
+            "initialized": False,
+            "offset": 0,
+            "size": total,
+            "behind": total,
+            "entries_consumed": 0,
+            "entry_next": None,
+            "entries_total": total,
+        }
+
+    def mailbox_record(self, record_id: str, record: dict[str, Any], mode: str = "at-end") -> dict[str, Any]:
+        """Persist an edited record. Streams are append-only, so both "in-place"
+        and "at-end" append a corrected event (tagged with the id it edits)
+        rather than mutating the durable log."""
+        if not record_id or not isinstance(record, dict):
+            raise ValidationError("id and record object are required")
+        raw = record.get("raw") if isinstance(record.get("raw"), dict) else {}
+        inner = record.get("data") if isinstance(record.get("data"), dict) else None
+        if inner is None and isinstance(raw.get("data"), dict):
+            inner = raw["data"]
+        if inner is None:
+            inner = {"text": record.get("text") or ""}
+        stream = record.get("stream") or record.get("mailboxId") or raw.get("stream") or "conversation"
+        if stream not in STREAMS:
+            raise ValidationError(f"unknown mailbox: {stream!r}", details={"allowed": sorted(STREAMS)})
+        event_type = record.get("type") or raw.get("type") or CONVERSATION_MESSAGE
+        source_id = record.get("source_id") or record.get("author") or record.get("from") or raw.get("source_id") or "operator"
+        source_kind = record.get("source_kind") or raw.get("source_kind") or "operator"
+        payload = {**inner, "edited_from": record_id, "edit_mode": mode}
+        published = self.publish(
+            stream=stream,
+            type=event_type,
+            data=payload,
+            source_id=source_id,
+            source_kind=source_kind,
+        )
+        message = self._event_to_message({
+            "id": published.get("id"),
+            "ts": published.get("server_time"),
+            "source_id": source_id,
+            "source_kind": source_kind,
+            "type": event_type,
+            "stream": stream,
+            "data": payload,
+        })
+        return {"entryKey": published.get("id"), "mailbox": stream, "record": message}
 
     # ------------------------------------------------------------------ workers
     def register_worker(self, worker_id: str, task: str = "", meta: dict[str, Any] | None = None) -> dict[str, Any]:

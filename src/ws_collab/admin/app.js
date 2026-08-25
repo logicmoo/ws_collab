@@ -1749,6 +1749,26 @@ function wireEvents() {
     if (state.streamMode === "tile") renderTiles();
   });
 
+  // Optional fallback: the experimental React streams viewer (kept, unmaintained).
+  // The button lets an operator offer it as a fallback, or turn it off entirely.
+  const REACT_FALLBACK_KEY = "wsc.reactFallback";
+  const applyReactFallback = () => {
+    const on = localStorage.getItem(REACT_FALLBACK_KEY) === "on";
+    const btn = $("st-fallback");
+    const open = $("st-open-react");
+    if (btn) btn.textContent = on ? "React viewer: fallback" : "React viewer: off";
+    if (open) open.style.display = on ? "" : "none";
+  };
+  if ($("st-fallback")) {
+    $("st-fallback").onclick = () => {
+      const on = localStorage.getItem(REACT_FALLBACK_KEY) === "on";
+      localStorage.setItem(REACT_FALLBACK_KEY, on ? "off" : "on");
+      applyReactFallback();
+    };
+  }
+  if ($("st-open-react")) $("st-open-react").onclick = () => { location.href = "react/"; };
+  applyReactFallback();
+
   // page actions
   $("wk-refresh").onclick = loadWorkers;
   $("wk-monitor").onclick = async () => { try { await api(`${V1}/workers/monitor`, { method: "POST", body: {} }); loadWorkers(); } catch (e) { pushError(e.message); } };

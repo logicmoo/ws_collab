@@ -69,7 +69,7 @@ include = ["ws_collab*"]
 # by path. Ship their driver.py/driver.json as package data of ws_collab.drivers,
 # and ship the admin SPA assets as package data of ws_collab.
 [tool.setuptools.package-data]
-"ws_collab" = ["admin/*"]
+"ws_collab" = ["admin/*", "admin/react/*", "admin/react/assets/*"]
 "ws_collab.drivers" = [
     "stt/*/driver.py",
     "stt/*/driver.json",

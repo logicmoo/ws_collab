@@ -78,6 +78,8 @@ def _serve_admin_asset(request: Request, relative: str) -> Response:
         path = safe_join(_ADMIN_DIR, relative)
     except WsCollabError as error:
         raise HTTPException(status_code=error.http_status, detail=error.to_dict()["error"])
+    if path.is_dir():
+        path = path / "index.html"
     if not path.is_file():
         raise HTTPException(status_code=404, detail={"code": "not_found", "message": relative})
     media_type = _EXTRA_MEDIA_TYPES.get(path.suffix.lower())
@@ -336,6 +338,126 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     async def get_conversation(request: Request, after: str | None = Query(None), limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
         await _require(request, "viewer")
         return guarded(service.read_events, "conversation", after=after, limit=limit, filters=_filters(request))
+
+    # --------------------------------------------------------- mailboxes (streams)
+    # Every durable JSONL stream is exposed as a "mailbox" so the shared workbench
+    # ChatConversation UI can browse ws_collab streams (mailbox == stream file).
+    @router.get(f"{mount}/mailbox/mailboxes")
+    async def mailbox_mailboxes(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.list_mailboxes)
+
+    @router.get(f"{mount}/mailbox/agents")
+    async def mailbox_agents(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.mailbox_agents)
+
+    @router.get(f"{mount}/mailbox/messages")
+    async def mailbox_messages(
+        request: Request,
+        mailbox: str | None = Query(None),
+        send_to: str | None = Query(None),
+        to: str | None = Query(None),
+        sender: str | None = Query(None, alias="from"),
+        text: str | None = Query(None),
+        filter: bool = Query(False),  # noqa: A002 - matches the UI query param
+        limit: int = Query(300, ge=1, le=2000),
+    ) -> dict[str, Any]:
+        await _require(request, "viewer")
+        stream = mailbox or send_to or "conversation"
+        return guarded(
+            service.mailbox_messages,
+            stream,
+            to=to,
+            sender=sender,
+            send_to=send_to,
+            text=text,
+            do_filter=filter,
+            limit=limit,
+            filters=_filters(request),
+        )
+
+    @router.post(f"{mount}/mailbox/send")
+    async def mailbox_send(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+        idempotency_key: str | None = Header(None),
+    ) -> dict[str, Any]:
+        auth = await _require(request, "worker", mutating=True)
+        source_id, source_kind = _source(auth, {"source_id": body.get("sender"), "source_kind": body.get("source_kind")})
+        return guarded(
+            service.mailbox_send,
+            to=str(body.get("to") or ""),
+            text=str(body.get("text") or ""),
+            sender=source_id,
+            source_kind=source_kind,
+            send_to=body.get("send_to"),
+            idempotency_key=body.get("idempotency_key") or idempotency_key,
+        )
+
+    @router.get(f"{mount}/mailbox/cursor")
+    async def mailbox_cursor_get(request: Request, mailbox: str = Query(...), agent: str = Query(...)) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.mailbox_cursor, mailbox, agent)
+
+    @router.post(f"{mount}/mailbox/cursor")
+    async def mailbox_cursor_move(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.mailbox_cursor, str(body.get("mailbox") or ""), str(body.get("agent") or ""))
+
+    @router.delete(f"{mount}/mailbox/cursor")
+    async def mailbox_cursor_clear(request: Request, mailbox: str = Query(...), agent: str = Query(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.mailbox_cursor, mailbox, agent)
+
+    @router.get(f"{mount}/mailbox/mailbox-config")
+    async def mailbox_config_get(request: Request, mailbox: str = Query(...)) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return {"mailbox": mailbox, "config": {}}
+
+    @router.post(f"{mount}/mailbox/mailbox-config")
+    async def mailbox_config_set(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return {"mailbox": body.get("mailbox"), "config": body.get("config") or {}, "subscribed": []}
+
+    @router.post(f"{mount}/mailbox/subscription")
+    async def mailbox_subscription(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return {"agent": body.get("agent"), "mailbox": body.get("mailbox"), "state": body.get("state")}
+
+    @router.post(f"{mount}/mailbox/agents")
+    async def mailbox_add_agent(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "worker", mutating=True)
+        agent_id = str(body.get("id") or "").strip()
+        if not agent_id:
+            raise HTTPException(status_code=400, detail={"code": "invalid", "message": "id is required"})
+        return {"id": agent_id, "created": True}
+
+    @router.post(f"{mount}/mailbox/mailboxes")
+    async def mailbox_add(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        # Mailboxes are durable streams defined by the server; they are not
+        # created on demand. Report no-op so the UI stays consistent.
+        await _require(request, "operator", mutating=True)
+        return {"id": str(body.get("id") or ""), "created": False}
+
+    @router.delete(f"{mount}/mailbox/mailboxes")
+    async def mailbox_delete(request: Request, id: str = Query(...)) -> dict[str, Any]:  # noqa: A002 - matches UI param
+        await _require(request, "operator", mutating=True)
+        return {"id": id, "deleted": False}
+
+    @router.post(f"{mount}/mailbox/record")
+    async def mailbox_record(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        record_id = str(body.get("id") or "")
+        record = body.get("record")
+        if not record_id or not isinstance(record, dict):
+            raise HTTPException(status_code=400, detail={"code": "invalid", "message": "id and record object are required"})
+        return guarded(service.mailbox_record, record_id, record, str(body.get("mode") or "at-end"))
+
+    @router.post(f"{mount}/mailbox/entity")
+    async def mailbox_entity(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return {"kind": body.get("kind"), "id": body.get("id"), "entry": body.get("entry")}
 
     # ------------------------------------------------------------------ workers
     @router.post(f"{mount}/workers/register")
