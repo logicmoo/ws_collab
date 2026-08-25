@@ -36,6 +36,7 @@ STREAM_ALERTS = "system_alerts"
 STREAM_AUDIT = "system_audit"
 STREAM_DIAGNOSTICS = "system_diagnostics"
 STREAM_WS_EVENTS = "ws_event_log"
+STREAM_WORKBENCH_EVENTS = "workbench_event_log"
 STREAM_PROMPT = "prompt"
 
 STREAMS: dict[str, str] = {
@@ -50,6 +51,7 @@ STREAMS: dict[str, str] = {
     STREAM_AUDIT: "system_audit.jsonl",
     STREAM_DIAGNOSTICS: "system_diagnostics.jsonl",
     STREAM_WS_EVENTS: "ws_event_log.jsonl",
+    STREAM_WORKBENCH_EVENTS: "workbench_event_log.jsonl",
     STREAM_PROMPT: "prompt_history.jsonl",
 }
 
@@ -67,6 +69,7 @@ STREAM_PURPOSES: dict[str, str] = {
     STREAM_AUDIT: "Administrative audit log.",
     STREAM_DIAGNOSTICS: "Diagnostics and internal telemetry.",
     STREAM_WS_EVENTS: "WebSocket protocol events and errors (e.g. unknown message types).",
+    STREAM_WORKBENCH_EVENTS: "Workbench server events and lifecycle log (workbench-origin stream).",
     STREAM_PROMPT: "Prompt and version history.",
 }
 

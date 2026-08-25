@@ -757,6 +757,12 @@ class WsCollabService:
     def _known_mailbox(self, name: str) -> bool:
         return name in STREAMS or name in self._dynamic_mailboxes or name in self._virtual
 
+    def _stream_origin(self, name: str) -> str:
+        """Which server a stream logically belongs to, for UI disambiguation.
+        Streams named ``workbench_*`` are the workbench server's own streams;
+        everything else is a native ws_collab stream."""
+        return "workbench" if str(name).startswith("workbench_") else "ws_collab"
+
     def _writable_mailbox(self, name: str) -> bool:
         if name in self._virtual:
             return False
@@ -997,6 +1003,7 @@ class WsCollabService:
             "purpose": dyn.get("purpose") or STREAM_PURPOSES.get(name, ""),
             "kind": "stream" if name in STREAMS else "mailbox",
             "source": dyn.get("source") or "jsonl",
+            "origin": self._stream_origin(name),
             "transports": ["jsonl", "ws"],
             "hidden": bool(dyn.get("hidden", False)),
             "writable": self._writable_mailbox(name),
@@ -1052,6 +1059,7 @@ class WsCollabService:
             "purpose": spec.get("purpose", ""),
             "kind": "merge" if source.startswith("merge:") else "registry",
             "source": "virtual",
+            "origin": self._stream_origin(name),
             "definition": source,
             "members": members,
             "rules": spec.get("rules") or [],
