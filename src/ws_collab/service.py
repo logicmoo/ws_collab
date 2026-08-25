@@ -37,6 +37,7 @@ from .events import (
     STREAM_TTS,
     STREAM_ROLES,
     STREAM_STATUSES,
+    STREAM_PURPOSES,
     STREAMS,
     STT_ENGINE_ERROR,
     STT_FINAL_RESULT,
@@ -333,19 +334,33 @@ class WsCollabService:
         }
 
     def list_mailboxes(self) -> dict[str, Any]:
-        """List every durable stream as a mailbox (one JSONL file each)."""
+        """This place's directory of mailboxes. Each entry is self-describing:
+        name, purpose, backing source + transports, live counts, and the
+        endpoints for reading/sending/tailing/streaming it, so a consumer can
+        discover and use a mailbox without hard-coding routes."""
+        v1 = "/ws_collab/v1"
+        mount = "/ws_collab"
         stats = {row["stream"]: row for row in self.store.stats()}
         mailboxes = [
             {
                 "id": name,
-                "kind": "stream",
-                "messages": int((stats.get(name) or {}).get("seq") or 0),
                 "name": name,
+                "purpose": STREAM_PURPOSES.get(name, ""),
+                "kind": "stream",
+                "source": "jsonl",
+                "transports": ["jsonl", "ws"],
+                "messages": int((stats.get(name) or {}).get("seq") or 0),
                 "filename": filename,
+                "endpoints": {
+                    "read": f"{v1}/mailbox/messages?mailbox={name}",
+                    "send": f"{v1}/mailbox/send",
+                    "tail": f"{v1}/streams/{name}/tail",
+                    "ws": f"{mount}/ws",
+                },
             }
             for name, filename in STREAMS.items()
         ]
-        return {"mailboxes": mailboxes, "server_time": utc_now_iso()}
+        return {"place": "ws_collab", "mailboxes": mailboxes, "server_time": utc_now_iso()}
 
     def mailbox_agents(self) -> dict[str, Any]:
         """Agents for the YOU/TO pickers: the operator plus registered workers."""

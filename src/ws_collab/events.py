@@ -51,6 +51,22 @@ STREAMS: dict[str, str] = {
     STREAM_PROMPT: "prompt_history.jsonl",
 }
 
+# Human-readable purpose of each mailbox/stream, surfaced in the mailbox
+# directory so a consumer knows what a mailbox is for at a glance.
+STREAM_PURPOSES: dict[str, str] = {
+    STREAM_CONVERSATION: "Shared chat and coordination between humans and agents.",
+    STREAM_STATUSES: "Worker registration and heartbeat/status updates.",
+    STREAM_TRANSLATED_AUDIO: "Resolved / translated audio utterances.",
+    STREAM_STT_TRANSCRIPTS: "Speech-to-text hypotheses and final transcripts (heard speech).",
+    STREAM_TTS: "Text queued for and spoken by the shared text-to-speech.",
+    STREAM_ROUTING: "Audio device routing decisions.",
+    STREAM_DEVICES: "Enumerated audio input / output devices.",
+    STREAM_ALERTS: "System alerts and warnings.",
+    STREAM_AUDIT: "Administrative audit log.",
+    STREAM_DIAGNOSTICS: "Diagnostics and internal telemetry.",
+    STREAM_PROMPT: "Prompt and version history.",
+}
+
 # Semantic roles -> stream name(s). Clients, the admin UI, documentation, and
 # tests resolve streams through these roles instead of literal names, so a stream
 # can be renamed or split without breaking anything downstream. This registry is
