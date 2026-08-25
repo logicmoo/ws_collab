@@ -18,7 +18,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from .context import AppContext
 from .errors import AuthenticationError, ValidationError, WsCollabError
-from .events import utc_now_iso
+from .events import STREAM_WS_EVENTS, utc_now_iso
 from .notify import Subscription
 
 
@@ -79,6 +79,29 @@ class _WsConnection:
         if ref is not None:
             message["ref"] = ref
         await self._send({"type": "error", **message})
+        self._log_ws_event("error", error, ref)
+
+    def _log_ws_event(self, kind: str, error: WsCollabError, ref: str | None) -> None:
+        """Record a WS protocol event durably on the ``ws_event_log`` stream so it
+        is reviewable as a mailbox, not only echoed to the client. Best-effort."""
+        try:
+            err = error.to_dict().get("error") or {}
+            self.service.publish(
+                stream=STREAM_WS_EVENTS,
+                type="WS_ERROR",
+                data={
+                    "kind": kind,
+                    "code": err.get("code") or error.__class__.__name__,
+                    "message": err.get("message") or str(error),
+                    "ref": ref,
+                    "client_ip": self.client_ip,
+                    "principal": getattr(self.principal, "label", None),
+                },
+                source_id="ws",
+                source_kind="system",
+            )
+        except Exception:
+            pass
 
     def _predicate(self):
         from .service import _build_predicate
