@@ -401,6 +401,11 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         await _require(request, "operator", mutating=True)
         return service.refresh_devices()
 
+    @router.post(f"{mount}/audio/devices/test")
+    async def test_output_device(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.test_output_device, body.get("device_id", ""), text=body.get("text"))
+
     @router.get(f"{mount}/audio/routing")
     async def routing_matrix(request: Request) -> dict[str, Any]:
         await _require(request, "viewer")
@@ -511,6 +516,32 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     async def assign_voices(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
         return guarded(service.assign_voices, body.get("policy"))
+
+    @router.post(f"{mount}/voices/preview")
+    async def preview_voice(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.preview_voice,
+            body.get("voice_id", ""),
+            text=body.get("text"),
+            rate=float(body.get("rate", 1.0)),
+            pitch=float(body.get("pitch", 0.0)),
+            volume=float(body.get("volume", 1.0)),
+        )
+
+    @router.post(f"{mount}/voices/clone")
+    async def clone_voice(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        auth = await _require(request, "operator", mutating=True)
+        return guarded(
+            service.clone_voice,
+            body.get("base_voice_id", ""),
+            body.get("name", ""),
+            rate=float(body.get("rate", 1.0)),
+            pitch=float(body.get("pitch", 0.0)),
+            volume=float(body.get("volume", 1.0)),
+            style=body.get("style", ""),
+            operator=auth.principal.label,
+        )
 
     # Registered after the static routes above so "assign" is never captured as
     # an agent id by this parameterised path.

@@ -51,7 +51,13 @@ class SapiBackend:  # pragma: no cover - requires Windows + pywin32
 
         engine.Rate = int(max(-10, min(10, round((item.rate - 1.0) * 10))))
         engine.Volume = int(max(0, min(100, round(item.volume * 100))))
-        engine.Speak(item.text)
+        text = item.text
+        # SAPI has no Pitch property; pitch is set inline via its XML markup.
+        pitch = int(max(-10, min(10, round(getattr(item, "pitch", 0.0) or 0.0))))
+        if pitch:
+            safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            text = f'<pitch absmiddle="{pitch}">{safe}</pitch>'
+        engine.Speak(text)
         return time.perf_counter() - start
 
 

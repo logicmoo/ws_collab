@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -204,18 +205,83 @@ class VoiceManager:
         self._audit = audit_sink
         self._voices: dict[str, Voice] = {}
         self._profiles: dict[str, AgentVoiceProfile] = {}
+        self._clones: dict[str, dict[str, Any]] = {}
         self._round_robin_index = 0
         self.notes: list[str] = []
-        self.refresh()
         self._load_profiles()
+        self.refresh()
 
     # ------------------------------------------------------------------ catalog
     def refresh(self) -> list[Voice]:
         with self._lock:
             voices, notes = enumerate_voices(self.config)
             self._voices = {voice.id: voice for voice in voices}
+            # Cloned presets are part of the catalog so they can be assigned,
+            # previewed, and resolved just like any other voice.
+            for clone in self._clones.values():
+                self._voices[clone["id"]] = self._clone_to_voice(clone)
             self.notes = notes
             return list(self._voices.values())
+
+    def _clone_to_voice(self, clone: dict[str, Any]) -> Voice:
+        return Voice(
+            id=clone["id"],
+            name=clone.get("name", clone["id"]),
+            provider=clone.get("provider", "fake"),
+            language=clone.get("language", "en-US"),
+            gender=clone.get("gender", "neutral"),
+            style=clone.get("style", "general"),
+            available=True,
+            cost_note=f"clone of {clone.get('base_voice_id', '')}",
+        )
+
+    def effective_voice(self, voice_id: str) -> tuple[str, dict[str, Any]]:
+        """Resolve a (possibly cloned) voice to the engine voice + its params."""
+
+        with self._lock:
+            clone = self._clones.get(voice_id)
+            if clone:
+                return clone["base_voice_id"], {
+                    "rate": clone.get("rate", 1.0),
+                    "pitch": clone.get("pitch", 0.0),
+                    "volume": clone.get("volume", 1.0),
+                    "style": clone.get("style", ""),
+                }
+            return voice_id, {}
+
+    def clone_voice(self, base_voice_id: str, name: str, *, rate: float = 1.0, pitch: float = 0.0,
+                    volume: float = 1.0, style: str = "", operator: str = "operator") -> dict[str, Any]:
+        """Create a named preset ("clone") of a base voice with custom settings."""
+
+        with self._lock:
+            base = self._voices.get(base_voice_id)
+            if base is None:
+                from ..errors import NotFoundError
+
+                raise NotFoundError(f"unknown base voice: {base_voice_id}")
+            slug = re.sub(r"[^a-z0-9]+", "-", (name or "").strip().lower()).strip("-") or "voice"
+            clone_id = f"clone:{slug}"
+            clone = {
+                "id": clone_id,
+                "name": name or slug,
+                "base_voice_id": base_voice_id,
+                "provider": base.provider,
+                "language": base.language,
+                "gender": base.gender,
+                "style": style or base.style,
+                "rate": float(rate),
+                "pitch": float(pitch),
+                "volume": float(volume),
+            }
+            self._clones[clone_id] = clone
+            self._voices[clone_id] = self._clone_to_voice(clone)
+            self._save_profiles()
+        self._audit_event("VOICE_CLONED", clone_id=clone_id, base_voice_id=base_voice_id, operator=operator)
+        return clone
+
+    def list_clones(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(c) for c in self._clones.values()]
 
     @property
     def backend(self) -> str:
@@ -247,9 +313,15 @@ class VoiceManager:
         for entry in payload.get("profiles", []):
             profile = AgentVoiceProfile(**{k: entry[k] for k in entry if k in AgentVoiceProfile.__annotations__})
             self._profiles[profile.agent_id] = profile
+        for clone in payload.get("clones", []):
+            if clone.get("id"):
+                self._clones[clone["id"]] = clone
 
     def _save_profiles(self) -> None:
-        payload = {"profiles": [profile.public() for profile in self._profiles.values()]}
+        payload = {
+            "profiles": [profile.public() for profile in self._profiles.values()],
+            "clones": list(self._clones.values()),
+        }
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         os.replace(tmp, self.path)

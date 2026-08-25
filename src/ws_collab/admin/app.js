@@ -767,7 +767,12 @@ async function loadDevices() {
                   catch (error) { pushError(error.message); }
                   loadDevices();
                 })
-              : "—"),
+              : ((d.direction === "output" || d.direction === "virtual") && d.available
+                  ? actionButton("Test", "", async () => {
+                      try { await api(`${V1}/audio/devices/test`, { method: "POST", body: { device_id: d.id } }); }
+                      catch (error) { pushError(error.message); }
+                    })
+                  : "—")),
       ]);
       const table_ = table(
         ["ID", "Name", "Direction", "Class", "Host API", "Ch", "Rates", "Latency", "Default", "Available", "Select"],
@@ -869,23 +874,37 @@ async function loadVoices() {
     const used = {};
     data.profiles.forEach((p) => { used[p.voice_id] = (used[p.voice_id] || 0) + 1; });
 
-    const profPanel = panel("Agent voice profiles");
+    const numInput = (value, step, lo, hi, onSave) => {
+      const inp = el("input");
+      inp.type = "number"; inp.value = String(value);
+      inp.step = String(step); inp.min = String(lo); inp.max = String(hi);
+      inp.style.width = "62px";
+      inp.onchange = async () => { try { await onSave(parseFloat(inp.value)); } catch (e) { pushError(e.message); } };
+      return inp;
+    };
+    const saveProfile = (agentId, patch) =>
+      api(`${V1}/voices/${encodeURIComponent(agentId)}`, { method: "POST", body: patch });
+
+    const profPanel = panel("Agent voice profiles — Speed and Pitch are editable and persist");
     profPanel.content.appendChild(table(
-      ["Agent", "Voice", "Engine", "Rate", "Vol", "Priority", "Speak", "Conflict", "Preview"],
+      ["Agent", "Voice", "Engine", "Speed", "Pitch", "Vol", "Priority", "Speak", "Conflict", "Preview"],
       data.profiles.map((p) => [
-        mono(p.agent_id), mono(p.voice_id), p.engine, String(p.rate), String(p.volume), String(p.queue_priority),
+        mono(p.agent_id), mono(p.voice_id), p.engine,
+        numInput(p.rate, 0.05, 0.5, 2.0, (v) => saveProfile(p.agent_id, { rate: v })),
+        numInput(p.pitch, 1, -10, 10, (v) => saveProfile(p.agent_id, { pitch: v })),
+        String(p.volume), String(p.queue_priority),
         badge(p.speaking_permission ? "yes" : "muted", p.speaking_permission ? "ok" : "warn"),
         used[p.voice_id] > 1 ? badge("shared", "warn") : badge("unique", "ok"),
         actionButton("Preview", "", async () => {
-          try { await api(`${V1}/tts/speak`, { method: "POST", body: { agent_id: p.agent_id, text: `Voice preview for ${p.agent_id}`, priority: 1 } }); }
+          try { await api(`${V1}/tts/speak`, { method: "POST", body: { agent_id: p.agent_id, text: `This is ${p.agent_id}.`, priority: 1 } }); }
           catch (error) { pushError(error.message); }
         }),
       ])));
     body.appendChild(profPanel.root);
 
-    const voicePanel = panel("Available voices");
+    const voicePanel = panel("Available voices — preview any voice, or clone one with custom speed/pitch");
     voicePanel.content.appendChild(table(
-      ["ID", "Name", "Provider", "Language", "Style", "Locality", "Available", "Assign to"],
+      ["ID", "Name", "Provider", "Language", "Style", "Available", "Assign to", "Actions"],
       data.voices.map((v) => {
         const select = el("select");
         select.appendChild(new Option("—", ""));
@@ -895,8 +914,25 @@ async function loadVoices() {
           try { await api(`${V1}/voices/${encodeURIComponent(select.value)}`, { method: "POST", body: { voice_id: v.id, engine: v.provider } }); loadVoices(); }
           catch (error) { pushError(error.message); }
         };
-        return [mono(v.id), v.name, v.provider, v.language, v.style, v.locality,
-          badge(v.available ? "yes" : "no", v.available ? "ok" : "danger"), select];
+        const actions = el("div", "toolbar");
+        actions.append(
+          actionButton("Preview", "", async () => {
+            try { await api(`${V1}/voices/preview`, { method: "POST", body: { voice_id: v.id } }); }
+            catch (error) { pushError(error.message); }
+          }),
+          actionButton("Clone", "", async () => {
+            const name = prompt(`Clone "${v.name}" as:`, `${v.name} custom`);
+            if (!name) return;
+            const rate = parseFloat(prompt("Speed (0.5 - 2.0):", "1.0") || "1");
+            const pitch = parseFloat(prompt("Pitch (-10 - 10):", "0") || "0");
+            try {
+              await api(`${V1}/voices/clone`, { method: "POST", body: { base_voice_id: v.id, name, rate, pitch } });
+              loadVoices();
+            } catch (error) { pushError(error.message); }
+          }),
+        );
+        return [mono(v.id), v.name, v.provider, v.language, v.style,
+          badge(v.available ? "yes" : "no", v.available ? "ok" : "danger"), select, actions];
       })));
     body.appendChild(voicePanel.root);
   } catch (error) { body.textContent = `error: ${error.message}`; }

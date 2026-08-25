@@ -515,15 +515,19 @@ class WsCollabService:
         if profile and len(text) > profile.max_utterance_chars:
             raise ValidationError("utterance exceeds the agent's max_utterance_chars")
         resolution = self.voices.resolve_for_speak(agent_id)
+        engine_voice, params = self.voices.effective_voice(resolution["voice_id"])
         effective_priority = priority if priority is not None else (profile.queue_priority if profile else 5)
+        base_rate = profile.rate if profile else 1.0
+        base_pitch = profile.pitch if profile else 0.0
+        base_volume = profile.volume if profile else 1.0
         result = self.tts.speak(
             agent_id,
             text,
-            voice_id=resolution["voice_id"],
+            voice_id=engine_voice,
             requested_voice_id=resolution["requested_voice_id"],
-            rate=profile.rate if profile else 1.0,
-            pitch=profile.pitch if profile else 0.0,
-            volume=profile.volume if profile else 1.0,
+            rate=base_rate * params.get("rate", 1.0),
+            pitch=base_pitch + params.get("pitch", 0.0),
+            volume=base_volume * params.get("volume", 1.0),
             device=profile.output_device if profile else "default",
             priority=effective_priority,
             correlation_id=correlation_id,
@@ -560,7 +564,17 @@ class WsCollabService:
         return self.list_devices()
 
     def list_voices(self) -> dict[str, Any]:
-        return {"voices": self.voices.list_voices(), "profiles": self.voices.list_profiles()}
+        return {
+            "voices": self.voices.list_voices(),
+            "profiles": self.voices.list_profiles(),
+            "clones": self.voices.list_clones(),
+        }
+
+    def clone_voice(self, base_voice_id: str, name: str, *, rate: float = 1.0, pitch: float = 0.0,
+                    volume: float = 1.0, style: str = "", operator: str = "operator") -> dict[str, Any]:
+        return self.voices.clone_voice(
+            base_voice_id, name, rate=rate, pitch=pitch, volume=volume, style=style, operator=operator
+        )
 
     def set_voice_profile(self, agent_id: str, updates: dict[str, Any], operator: str = "operator") -> dict[str, Any]:
         return self.voices.set_profile(agent_id, updates, operator=operator).public()
@@ -697,6 +711,76 @@ class WsCollabService:
             "device_id": device_id or None, "operator": operator,
         })
         return self.get_audio_defaults()
+
+    def preview_voice(self, voice_id: str, *, text: str | None = None, rate: float = 1.0,
+                      pitch: float = 0.0, volume: float = 1.0) -> dict[str, Any]:
+        """Speak a short sample with a specific voice (and optional rate/pitch).
+
+        Independent of any agent profile, so the admin UI can audition any voice
+        -- including cloned presets -- before assigning it.
+        """
+
+        voice = self.voices.get_voice(voice_id)
+        if voice is None:
+            raise NotFoundError(f"unknown voice: {voice_id}")
+        engine_voice, params = self.voices.effective_voice(voice_id)
+        sample = text or f"This is {voice.name}, a {voice.language} voice."
+        return self.tts.speak(
+            "preview",
+            sample,
+            voice_id=engine_voice,
+            requested_voice_id=voice_id,
+            rate=float(rate) * params.get("rate", 1.0),
+            pitch=float(pitch) + params.get("pitch", 0.0),
+            volume=float(volume) * params.get("volume", 1.0),
+            priority=1,
+            dedupe=False,
+        )
+
+    def _play_test_tone(self, device: Any) -> bool:
+        """Best-effort: play a short sine tone on a real output device."""
+
+        if getattr(device, "backend", "") != "sounddevice" or device.backend_index is None:
+            return False
+        try:  # pragma: no cover - depends on real audio hardware
+            import numpy as np
+            import sounddevice as sd
+
+            sample_rate = 44100
+            duration = 0.6
+            t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+            tone = (0.2 * np.sin(2 * np.pi * 440.0 * t)).astype("float32")
+            sd.play(tone, samplerate=sample_rate, device=device.backend_index)
+            return True
+        except Exception:
+            return False
+
+    def test_output_device(self, device_id: str, *, text: str | None = None) -> dict[str, Any]:
+        """Play a test sound on a specific output device.
+
+        Prefers a real tone on the exact device; falls back to a spoken test
+        phrase through the TTS engine when a direct tone is not possible.
+        """
+
+        device = self.devices.get(device_id)
+        if device is None:
+            raise NotFoundError(f"unknown device: {device_id}")
+        if device.direction not in ("output", "virtual"):
+            raise ValidationError(
+                "a test sound needs a playback-capable device",
+                details={"device": device.name, "direction": device.direction},
+            )
+        if self._play_test_tone(device):
+            self._audit_sink({"type": "AUDIO_TEST", "action": "test_output_device",
+                              "device_id": device_id, "method": "tone"})
+            return {"device_id": device_id, "device_name": device.name, "method": "tone"}
+        voices = self.voices.list_voices()
+        voice_id = voices[0]["id"] if voices else "fake:aria"
+        result = self.tts.speak(
+            "device-test", text or f"Test sound for {device.name}.",
+            voice_id=voice_id, device=device_id, priority=1, dedupe=False,
+        )
+        return {"device_id": device_id, "device_name": device.name, "method": "tts", "tts": result}
 
     def set_route(self, source: str, engine: str, device_id: str, operator: str = "operator", **params: Any) -> dict[str, Any]:
         return self.routing.set_route(source, engine, device_id, operator=operator, **params).public()

@@ -73,6 +73,18 @@ class _RecordingAdapter(SttAdapter):
         )
 
 
+def test_preview_voice_queues_speech(service) -> None:
+    voice_id = service.list_voices()["voices"][0]["id"]
+    result = service.preview_voice(voice_id)
+    assert result.get("id"), "preview must enqueue an utterance"
+
+
+def test_test_output_device_returns_a_method(service) -> None:
+    speakers = _device_id(service, "Primary Speakers")
+    result = service.test_output_device(speakers)
+    assert result["device_id"] == speakers and result["method"] in ("tone", "tts")
+
+
 def test_all_stt_drivers_share_one_segment() -> None:
     """Every configured driver must receive the *same* captured segment."""
 

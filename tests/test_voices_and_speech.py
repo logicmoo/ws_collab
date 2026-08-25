@@ -132,6 +132,22 @@ def test_out_of_unique_voices_varies_pitch_and_speed(voices) -> None:
     assert any(rate != 1.0 or pitch != 0.0 for _voice, rate, pitch in combos)
 
 
+def test_clone_voice_creates_a_selectable_preset(voices) -> None:
+    base = voices.list_voices()[0]["id"]
+    clone = voices.clone_voice(base, "Deep One", rate=0.9, pitch=-4.0)
+    assert clone["id"].startswith("clone:")
+    assert any(v["id"] == clone["id"] for v in voices.list_voices())
+    engine_voice, params = voices.effective_voice(clone["id"])
+    assert engine_voice == base and params["rate"] == 0.9 and params["pitch"] == -4.0
+
+
+def test_clone_persists_across_reload(voices, config) -> None:
+    base = voices.list_voices()[0]["id"]
+    voices.clone_voice(base, "Persisted Clone", rate=1.1, pitch=3.0)
+    reloaded = VoiceManager(config, config.state_dir)
+    assert any(v["id"] == "clone:persisted-clone" for v in reloaded.list_voices())
+
+
 def test_unknown_policy_is_rejected(voices) -> None:
     with pytest.raises(ValidationError):
         voices.auto_assign([{"agent_id": "a1"}], "telepathy")
