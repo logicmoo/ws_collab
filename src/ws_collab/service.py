@@ -560,21 +560,112 @@ class WsCollabService:
                 return self._records_from_json(json.loads(path.read_text("utf-8-sig")))
             except Exception:
                 return []
-        # remote http(s) endpoint (best-effort, stdlib)
+        # remote http(s) endpoint — a participant may cap/paginate its /v1, often
+        # *silently* (ask per_page=500, get its hard-capped 200, with no has_more).
+        # Strategy: (1) discover the real cap from the first page's length; (2) page
+        # by that EFFECTIVE size — for page+per_page APIs the next page is computed
+        # from how many we've collected, so a 500→200 mismatch can't skip rows; for
+        # offset APIs advance by (page-overlap); follow next_cursor when offered.
+        # (3) keep going while new records appear, stopping on an empty/no-new page.
+        # Dedup by id covers overlaps; _MAX_SCAN and a page ceiling bound it.
         if source.startswith(("http://", "https://")):
-            try:
-                import json
-                import urllib.request
+            import json
+            import re as _re
+            import urllib.request
+            from urllib.parse import parse_qs, quote, urlparse
 
-                with urllib.request.urlopen(source, timeout=3) as response:  # noqa: S310 - operator-configured
-                    payload = json.loads(response.read().decode("utf-8"))
-            except Exception:
-                return []
-            if isinstance(payload, dict):
-                for key in ("agents", "messages", "mailboxes", "items"):
-                    if isinstance(payload.get(key), list):
-                        return [item if isinstance(item, dict) else {"value": item} for item in payload[key]]
-            return self._records_from_json(payload)
+            def _fetch(url: str) -> Any:
+                try:
+                    with urllib.request.urlopen(url, timeout=3) as response:  # noqa: S310 - operator-configured
+                        return json.loads(response.read().decode("utf-8"))
+                except Exception:
+                    return None
+
+            def _page_records(payload: Any) -> list[dict[str, Any]]:
+                if isinstance(payload, dict):
+                    for key in ("messages", "events", "agents", "mailboxes", "items"):
+                        if isinstance(payload.get(key), list):
+                            return [it if isinstance(it, dict) else {"value": it} for it in payload[key]]
+                return self._records_from_json(payload) if payload is not None else []
+
+            def _with_param(url: str, name: str, value: Any) -> str:
+                pat = rf"([?&]{_re.escape(name)}=)[^&]*"
+                if _re.search(pat, url):
+                    return _re.sub(pat, lambda m: m.group(1) + quote(str(value)), url)
+                return f"{url}{'&' if '?' in url else '?'}{name}={quote(str(value))}"
+
+            paging = spec.get("paging") if isinstance(spec.get("paging"), dict) else {}
+            overlap = int(paging.get("overlap") or 2)
+            page_step = int(paging.get("step") or 0)
+            qs = parse_qs(urlparse(source).query)
+            page_param = next((p for p in ("page", "pageNumber", "p") if p in qs), None)
+            per_page_param = next((p for p in ("per_page", "perPage", "pageSize", "page_size") if p in qs), "per_page")
+            offset_param = next((p for p in ("offset", "start", "skip", "after") if p in qs), "offset")
+            mode = str(paging.get("mode") or ("page" if page_param else "offset")).lower()
+            page_base = int(paging.get("base", 1))
+            # Requested page size — a probe for the server's real cap.
+            req_pp = int(paging.get("limit") or 0)
+            if req_pp <= 0:
+                for p in (per_page_param, "limit"):
+                    if p in qs:
+                        try:
+                            req_pp = int(qs[p][0])
+                        except Exception:
+                            req_pp = 0
+                        if req_pp > 0:
+                            break
+            if req_pp <= 0:
+                req_pp = 500
+            size_param = per_page_param if mode == "page" else "limit"
+            source = _with_param(source, size_param, req_pp)
+
+            records: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            seen_cursors: set[str] = set()
+            effective_pp: int | None = None
+            page_num = page_base
+            offset = 0
+            url = _with_param(source, page_param or "page", page_num) if mode == "page" else source
+            for _ in range(2000):  # page-count safety ceiling
+                payload = _fetch(url)
+                if payload is None:
+                    break
+                page = _page_records(payload)
+                if not page:
+                    break  # an empty page is the reliable "done" signal
+                if effective_pp is None:
+                    effective_pp = len(page)  # discover the server's real cap
+                new = 0
+                for rec in page:
+                    rid = rec.get("id") if isinstance(rec, dict) else None
+                    key = f"id:{rid}" if rid is not None else json.dumps(rec, sort_keys=True, default=str)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    records.append(rec)
+                    new += 1
+                if len(records) >= _MAX_SCAN:
+                    break
+                # We NEVER trust has_more as a stop signal (peers lie or send it
+                # prematurely). The only reliable ends are an empty page (handled
+                # above) or a page that yields no NEW records after dedup.
+                if new == 0:
+                    break
+                nxt = payload.get("next_cursor") if isinstance(payload, dict) else None
+                if nxt and str(nxt) not in seen_cursors:
+                    seen_cursors.add(str(nxt))  # next_cursor is only an advance hint
+                    url = _with_param(source, "after", nxt)
+                    continue
+                if mode == "page":
+                    pp = effective_pp or len(page) or 1
+                    # Continue from the page the last collected unit lands on (by the
+                    # EFFECTIVE size), realigning per_page so a silent cap can't skip.
+                    page_num = (len(records) // pp) + page_base
+                    url = _with_param(_with_param(source, per_page_param, pp), page_param or "page", page_num)
+                else:
+                    offset += page_step if page_step > 0 else max(1, len(page) - overlap)
+                    url = _with_param(source, offset_param, offset)
+            return records[:_MAX_SCAN]
         return []
 
     _MAILBOX_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -670,6 +761,7 @@ class WsCollabService:
         source: str = "jsonl",
         rules: Any = None,
         policy: str = "",
+        paging: Any = None,
         created_by: str = "operator",
     ) -> dict[str, Any]:
         """Begin hosting a new client-created mailbox (a durable JSONL stream).
@@ -708,6 +800,10 @@ class WsCollabService:
                 spec["rules"] = [r for r in rules if isinstance(r, dict)]
             if policy:
                 spec["policy"] = str(policy)
+            if isinstance(paging, dict):
+                pg = {k: paging[k] for k in ("limit", "step", "overlap") if isinstance(paging.get(k), (int, float))}
+                if pg:
+                    spec["paging"] = pg
             self._virtual[name] = spec
             self._save_virtual_registry()
             return {"created": True, "mailbox": self._virtual_descriptor(name)}

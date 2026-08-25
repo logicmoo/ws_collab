@@ -447,6 +447,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             source=str(body.get("source") or "jsonl"),
             rules=body.get("rules"),
             policy=str(body.get("policy") or ""),
+            paging=body.get("paging"),
             created_by=body.get("created_by") or auth.principal.label or "operator",
         )
 
@@ -464,6 +465,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             source=str(body.get("source") or "jsonl"),
             rules=body.get("rules"),
             policy=str(body.get("policy") or ""),
+            paging=body.get("paging"),
             created_by=body.get("created_by") or auth.principal.label or "operator",
         )
 
