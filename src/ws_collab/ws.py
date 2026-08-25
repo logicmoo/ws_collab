@@ -149,6 +149,9 @@ class _WsConnection:
                 await self._handle_cursor(frame)
             elif kind == "ping":
                 await self._send({"type": "pong", "server_time": utc_now_iso()})
+            elif kind == "pong":
+                # Client heartbeat/keepalive reply — accept and ignore.
+                return
             else:
                 raise ValidationError(f"unknown message type: {kind!r}")
         except WsCollabError as error:
