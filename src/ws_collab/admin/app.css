@@ -324,13 +324,13 @@ button.tristate[data-state="hide"] {
   box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.55);
 }
 button.tristate[data-state="hide"]::before { content: "\2715\00a0"; }
-button.tristate[data-state="filtered"] {
+button.tristate[data-state="neutral"] {
   background: #3a2e07;
   border-color: #caa14a;
   color: #e6c56b;
   box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.55);
 }
-button.tristate[data-state="filtered"]::before { content: "\25D0\00a0"; }
+button.tristate[data-state="neutral"]::before { content: "\25D0\00a0"; }
 
 .toolbar-sep {
   width: 1px;

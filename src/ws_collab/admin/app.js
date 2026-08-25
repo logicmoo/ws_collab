@@ -656,7 +656,7 @@ const DEVICE_FILTER_DEFAULTS = {
   inputs: "show", outputs: "show", physical: "show", loopback: "show",
   virtual: "show", unknown: "hide", disabled: "hide",
 };
-const DEVICE_FILTER_STATES = ["show", "hide", "filtered"];
+const DEVICE_FILTER_STATES = ["hide", "show", "neutral"];
 
 function catState(cat) {
   return localStorage.getItem(`ws_collab_devfilter_${cat}`) || DEVICE_FILTER_DEFAULTS[cat] || "show";
@@ -665,7 +665,7 @@ function catState(cat) {
 function wireCatFilter(button, onChange) {
   const cat = button.dataset.cat;
   button.dataset.state = catState(cat);
-  button.title = `${cat}: click to cycle show → hide → filtered`;
+  button.title = `${cat}: click to cycle hide → show → neutral`;
   button.addEventListener("click", () => {
     const cur = DEVICE_FILTER_STATES.indexOf(button.dataset.state || "show");
     const next = DEVICE_FILTER_STATES[(cur + 1) % DEVICE_FILTER_STATES.length];
@@ -700,7 +700,7 @@ function deviceVerdict(device) {
   for (const cat of deviceCategories(device)) {
     const s = catState(cat);
     if (s === "hide") return { state: "hide", reason: `${cat} hidden` };
-    if (s === "filtered" && state === "show") { state = "filtered"; reason = `${cat} filtered`; }
+    if (s === "neutral" && state === "show") { state = "neutral"; reason = `${cat} neutral`; }
   }
   const needle = ($("dv-search").value || "").trim().toLowerCase();
   if (needle) {
@@ -734,10 +734,10 @@ async function loadDevices() {
       return { device: d, state: verdict.state, reason: verdict.reason };
     });
     const shownCount = decorated.filter((r) => r.state === "show").length;
-    const filteredCount = decorated.filter((r) => r.state === "filtered").length;
+    const neutralCount = decorated.filter((r) => r.state === "neutral").length;
     const visible = decorated.filter((r) => r.state !== "hide");
     $("dv-counts").textContent =
-      `${shownCount} shown · ${filteredCount} filtered · ${all.length - visible.length} hidden`;
+      `${shownCount} shown · ${neutralCount} neutral · ${all.length - visible.length} hidden`;
 
     const target = $("dv-table");
     target.replaceChildren();
@@ -754,7 +754,7 @@ async function loadDevices() {
         [d.is_default_input && "in", d.is_default_output && "out", d.is_default_comm && "comm"]
           .filter(Boolean).join("/") || "—",
         badge(d.available ? "yes" : "no", d.available ? "ok" : "danger"),
-        state === "filtered"
+        state === "neutral"
           ? badge(reason, "warn")
           : (deviceGroup(d) === "input" && d.available
               ? actionButton("Use", "", async () => {
@@ -768,10 +768,10 @@ async function loadDevices() {
       const table_ = table(
         ["ID", "Name", "Direction", "Class", "Host API", "Ch", "Rates", "Latency", "Default", "Available", "Select"],
         rows);
-      // Mark filtered rows so it is obvious they are excluded, not selectable.
+      // Mark neutral rows so it is obvious they are passive, not selectable.
       const bodyRows = table_.querySelectorAll("tbody tr");
       visible.forEach((row, index) => {
-        if (row.state === "filtered" && bodyRows[index]) bodyRows[index].classList.add("filtered-out");
+        if (row.state === "neutral" && bodyRows[index]) bodyRows[index].classList.add("filtered-out");
       });
       target.appendChild(table_);
     }
