@@ -443,6 +443,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             purpose=str(body.get("purpose") or ""),
             hidden=bool(body.get("hidden", False)),
             writable=bool(body.get("writable", True)),
+            global_name=str(body.get("global_name") or ""),
             source=str(body.get("source") or "jsonl"),
             created_by=body.get("created_by") or auth.principal.label or "operator",
         )
@@ -457,6 +458,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             purpose=str(body.get("purpose") or ""),
             hidden=bool(body.get("hidden", False)),
             writable=bool(body.get("writable", True)),
+            global_name=str(body.get("global_name") or ""),
             source=str(body.get("source") or "jsonl"),
             created_by=body.get("created_by") or auth.principal.label or "operator",
         )

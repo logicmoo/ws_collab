@@ -9,6 +9,7 @@ a restricted file (its path is printed, the secret itself is not).
 from __future__ import annotations
 
 import os
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +42,27 @@ def _as_int(value: str | None, default: int) -> int:
         return int(value)
     except ValueError as error:
         raise ConfigurationError(f"invalid integer value: {value!r}") from error
+
+
+def _parse_virtual_mailboxes(raw: str | None, default: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Parse WS_COLLAB_VIRTUAL_MAILBOXES: a JSON list of {source, mailbox, purpose?}."""
+    if not raw or not raw.strip():
+        return default
+    try:
+        data = json.loads(raw)
+    except ValueError as error:
+        raise ConfigurationError(f"invalid VIRTUAL_MAILBOXES JSON: {error}") from error
+    if not isinstance(data, list):
+        raise ConfigurationError("VIRTUAL_MAILBOXES must be a JSON list")
+    result: list[dict[str, str]] = []
+    for item in data:
+        if isinstance(item, dict) and item.get("mailbox") and item.get("source"):
+            result.append({
+                "source": str(item["source"]),
+                "mailbox": str(item["mailbox"]),
+                "purpose": str(item.get("purpose", "")),
+            })
+    return result or default
 
 
 def _as_list(value: str | None) -> list[str]:
@@ -144,6 +166,21 @@ class Config:
 
     # Agents
     agents: list[str] = field(default_factory=list)
+
+    # Federation: a globally-unique prefix prepended to this server's local
+    # mailbox names to form their global names (e.g. "ws_collab/conversation").
+    global_name: str = "ws_collab"
+
+    # Virtual (emulated) read-only mailboxes: each projects a source (a disk JSON
+    # file, or a `self:`/http endpoint) as a mailbox. Configure via
+    # WS_COLLAB_VIRTUAL_MAILBOXES (a JSON list of {source, mailbox, purpose?}).
+    virtual_mailboxes: list[dict[str, str]] = field(default_factory=lambda: [
+        {
+            "source": "self:mailbox/agents",
+            "mailbox": "server-agents",
+            "purpose": "Agents/users directory, emulated as a read-only stream.",
+        }
+    ])
 
     # Derived / diagnostic
     warnings: list[str] = field(default_factory=list)
@@ -281,6 +318,8 @@ class Config:
         cfg.tts_policy = get("TTS_POLICY") or cfg.tts_policy
 
         cfg.agents = _collect_agents(env)
+        cfg.global_name = get("GLOBAL_NAME") if get("GLOBAL_NAME") is not None else cfg.global_name
+        cfg.virtual_mailboxes = _parse_virtual_mailboxes(get("VIRTUAL_MAILBOXES"), cfg.virtual_mailboxes)
 
         cfg.validate()
         return cfg

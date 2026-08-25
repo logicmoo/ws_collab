@@ -59,6 +59,7 @@ All paths below are under the REST mount `/ws_collab/v1` (also mounted at
 {
   "id": "conversation",
   "name": "conversation",
+  "global_name": "ws_collab/conversation",
   "purpose": "Shared chat and coordination between humans and agents.",
   "kind": "stream",
   "source": "jsonl",
@@ -95,16 +96,31 @@ The directory response is `{ "place": "ws_collab", "mailboxes": [...], "server_t
 is the first mailbox name among `send_to`, then `to`, else `conversation`; a
 distinct recipient is kept in `data.to`.
 
+## Names and federation
+
+Each mailbox has a server-local `name` and a globally-unique `global_name`. The
+server config sets a `global_name` prefix (env `WS_COLLAB_GLOBAL_NAME`, default
+`ws_collab`) that is prepended to every local name, e.g. `conversation` →
+`ws_collab/conversation`. A mailbox may also carry an explicit `global_name`
+override. The directory lists **both** names, and the response header carries the
+place's `global_name`, so a federated chat can merge many places without
+collisions.
+
 ## Writable and virtual mailboxes
 
 * Each mailbox declares `writable`. Built-in streams and dynamic mailboxes are
   writable by default; a dynamic mailbox may be created read-only with
   `writable: false`. Posting (`send`) or editing (`record`) a non-writable
   mailbox is refused (a `send` simply falls back to `conversation`).
-* A server may **emulate** read-only mailboxes that project internal state as a
-  JSONL stream instead of a durable file. ws_collab exposes `server-agents`
-  (`source: "virtual"`, `writable: false`): reading it returns the agents/users
-  directory, one agent per message. Its `raw` field is the full agent record.
+* **Virtual (emulated) mailboxes** are config-driven and read-only: each projects
+  a `source` as a JSONL stream. Configure via `WS_COLLAB_VIRTUAL_MAILBOXES`, a
+  JSON list of `{source, mailbox, purpose?}`. Sources:
+  * `self:mailbox/agents` (or `self:mailbox/mailboxes`) — an internal endpoint.
+  * `./file.json` / `/abs/path.json` (relative resolves under the state dir) — a
+    disk JSON file (list, or object keyed by id); BOM-tolerant.
+  * `http(s)://host/…` — a remote endpoint (best-effort; extracts an
+    `agents`/`messages`/`mailboxes`/`items` list or a bare list).
+  `server-agents` (source `self:mailbox/agents`) is just the default entry.
 
 ## Agents (users)
 

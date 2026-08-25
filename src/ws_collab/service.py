@@ -170,6 +170,20 @@ class WsCollabService:
         self._agents: dict[str, dict[str, Any]] = {}
         self._load_agent_registry()
 
+        # Config-declared virtual (emulated) read-only mailboxes: name -> spec.
+        # Each projects a source (a disk JSON file, or a self:/http endpoint) as
+        # a read-only mailbox. server-agents is just the default entry.
+        self._virtual: dict[str, dict[str, str]] = {
+            str(entry.get("mailbox")): {
+                "source": str(entry.get("source", "")),
+                "purpose": str(entry.get("purpose", "")),
+            }
+            for entry in (getattr(config, "virtual_mailboxes", None) or [])
+            if entry.get("mailbox") and entry.get("source")
+        }
+        # Global namespace prefix for this server's mailboxes (federation).
+        self._global_name = str(getattr(config, "global_name", "") or "").strip()
+
     # ------------------------------------------------------------------ core io
     def publish(
         self,
@@ -376,19 +390,27 @@ class WsCollabService:
         except OSError:
             pass
 
-    # Read-only "virtual" mailboxes the server emulates by projecting internal
-    # state as a JSONL stream (e.g. the agents/users directory).
-    VIRTUAL_MAILBOXES = {"server-agents": "Agents/users directory, emulated as a read-only stream."}
-
     def _known_mailbox(self, name: str) -> bool:
-        return name in STREAMS or name in self._dynamic_mailboxes or name in self.VIRTUAL_MAILBOXES
+        return name in STREAMS or name in self._dynamic_mailboxes or name in self._virtual
 
     def _writable_mailbox(self, name: str) -> bool:
-        if name in self.VIRTUAL_MAILBOXES:
+        if name in self._virtual:
             return False
         if name in self._dynamic_mailboxes:
             return self._dynamic_mailboxes[name].get("writable", True) is not False
         return name in STREAMS
+
+    def _global_id(self, name: str) -> str:
+        """The globally-unique name for a local mailbox: an explicit per-mailbox
+        override if set, else the server's global prefix + local name."""
+        override = None
+        if name in self._dynamic_mailboxes:
+            override = self._dynamic_mailboxes[name].get("global_name")
+        elif name in self._virtual:
+            override = self._virtual[name].get("global_name")
+        if override:
+            return str(override)
+        return f"{self._global_name}/{name}" if self._global_name else name
 
     # -------------------------------------------------- agent (user) registry
     def _agent_registry_path(self) -> Path:
@@ -432,25 +454,78 @@ class WsCollabService:
         self._save_agent_registry()
         return {"id": agent_id, "properties": record}
 
-    @staticmethod
-    def _agent_as_message(agent: dict[str, Any]) -> dict[str, Any]:
-        """Project one agent (user) as a message record for the emulated
-        `server-agents` mailbox."""
-        agent_id = str(agent.get("id") or "")
+    def _virtual_message(self, mailbox: str, record: dict[str, Any]) -> dict[str, Any]:
+        """Project one source record as a message for an emulated mailbox."""
+        record_id = str(record.get("id") or record.get("name") or "")
         return {
-            "id": f"agent:{agent_id}",
-            "timestamp": agent.get("updated_at") or agent.get("created_at"),
+            "id": f"{mailbox}:{record_id}" if record_id else f"{mailbox}:{id(record)}",
+            "timestamp": record.get("updated_at") or record.get("created_at"),
             "from": "server",
-            "to": agent_id,
-            "send_to": "server-agents",
-            "text": agent_id,
-            "type": "AGENT",
-            "mailboxId": "server-agents",
+            "to": record_id or mailbox,
+            "send_to": mailbox,
+            "text": record_id or str(record.get("text") or ""),
+            "type": "RECORD",
+            "mailboxId": mailbox,
             "author": "server",
             "authorName": "server",
-            "mailboxName": "server-agents",
-            "raw": agent,
+            "mailboxName": mailbox,
+            "raw": record,
         }
+
+    @staticmethod
+    def _records_from_json(data: Any) -> list[dict[str, Any]]:
+        if isinstance(data, list):
+            return [item if isinstance(item, dict) else {"value": item} for item in data]
+        if isinstance(data, dict):
+            records: list[dict[str, Any]] = []
+            for key, value in data.items():
+                records.append({"id": key, **value} if isinstance(value, dict) else {"id": key, "value": value})
+            return records
+        return []
+
+    def _resolve_virtual_records(self, mailbox: str) -> list[dict[str, Any]]:
+        """Resolve a virtual mailbox's source into a list of records."""
+        spec = self._virtual.get(mailbox)
+        if not spec:
+            return []
+        source = str(spec.get("source", "")).strip()
+        # self endpoints, resolved internally (no HTTP self-call)
+        for prefix in ("self:", "http://self/", "https://self/"):
+            if source.startswith(prefix):
+                endpoint = source[len(prefix):].strip("/")
+                if endpoint in ("mailbox/agents", "agents"):
+                    return self.mailbox_agents().get("agents", [])
+                if endpoint in ("mailbox/mailboxes", "mailboxes"):
+                    return self.list_mailboxes().get("mailboxes", [])
+                return []
+        # disk JSON file (relative paths resolve under the state directory)
+        if source.startswith(("file:", "./", "../", "/")) or source.endswith(".json"):
+            path_str = source[5:] if source.startswith("file:") else source
+            path = Path(path_str)
+            if not path.is_absolute():
+                path = Path(self.store.directory) / path
+            try:
+                import json
+
+                return self._records_from_json(json.loads(path.read_text("utf-8-sig")))
+            except Exception:
+                return []
+        # remote http(s) endpoint (best-effort, stdlib)
+        if source.startswith(("http://", "https://")):
+            try:
+                import json
+                import urllib.request
+
+                with urllib.request.urlopen(source, timeout=3) as response:  # noqa: S310 - operator-configured
+                    payload = json.loads(response.read().decode("utf-8"))
+            except Exception:
+                return []
+            if isinstance(payload, dict):
+                for key in ("agents", "messages", "mailboxes", "items"):
+                    if isinstance(payload.get(key), list):
+                        return [item if isinstance(item, dict) else {"value": item} for item in payload[key]]
+            return self._records_from_json(payload)
+        return []
 
     _MAILBOX_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -463,6 +538,7 @@ class WsCollabService:
         return {
             "id": name,
             "name": name,
+            "global_name": self._global_id(name),
             "purpose": dyn.get("purpose") or STREAM_PURPOSES.get(name, ""),
             "kind": "stream" if name in STREAMS else "mailbox",
             "source": dyn.get("source") or "jsonl",
@@ -491,17 +567,25 @@ class WsCollabService:
             for name in names
             if not self._dynamic_mailboxes.get(name, {}).get("hidden")
         ]
-        for vname, vpurpose in self.VIRTUAL_MAILBOXES.items():
-            mailboxes.append(self._virtual_descriptor(vname, vpurpose))
-        return {"place": "ws_collab", "mailboxes": mailboxes, "server_time": utc_now_iso()}
+        for vname in self._virtual:
+            mailboxes.append(self._virtual_descriptor(vname))
+        return {"place": "ws_collab", "global_name": self._global_name, "mailboxes": mailboxes, "server_time": utc_now_iso()}
 
-    def _virtual_descriptor(self, name: str, purpose: str) -> dict[str, Any]:
+    def _virtual_descriptor(self, name: str) -> dict[str, Any]:
         """Descriptor for an emulated read-only mailbox (projected server state)."""
-        count = len(self.mailbox_agents().get("agents", [])) if name == "server-agents" else 0
+        spec = self._virtual.get(name) or {}
+        source = str(spec.get("source", ""))
+        count = 0
+        if source.rstrip("/").endswith("agents"):
+            try:
+                count = len(self.mailbox_agents().get("agents", []))
+            except Exception:
+                count = 0
         return {
             "id": name,
             "name": name,
-            "purpose": purpose,
+            "global_name": self._global_id(name),
+            "purpose": spec.get("purpose", ""),
             "kind": "registry",
             "source": "virtual",
             "transports": ["jsonl"],
@@ -519,6 +603,7 @@ class WsCollabService:
         purpose: str = "",
         hidden: bool = False,
         writable: bool = True,
+        global_name: str = "",
         source: str = "jsonl",
         created_by: str = "operator",
     ) -> dict[str, Any]:
@@ -538,6 +623,7 @@ class WsCollabService:
             "purpose": str(purpose or ""),
             "hidden": bool(hidden),
             "writable": bool(writable),
+            "global_name": str(global_name or ""),
             "source": str(source or "jsonl"),
             "created_at": utc_now_iso(),
             "created_by": str(created_by or "operator"),
@@ -609,8 +695,9 @@ class WsCollabService:
         YOU (the message ``from``), ``to`` the addressed recipient, ``send_to``
         the routed mailbox (null == this mailbox) and ``text`` a case-insensitive
         substring."""
-        if mailbox in self.VIRTUAL_MAILBOXES:
-            messages = [self._agent_as_message(agent) for agent in self.mailbox_agents().get("agents", [])]
+        if mailbox in self._virtual:
+            records = self._resolve_virtual_records(mailbox)
+            messages = [self._virtual_message(mailbox, record) for record in records]
             if do_filter and text:
                 needle = text.lower()
                 messages = [m for m in messages if needle in (m.get("text") or "").lower()]
