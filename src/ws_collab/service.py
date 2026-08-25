@@ -586,7 +586,7 @@ class WsCollabService:
             "name": name,
             "global_name": self._global_id(name),
             "purpose": spec.get("purpose", ""),
-            "kind": "registry",
+            "kind": "merge" if source.startswith("merge:") else "registry",
             "source": "virtual",
             "transports": ["jsonl"],
             "hidden": False,
@@ -696,8 +696,17 @@ class WsCollabService:
         the routed mailbox (null == this mailbox) and ``text`` a case-insensitive
         substring."""
         if mailbox in self._virtual:
-            records = self._resolve_virtual_records(mailbox)
-            messages = [self._virtual_message(mailbox, record) for record in records]
+            source = str(self._virtual[mailbox].get("source", ""))
+            if source.startswith("merge:"):
+                subs = [n.strip() for n in source[len("merge:"):].split(",") if n.strip() and n.strip() != mailbox]
+                merged: list[dict[str, Any]] = []
+                for sub in subs:
+                    merged.extend(self.mailbox_messages(sub, limit=limit).get("messages", []))
+                merged.sort(key=lambda m: str(m.get("timestamp") or ""))
+                messages = merged[-max(1, min(limit, 2000)):]
+            else:
+                records = self._resolve_virtual_records(mailbox)
+                messages = [self._virtual_message(mailbox, record) for record in records]
             if do_filter and text:
                 needle = text.lower()
                 messages = [m for m in messages if needle in (m.get("text") or "").lower()]

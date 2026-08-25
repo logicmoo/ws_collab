@@ -120,7 +120,12 @@ collisions.
     disk JSON file (list, or object keyed by id); BOM-tolerant.
   * `http(s)://host/…` — a remote endpoint (best-effort; extracts an
     `agents`/`messages`/`mailboxes`/`items` list or a bare list).
+  * `merge:mb1,mb2,…` — a read-only union of several mailboxes, merged and
+    sorted by timestamp (newest last).
   `server-agents` (source `self:mailbox/agents`) is just the default entry.
+
+A chat client can also merge several mailboxes into one view on its side; the
+`merge:` virtual mailbox is the server-side equivalent, shareable across places.
 
 ## Agents (users)
 
