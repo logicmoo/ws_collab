@@ -14,9 +14,19 @@ WS_COLLAB runs two ways:
   router directly into the host app under `/ws_collab`. This is supported and works,
   but it is **not tested as thoroughly** as the standalone path, and — because the
   shared service layer eagerly wires up the audio, STT, and TTS subsystems —
-  importing it **pulls the full WS_COLLAB dependency stack (audio/STT/TTS) into the
-  host process**. Prefer the standalone + `web_proxy` deployment unless you
-  specifically want everything in one process.
+  importing it **pulls the full WS_COLLAB dependency stack into the host process**.
+  With the in-process path the host venv must carry whatever optional extras you
+  enable, and model-backed STT engines (`whisper`, `vosk`, and especially `nemo`,
+  which brings torch) can **download multi-gigabyte models**. Prefer the standalone
+  + `web_proxy` deployment, run from its **own venv**, so the host/workbench venv
+  stays clean.
+
+Dependencies stay light by default: the base install is only
+`fastapi`/`uvicorn`/`starlette` (no ML libraries, no model downloads). Everything
+hardware/model specific is an opt-in extra (`audio`, `vosk`, `whisper`, `nemo`,
+`sapi`, …); the `all` extra deliberately **excludes `nemo`**. The bundled TTS
+backends are `fake` (default, hardware-free) and `sapi` (Windows built-in) — **no
+TTS backend downloads models**.
 
 ```
   microphone ─▶ VAD ─▶ segment ─┬─▶ STT engine A ─┐
