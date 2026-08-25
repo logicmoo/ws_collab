@@ -377,6 +377,21 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             filters=_filters(request),
         )
 
+    @router.get(f"{mount}/mailbox/field-values")
+    async def mailbox_field_values(request: Request, mailbox: str = Query(...)) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.field_values, mailbox)
+
+    @router.post(f"{mount}/mailbox/field-limit")
+    async def mailbox_field_limit(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.set_field_cache_limit,
+            str(body.get("field") or ""),
+            int(body.get("limit") or 0),
+            stream=str(body.get("stream") or ""),
+        )
+
     @router.post(f"{mount}/mailbox/send")
     async def mailbox_send(
         request: Request,

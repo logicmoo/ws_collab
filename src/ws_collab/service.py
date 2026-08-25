@@ -191,6 +191,228 @@ class WsCollabService:
         # Global namespace prefix for this server's mailboxes (federation).
         self._global_name = str(getattr(config, "global_name", "") or "").strip()
 
+        # Per-stream, per-field cache of the last 16 distinct values seen (plus each
+        # field's inferred value type), so the render/filter pickers can offer
+        # candidates and later use them intelligently. Durable on disk.
+        self._field_cache: dict[str, dict[str, list[str]]] = {}
+        self._field_types: dict[str, dict[str, str]] = {}
+        # Per-field cache-limit overrides, layered: a per-(stream,field) override wins
+        # over a global by-field override ("cache-overrides"), which wins over the
+        # default cached_limit.
+        self._field_overrides_global: dict[str, int] = {}
+        self._field_overrides_stream: dict[str, dict[str, int]] = {}
+        self._field_cache_dirty = False
+        self._field_cache_saved_at = 0.0
+        self._load_field_cache()
+
+    # ------------------------------------------- per-field value cache (candidates)
+    _FIELD_CACHE_SKIP = {"id", "raw", "text", "timestamp", "ts", "seq", "mailboxId", "forwarded_by"}
+    _FIELD_CACHE_MAX = 16
+
+    def _field_cache_path(self) -> Path:
+        return Path(self.store.directory) / "cached_stream_feilds.json"
+
+    def _load_field_cache(self) -> None:
+        import json
+
+        try:
+            raw = json.loads(self._field_cache_path().read_text("utf-8"))
+        except Exception:
+            return
+        if not isinstance(raw, dict):
+            return
+        # Top-level "cache-overrides": global per-field limits (e.g. {"kind": 400}).
+        glob = raw.get("cache-overrides")
+        if isinstance(glob, dict):
+            for field, lim in glob.items():
+                if isinstance(field, str) and isinstance(lim, (int, float)) and int(lim) > 0:
+                    self._field_overrides_global[field] = int(lim)
+        for stream, entry in raw.items():
+            if stream == "cache-overrides" or not isinstance(stream, str) or not isinstance(entry, dict):
+                continue
+            out: dict[str, list[str]] = {}
+            out_types: dict[str, str] = {}
+            # Per-stream "cache-overrides": {field: limit} beats the global ones.
+            s_over = entry.get("cache-overrides")
+            if isinstance(s_over, dict):
+                self._field_overrides_stream[stream] = {
+                    str(f): int(v) for f, v in s_over.items() if isinstance(v, (int, float)) and int(v) > 0
+                }
+            fields = entry.get("fields") if isinstance(entry.get("fields"), dict) else {}
+            for field, decl in fields.items():
+                if not isinstance(field, str) or not isinstance(decl, dict):
+                    continue
+                values = decl.get("values")
+                if not isinstance(values, list):
+                    continue
+                out_types[field] = str(decl.get("type") or "string")
+                out[field] = [str(v) for v in values][-self._field_limit(stream, field):]
+            self._field_cache[stream] = out
+            self._field_types[stream] = out_types
+
+    def _field_limit(self, stream: str, field: str) -> int:
+        """Effective cache limit: per-(stream,field) > global by-field > default."""
+        s = self._field_overrides_stream.get(stream, {})
+        if field in s:
+            return s[field]
+        if field in self._field_overrides_global:
+            return self._field_overrides_global[field]
+        return self._FIELD_CACHE_MAX
+
+    def _save_field_cache(self, *, force: bool = False) -> None:
+        import json
+        import os
+
+        if not self._field_cache_dirty:
+            return
+        now = time.time()
+        if not force and (now - self._field_cache_saved_at) < 2.0:
+            return
+        # On-disk shape:
+        #   { "cache-overrides": { <field>: <limit> },              # global by-field
+        #     <stream>: { "cached_limit": 16,
+        #                 "cache-overrides": { <field>: <limit> },  # per-stream (wins)
+        #                 "fields": { <field>: { "type", "cached_limit", "values" } } } }
+        serializable: dict[str, Any] = {}
+        if self._field_overrides_global:
+            serializable["cache-overrides"] = dict(self._field_overrides_global)
+        for stream, fields in self._field_cache.items():
+            entry: dict[str, Any] = {"cached_limit": self._FIELD_CACHE_MAX}
+            if self._field_overrides_stream.get(stream):
+                entry["cache-overrides"] = dict(self._field_overrides_stream[stream])
+            entry["fields"] = {
+                field: {
+                    "type": self._field_types.get(stream, {}).get(field, "string"),
+                    "cached_limit": self._field_limit(stream, field),
+                    "values": values,
+                }
+                for field, values in fields.items()
+            }
+            serializable[stream] = entry
+        path = self._field_cache_path()
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(serializable, indent=2), "utf-8")
+            os.replace(tmp, path)
+            self._field_cache_dirty = False
+            self._field_cache_saved_at = now
+        except OSError:
+            pass
+
+    def _remember_field_values(self, stream: str, messages: list[dict[str, Any]]) -> None:
+        """Record the last N distinct values of each primitive field per stream,
+        plus each field's inferred value type (string/number/boolean, or mixed)."""
+        if not stream or not messages:
+            return
+        bucket = self._field_cache.setdefault(stream, {})
+        types = self._field_types.setdefault(stream, {})
+
+        def vtype(v: Any) -> str:
+            if isinstance(v, bool):
+                return "boolean"
+            if isinstance(v, (int, float)):
+                return "number"
+            return "string"
+
+        def offer(field: str, value: Any) -> None:
+            if field in self._FIELD_CACHE_SKIP or value is None or isinstance(value, (dict, list)):
+                return
+            sval = str(value)
+            if sval == "":
+                return
+            t = vtype(value)
+            prior = types.get(field)
+            if prior is None:
+                types[field] = t
+            elif prior != t and prior != "mixed":
+                types[field] = "mixed"
+            seq = bucket.setdefault(field, [])
+            if seq and seq[-1] == sval:
+                return
+            if sval in seq:
+                seq.remove(sval)
+            seq.append(sval)
+            lim = self._field_limit(stream, field)
+            if len(seq) > lim:
+                del seq[: len(seq) - lim]
+            self._field_cache_dirty = True
+
+        for m in messages:
+            rec = m if isinstance(m, dict) else {}
+            for k, v in rec.items():
+                offer(k, v)
+            raw = rec.get("raw")
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    offer(k, v)
+
+    def field_values(self, mailbox: str) -> dict[str, Any]:
+        """Candidate field values (and inferred types) for a mailbox, aggregated
+        across a merge's members."""
+        streams: list[str] = []
+        spec = self._virtual.get(mailbox)
+        if spec:
+            source = str(spec.get("source", ""))
+            if source.startswith("merge:"):
+                target = source[len("merge:"):].strip()
+                if target in ("*", "all"):
+                    streams = [s for s in STREAMS] + list(self._dynamic_mailboxes)
+                else:
+                    streams = [n.strip() for n in target.split(",") if n.strip()]
+            else:
+                streams = [mailbox]
+        else:
+            streams = [mailbox]
+        merged: dict[str, list[str]] = {}
+        types: dict[str, str] = {}
+        for s in streams:
+            for field, values in self._field_cache.get(s, {}).items():
+                dest = merged.setdefault(field, [])
+                for v in values:
+                    if v in dest:
+                        dest.remove(v)
+                    dest.append(v)
+                if len(dest) > self._FIELD_CACHE_MAX:
+                    del dest[: len(dest) - self._FIELD_CACHE_MAX]
+            for field, t in self._field_types.get(s, {}).items():
+                prior = types.get(field)
+                types[field] = t if prior is None else (prior if prior == t else "mixed")
+        limits: dict[str, int] = {}
+        for s in streams:
+            for field in self._field_cache.get(s, {}):
+                limits[field] = max(limits.get(field, 0), self._field_limit(s, field))
+        fields = {
+            field: {"type": types.get(field, "string"), "cached_limit": limits.get(field, self._FIELD_CACHE_MAX), "values": values}
+            for field, values in merged.items()
+        }
+        return {"mailbox": mailbox, "cached_limit": self._FIELD_CACHE_MAX, "fields": fields}
+
+    def set_field_cache_limit(self, field: str, limit: int, *, stream: str = "") -> dict[str, Any]:
+        """Set a per-field cache limit. With ``stream`` it is a per-(stream,field)
+        override; without, it is a global by-field override ("cache-overrides")."""
+        field = str(field or "").strip()
+        if not field:
+            raise ValidationError("field is required")
+        lim = int(limit)
+        if lim <= 0:
+            raise ValidationError("limit must be a positive integer")
+        if stream:
+            self._field_overrides_stream.setdefault(stream, {})[field] = lim
+        else:
+            self._field_overrides_global[field] = lim
+        # Re-trim any affected cached lists to the new effective limit.
+        for s, fields in self._field_cache.items():
+            if stream and s != stream:
+                continue
+            seq = fields.get(field)
+            if seq is not None:
+                eff = self._field_limit(s, field)
+                if len(seq) > eff:
+                    del seq[: len(seq) - eff]
+        self._field_cache_dirty = True
+        self._save_field_cache(force=True)
+        return {"stream": stream or "*", "field": field, "cached_limit": lim}
+
     # ------------------------------------------------------------------ core io
     def publish(
         self,
@@ -994,6 +1216,11 @@ class WsCollabService:
             if do_filter and text:
                 needle = text.lower()
                 messages = [m for m in messages if needle in (m.get("text") or "").lower()]
+            # Single-source virtuals (self/disk/http) cache their own candidates;
+            # merge members are cached by their leaf reads.
+            if not source.startswith("merge:"):
+                self._remember_field_values(mailbox, messages)
+                self._save_field_cache()
             # Limit the PRODUCED stream only, after filtering.
             if limit and limit > 0:
                 messages = messages[-min(limit, _MAX_SCAN):]
@@ -1002,6 +1229,10 @@ class WsCollabService:
             return {"messages": [], "user": sender or "", "peer": mailbox}
         events = self.store.tail(mailbox, max(1, min(limit, _MAX_SCAN)), _build_predicate(filters))
         messages = [self._event_to_message(event.to_dict()) for event in events]
+        # Remember field values (from the full read, before the require-match filter)
+        # so the pickers have candidates for this stream.
+        self._remember_field_values(mailbox, messages)
+        self._save_field_cache()
         if do_filter:
             needle = (text or "").lower()
 
