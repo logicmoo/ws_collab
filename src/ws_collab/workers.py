@@ -33,6 +33,15 @@ STATE_OVERDUE = "overdue"
 STATE_UNRESPONSIVE = "unresponsive"
 STATE_TERMINATED = "terminated"
 
+# A worker that only runs when its recurring native automation fires cannot
+# heartbeat continuously -- the doctrine forbids agent keep-alive loops. Such a
+# worker declares `meta.cadence = "on-activation"` at registration. Its state is
+# still tracked truthfully, but going quiet between activations is expected
+# rather than a failure, so its alerts are informational and it is not counted
+# when deciding whether the whole team has gone down.
+CADENCE_ON_ACTIVATION = "on-activation"
+CADENCE_CONTINUOUS = "continuous"
+
 _STATE_RANK = {STATE_OK: 0, STATE_WARN: 1, STATE_OVERDUE: 2, STATE_UNRESPONSIVE: 3, STATE_TERMINATED: 4}
 
 PublishFn = Callable[..., dict[str, Any]]
@@ -55,6 +64,17 @@ class WorkerRecord:
 
     def age(self, now: float) -> float:
         return max(0.0, now - self.last_status_at)
+
+    @property
+    def cadence(self) -> str:
+        """How this worker reports: continuously, or only when its automation fires."""
+
+        declared = str(self.meta.get("cadence") or "").strip().lower()
+        return CADENCE_ON_ACTIVATION if declared == CADENCE_ON_ACTIVATION else CADENCE_CONTINUOUS
+
+    @property
+    def activation_cadence(self) -> bool:
+        return self.cadence == CADENCE_ON_ACTIVATION
 
 
 class WorkerMonitor:
@@ -200,7 +220,10 @@ class WorkerMonitor:
             return None
         record.last_alert_state = state
         severity = {"warn": "warning", "overdue": "warning", "unresponsive": "danger"}[state]
-        if self._announce and state == STATE_UNRESPONSIVE:
+        if record.activation_cadence:
+            # Expected quiet between activations: report it, never alarm on it.
+            severity = "info"
+        if self._announce and state == STATE_UNRESPONSIVE and not record.activation_cadence:
             self._announce(record.worker_id, f"Worker {record.worker_id} is unresponsive")
         return self._publish(
             stream=STREAM_ALERTS,
@@ -209,9 +232,10 @@ class WorkerMonitor:
                 "worker_id": record.worker_id,
                 "state": state,
                 "severity": severity,
+                "cadence": record.cadence,
                 "task": record.task,
                 "age_seconds": round(record.age(now), 1),
-                "confirmation_required": state == STATE_UNRESPONSIVE,
+                "confirmation_required": state == STATE_UNRESPONSIVE and not record.activation_cadence,
             },
             source_id="monitor",
             source_kind="system",
@@ -219,9 +243,14 @@ class WorkerMonitor:
 
     def _check_team_failure(self, records: list[WorkerRecord], now: float) -> list[dict[str, Any]]:
         active = [r for r in records if not r.terminated_confirmed]
-        if not active:
+        # Activation-cadence workers are quiet by design between firings, so
+        # they cannot be evidence that the team has collapsed. Judge only the
+        # workers that promised continuous reporting; if there are none, there
+        # is nothing to conclude.
+        judged = [r for r in active if not r.activation_cadence]
+        if not judged:
             return []
-        all_down = all(self._state_for(r, now) in (STATE_OVERDUE, STATE_UNRESPONSIVE) for r in active)
+        all_down = all(self._state_for(r, now) in (STATE_OVERDUE, STATE_UNRESPONSIVE) for r in judged)
         events: list[dict[str, Any]] = []
         if all_down and not self._team_alerted:
             self._team_alerted = True
@@ -271,6 +300,7 @@ class WorkerMonitor:
             "worker_id": record.worker_id,
             "task": record.task,
             "state": self._state_for(record, now),
+            "cadence": record.cadence,
             "last_status": record.last_status,
             "last_status_age_seconds": round(record.age(now), 1),
             "registered_at": record.registered_at,
@@ -285,6 +315,8 @@ class WorkerMonitor:
     def rebuild_from_events(self, statuses: list[dict[str, Any]]) -> None:
         """Rehydrate the registry from recent durable status events after restart."""
 
+        from datetime import datetime
+
         with self._lock:
             for raw in statuses:
                 data = raw.get("data", {})
@@ -294,4 +326,17 @@ class WorkerMonitor:
                 record = self._workers.setdefault(worker_id, WorkerRecord(worker_id=worker_id))
                 if raw.get("type") == WORKER_REGISTERED:
                     record.task = data.get("task", record.task)
-                record.last_status = data.get("status", record.last_status)
+                    if isinstance(data.get("meta"), dict):
+                        record.meta.update(data["meta"])
+                if data.get("status"):
+                    record.last_status = data["status"]
+                # Preserve true staleness so the monitor can age restored workers
+                # correctly instead of showing everyone as freshly "ok".
+                ts = raw.get("ts")
+                if ts:
+                    try:
+                        seen = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+                        record.last_status_at = seen
+                        record.registered_at = min(record.registered_at, seen)
+                    except (ValueError, TypeError):
+                        pass

@@ -869,10 +869,25 @@ async function loadDevices() {
 async function loadVoices() {
   const body = $("vc-body");
   try {
-    const data = await api(`${V1}/voices`);
+    const [data, fleet] = await Promise.all([api(`${V1}/voices`), api(`${V1}/workers`)]);
     body.replaceChildren();
+
+    // Combine configured voice profiles with connected workers, so a worker that
+    // has no profile yet is still listed (its params editable) and assignable.
+    const byId = new Map();
+    (data.profiles || []).forEach((p) => byId.set(p.agent_id, { ...p }));
+    (fleet.workers || []).forEach((w) => {
+      if (!byId.has(w.worker_id)) {
+        byId.set(w.worker_id, {
+          agent_id: w.worker_id, voice_id: "", engine: "", rate: 1.0, pitch: 0.0,
+          volume: 1.0, queue_priority: 5, speaking_permission: true,
+        });
+      }
+    });
+    const agents = Array.from(byId.values()).sort((a, b) => a.agent_id.localeCompare(b.agent_id));
+    const agentIds = agents.map((a) => a.agent_id);
     const used = {};
-    data.profiles.forEach((p) => { used[p.voice_id] = (used[p.voice_id] || 0) + 1; });
+    agents.forEach((p) => { if (p.voice_id) used[p.voice_id] = (used[p.voice_id] || 0) + 1; });
 
     const numInput = (value, step, lo, hi, onSave) => {
       const inp = el("input");
@@ -885,16 +900,20 @@ async function loadVoices() {
     const saveProfile = (agentId, patch) =>
       api(`${V1}/voices/${encodeURIComponent(agentId)}`, { method: "POST", body: patch });
 
-    const profPanel = panel("Agent voice profiles — Speed and Pitch are editable and persist");
+    const profPanel = panel("Agent & worker voice profiles — Speed, Pitch, Volume, Priority editable and persistent");
     profPanel.content.appendChild(table(
-      ["Agent", "Voice", "Engine", "Speed", "Pitch", "Vol", "Priority", "Speak", "Conflict", "Preview"],
-      data.profiles.map((p) => [
-        mono(p.agent_id), mono(p.voice_id), p.engine,
+      ["Agent / Worker", "Voice", "Engine", "Speed", "Pitch", "Vol", "Priority", "Speak", "Conflict", "Preview"],
+      agents.map((p) => [
+        mono(p.agent_id), p.voice_id ? mono(p.voice_id) : badge("unassigned", "warn"), p.engine || "—",
         numInput(p.rate, 0.05, 0.5, 2.0, (v) => saveProfile(p.agent_id, { rate: v })),
         numInput(p.pitch, 1, -10, 10, (v) => saveProfile(p.agent_id, { pitch: v })),
-        String(p.volume), String(p.queue_priority),
-        badge(p.speaking_permission ? "yes" : "muted", p.speaking_permission ? "ok" : "warn"),
-        used[p.voice_id] > 1 ? badge("shared", "warn") : badge("unique", "ok"),
+        numInput(p.volume, 0.05, 0, 1.0, (v) => saveProfile(p.agent_id, { volume: v })),
+        numInput(p.queue_priority, 1, 1, 10, (v) => saveProfile(p.agent_id, { queue_priority: Math.round(v) })),
+        actionButton(p.speaking_permission ? "on" : "muted", p.speaking_permission ? "ok" : "warn", async () => {
+          try { await saveProfile(p.agent_id, { speaking_permission: !p.speaking_permission }); loadVoices(); }
+          catch (error) { pushError(error.message); }
+        }),
+        p.voice_id ? (used[p.voice_id] > 1 ? badge("shared", "warn") : badge("unique", "ok")) : "—",
         actionButton("Preview", "", async () => {
           try { await api(`${V1}/tts/speak`, { method: "POST", body: { agent_id: p.agent_id, text: `This is ${p.agent_id}.`, priority: 1 } }); }
           catch (error) { pushError(error.message); }
@@ -907,8 +926,8 @@ async function loadVoices() {
       ["ID", "Name", "Provider", "Language", "Style", "Available", "Assign to", "Actions"],
       data.voices.map((v) => {
         const select = el("select");
-        select.appendChild(new Option("—", ""));
-        data.profiles.forEach((p) => select.appendChild(new Option(p.agent_id, p.agent_id)));
+        select.appendChild(new Option("assign to…", ""));
+        agentIds.forEach((id) => select.appendChild(new Option(id, id)));
         select.onchange = async () => {
           if (!select.value) return;
           try { await api(`${V1}/voices/${encodeURIComponent(select.value)}`, { method: "POST", body: { voice_id: v.id, engine: v.provider } }); loadVoices(); }

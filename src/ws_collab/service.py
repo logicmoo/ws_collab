@@ -36,6 +36,7 @@ from .events import (
     STREAM_TRANSLATED_AUDIO,
     STREAM_TTS,
     STREAM_ROLES,
+    STREAM_STATUSES,
     STREAMS,
     STT_ENGINE_ERROR,
     STT_FINAL_RESULT,
@@ -1212,6 +1213,7 @@ class WsCollabService:
         await self.tts.start()
         self._seed_prompt()
         self._seed_voices()
+        self._seed_workers()
         self._monitor_task = asyncio.create_task(self._monitor_loop())
 
     async def shutdown(self) -> None:
@@ -1243,6 +1245,17 @@ class WsCollabService:
                 self.assign_voices()
             except Exception:
                 pass
+
+    def _seed_workers(self) -> None:
+        """Rehydrate the worker registry from durable status events after a restart,
+        so previously-registered workers still show up (and stay assignable) instead
+        of vanishing until they happen to check in again."""
+
+        try:
+            events = self.store.tail(STREAM_STATUSES, 1000)
+            self.workers.rebuild_from_events([event.to_dict() for event in events])
+        except Exception:
+            pass
 
 
 # The prompt history stream constant (imported lazily to avoid a cycle above).
