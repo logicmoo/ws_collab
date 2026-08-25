@@ -1227,7 +1227,24 @@ async function loadDevices() {
       } catch (error) { pushError(error.message); }
       loadDevices();
     };
-    defRow.append(el("span", "filter-label", "Speak through"), outSelect);
+    const testNote = el("span", "mono hint", "");
+    const testBtn = actionButton("▶ Test", "", async () => {
+      const id = outSelect.value || (outputs.find((d) => d.is_default_output) || outputs[0] || {}).id || "";
+      if (!id) { pushError("No output device available to test."); return; }
+      testBtn.disabled = true;
+      testNote.textContent = "testing…";
+      try {
+        const r = await api(`${V1}/audio/devices/test`, { method: "POST", body: { device_id: id } });
+        testNote.textContent = `✓ ${r.method === "tone" ? "tone" : "spoken test"} on ${r.device_name || id}`;
+      } catch (error) {
+        testNote.textContent = "";
+        pushError(error.message);
+      } finally {
+        testBtn.disabled = false;
+      }
+    });
+    testBtn.title = "Play a test sound on the selected output device";
+    defRow.append(el("span", "filter-label", "Speak through"), outSelect, testBtn, testNote);
     if (defaults.available === false) {
       defRow.appendChild(badge("saved device missing", "danger"));
     }
