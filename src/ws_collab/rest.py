@@ -555,6 +555,19 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         auth = await _require(request, "operator", mutating=True)
         return guarded(service.set_voice_profile, agent_id, body, auth.principal.label)
 
+    # ---------------------------------------------------------------- convert
+    @router.post(f"{mount}/convert")
+    async def convert_representation(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        """Render a value (or batch of {id,value} items) as MeTTa or pretty JSON."""
+
+        await _require(request, "viewer")
+        return guarded(
+            service.convert_representation,
+            value=body.get("value"),
+            to=body.get("to", "metta"),
+            items=body.get("items"),
+        )
+
     # ------------------------------------------------------------------ cursors
     @router.get(f"{mount}/cursors")
     async def list_cursors(request: Request) -> dict[str, Any]:

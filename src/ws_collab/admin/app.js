@@ -462,6 +462,268 @@ function selectEvent(event, row) {
 }
 
 /* -------------------------------------------------- tile / chat-bubble mode */
+
+/* Minimal, safe GitHub-flavored-markdown renderer for message bodies. All user
+ * content is HTML-escaped first; only our own generated tags are emitted, and
+ * link URLs are restricted to http/https/mailto. Covers headings, bold/italic/
+ * strikethrough, inline code, fenced code blocks, links, lists, blockquotes,
+ * and horizontal rules -- enough to match the workspace markdown viewer for
+ * chat-style messages. */
+function mdEscape(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function mdInline(text) {
+  const codes = [];
+  text = text.replace(/`([^`]+)`/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+  text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (m, alt, url) =>
+    /^https?:/i.test(url) ? `<img src="${url}" alt="${alt}">` : m);
+  text = text.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, label, url) =>
+    /^(https?:|mailto:|#)/i.test(url)
+      ? `<a href="${url}"${/^https?:/i.test(url) ? ' target="_blank" rel="noopener noreferrer"' : ""}>${label}</a>`
+      : m);
+  text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  text = text.replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
+  text = text.replace(/(^|[^_\w])_([^_\s][^_]*)_/g, "$1<em>$2</em>");
+  text = text.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  text = text.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[Number(i)]}</code>`);
+  return text;
+}
+
+function mdToHtml(raw) {
+  const lines = String(raw == null ? "" : raw).split(/\r?\n/);
+  const out = [];
+  let para = [];
+  let i = 0;
+  const flush = () => { if (para.length) { out.push(`<p>${para.join("<br>")}</p>`); para = []; } };
+  const cells = (row) => row.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^```/.test(line)) {
+      flush();
+      const buf = [];
+      i += 1;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) { buf.push(lines[i]); i += 1; }
+      i += 1;
+      out.push(`<pre><code>${mdEscape(buf.join("\n"))}</code></pre>`);
+      continue;
+    }
+    if (/^\s*$/.test(line)) { flush(); i += 1; continue; }
+    // GFM table: a header row followed by a |---|---| separator.
+    if (line.includes("|") && i + 1 < lines.length
+        && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(lines[i + 1])) {
+      flush();
+      const header = cells(line);
+      i += 2;
+      const body = [];
+      while (i < lines.length && lines[i].includes("|") && !/^\s*$/.test(lines[i])) { body.push(cells(lines[i])); i += 1; }
+      let t = `<table><thead><tr>${header.map((c) => `<th>${mdInline(mdEscape(c))}</th>`).join("")}</tr></thead><tbody>`;
+      t += body.map((r) => `<tr>${r.map((c) => `<td>${mdInline(mdEscape(c))}</td>`).join("")}</tr>`).join("");
+      out.push(`${t}</tbody></table>`);
+      continue;
+    }
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { flush(); out.push(`<h${h[1].length}>${mdInline(mdEscape(h[2]))}</h${h[1].length}>`); i += 1; continue; }
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flush(); out.push("<hr>"); i += 1; continue; }
+    if (/^>\s?/.test(line)) {
+      flush();
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^>\s?/, "")); i += 1; }
+      out.push(`<blockquote>${buf.map((l) => mdInline(mdEscape(l))).join("<br>")}</blockquote>`);
+      continue;
+    }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      flush();
+      const items = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) { items.push(lines[i].replace(/^\s*[-*+]\s+/, "")); i += 1; }
+      out.push(`<ul>${items.map((t) => {
+        const task = t.match(/^\[([ xX])\]\s+(.*)$/);
+        if (task) {
+          const checked = task[1].toLowerCase() === "x" ? " checked" : "";
+          return `<li class="task-list-item"><input type="checkbox" disabled${checked}> ${mdInline(mdEscape(task[2]))}</li>`;
+        }
+        return `<li>${mdInline(mdEscape(t))}</li>`;
+      }).join("")}</ul>`);
+      continue;
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      flush();
+      const items = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) { items.push(lines[i].replace(/^\s*\d+\.\s+/, "")); i += 1; }
+      out.push(`<ol>${items.map((t) => `<li>${mdInline(mdEscape(t))}</li>`).join("")}</ol>`);
+      continue;
+    }
+    para.push(mdInline(mdEscape(line)));
+    i += 1;
+  }
+  flush();
+  return out.join("\n");
+}
+
+/* Render into a container carrying the workbench's own markdown classes, so the
+ * result is styled identically to the workspace markdown viewer (help_tabs.css
+ * .markdown-body, reused verbatim in app.css). */
+function renderMarkdown(text, extraClass) {
+  const div = el("div", `markdown-body${extraClass ? " " + extraClass : ""}`);
+  div.innerHTML = mdToHtml(text);
+  return div;
+}
+
+/* MeTTa codec — ported verbatim from the workbench's
+ * frontend/src/lib/mettaResourceCodec.ts (jsonValueToMetta) so the MeTTa view
+ * here renders identically to the workspace. */
+const METTA_SAFE_ATOM = /^[^\s(){}";\\]+$/;
+const METTA_TYPED_ATOM = /^(?:true|false|null|-?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)$/i;
+const METTA_EMBEDDED = "__metta_json_string_parts__";
+
+function mettaQuote(value, force) {
+  if (force) return JSON.stringify(value);
+  return METTA_SAFE_ATOM.test(value) && value !== "{}" && !METTA_TYPED_ATOM.test(value) ? value : JSON.stringify(value);
+}
+function mettaSingleQuote(value) {
+  return `'${value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t")}'`;
+}
+function mettaEmbeddedParts(value) {
+  const parts = []; let cursor = 0; let scan = 0; let found = false;
+  while (scan < value.length) {
+    if (value[scan] !== "{" && value[scan] !== "[") { scan += 1; continue; }
+    const start = scan; const stack = []; let quoted = false; let escaped = false; let end = -1;
+    for (; scan < value.length; scan += 1) {
+      const ch = value[scan];
+      if (quoted) { if (escaped) escaped = false; else if (ch === "\\") escaped = true; else if (ch === '"') quoted = false; continue; }
+      if (ch === '"') { quoted = true; continue; }
+      if (ch === "{" || ch === "[") stack.push(ch);
+      else if (ch === "}" || ch === "]") { const op = stack.pop(); if ((op === "{" && ch !== "}") || (op === "[" && ch !== "]")) break; if (!stack.length) { end = scan + 1; break; } }
+    }
+    if (end < 0) { scan = start + 1; continue; }
+    try {
+      const parsed = JSON.parse(value.slice(start, end));
+      if (parsed === null || typeof parsed !== "object") { scan = start + 1; continue; }
+      if (start > cursor) parts.push(value.slice(cursor, start));
+      parts.push(parsed); found = true; cursor = end; scan = end;
+    } catch { scan = start + 1; }
+  }
+  if (!found) return undefined;
+  if (cursor < value.length) parts.push(value.slice(cursor));
+  return parts;
+}
+function mettaFmtEmbeddedItem(value) {
+  const parts = mettaEmbeddedParts(value);
+  if (parts === undefined || !parts.some((p) => typeof p !== "string")) return undefined;
+  const lines = [""];
+  parts.forEach((part) => {
+    if (typeof part === "string") { lines[lines.length - 1] += part; return; }
+    const pretty = JSON.stringify(part, null, 2).split("\n");
+    lines[lines.length - 1] += pretty[0];
+    pretty.slice(1).forEach((l) => lines.push(l));
+  });
+  return [JSON.stringify(lines[0]), ...lines.slice(1).map((l) => mettaSingleQuote(l))];
+}
+function mettaSplitLongSentence(value, minimumPrefix) {
+  minimumPrefix = minimumPrefix || 50;
+  if (value.length <= minimumPrefix || /\r|\n/.test(value)) return undefined;
+  const lines = []; let remaining = value;
+  while (remaining.length > minimumPrefix) {
+    const boundary = /[A-Za-z][.!?]\s+/g; let splitAt = -1; let m;
+    while ((m = boundary.exec(remaining)) !== null) { const b = m.index + m[0].length; if (b >= minimumPrefix) { splitAt = b; break; } }
+    if (splitAt < 0) break;
+    lines.push(remaining.slice(0, splitAt)); remaining = remaining.slice(splitAt);
+  }
+  if (!lines.length) return undefined;
+  lines.push(remaining); return lines;
+}
+function mettaFmtLongSentence(value) {
+  const lines = mettaSplitLongSentence(value);
+  if (!lines || lines.length <= 1) return undefined;
+  return [JSON.stringify(lines[0]), ...lines.slice(1).map((l) => mettaSingleQuote(l))];
+}
+function jsonValueToMetta(value, depth, forceQuoteString) {
+  depth = depth || 0;
+  const indent = "  ".repeat(depth);
+  const childIndent = "  ".repeat(depth + 1);
+  if (value === null) return "null";
+  if (typeof value === "boolean" || typeof value === "number") return String(value);
+  if (typeof value === "string") {
+    if (forceQuoteString) return mettaQuote(value, true);
+    const embedded = mettaEmbeddedParts(value);
+    return embedded === undefined ? mettaQuote(value) : jsonValueToMetta({ [METTA_EMBEDDED]: embedded }, depth, false);
+  }
+  if (Array.isArray(value)) {
+    if (!value.length) return "([])";
+    if (value.every((it) => typeof it === "number")) return `([] ${value.map((it) => String(it)).join(" ")})`;
+    const quoteStringItems = value.some((it) => typeof it === "string" && /\s/.test(it));
+    const items = value.flatMap((it) => {
+      if (quoteStringItems && typeof it === "string") {
+        const f = mettaFmtEmbeddedItem(it); if (f) return f.map((l) => `${childIndent}${l}`);
+        const w = mettaFmtLongSentence(it); if (w) return w.map((l) => `${childIndent}${l}`);
+      }
+      return [`${childIndent}${jsonValueToMetta(it, depth + 1, quoteStringItems && typeof it === "string")}`];
+    });
+    return `([]\n${items.join("\n")}\n${indent})`;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value);
+    if (!entries.length) return "()";
+    const items = entries.map(([k, it]) => `${childIndent}(${mettaQuote(k)} ${jsonValueToMetta(it, depth + 1, false)})`);
+    return `(\n${items.join("\n")}\n${indent})`;
+  }
+  return String(value);
+}
+
+/* Cached conversions come from the shared server-side codec service
+ * (POST /convert). The ported client codec is only an instant fallback shown
+ * while the authoritative server result loads. */
+function convCacheGet(format, id) {
+  return state.convCache && state.convCache[format] ? state.convCache[format][id] : undefined;
+}
+function convCacheSet(format, id, text) {
+  if (!state.convCache) state.convCache = {};
+  if (!state.convCache[format]) state.convCache[format] = {};
+  state.convCache[format][id] = text;
+}
+async function ensureConversions(events, format) {
+  const pending = events.filter((e) => e && e.id && convCacheGet(format, e.id) === undefined);
+  if (!pending.length) return;
+  pending.forEach((e) => convCacheSet(format, e.id, null));   // mark in-flight
+  try {
+    const res = await api(`${V1}/convert`, {
+      method: "POST",
+      body: { to: format, items: pending.map((e) => ({ id: e.id, value: e.data || {} })) },
+    });
+    (res.results || []).forEach((r) => convCacheSet(format, r.id, r.text));
+  } catch (error) {
+    pending.forEach((e) => convCacheSet(format, e.id, `(conversion failed: ${error.message})`));
+  }
+  if (state.streamMode === "tile" && state.page === "streams") renderTiles();
+}
+
+/* Render one event's body in the selected representation. */
+function renderBubbleBody(event, format) {
+  const data = event.data || {};
+  if (format === "json") {
+    const pre = el("pre", "bubble-code");
+    pre.textContent = JSON.stringify(data, null, 2);
+    return pre;
+  }
+  if (format === "metta") {
+    const pre = el("pre", "bubble-code");
+    const cached = convCacheGet("metta", event.id);
+    if (cached !== undefined && cached !== null) pre.textContent = cached;
+    else { try { pre.textContent = jsonValueToMetta(data); } catch { pre.textContent = JSON.stringify(data, null, 2); } }
+    return pre;
+  }
+  const summary = eventSummary(event);
+  if (format === "text") {
+    const div = el("div", "bubble-body");
+    div.textContent = summary.text || JSON.stringify(data);
+    return div;
+  }
+  const md = renderMarkdown(summary.text || JSON.stringify(data), "bubble-body");
+  if (summary.cls) md.classList.add(summary.cls);
+  return md;
+}
+
 /* An alternative to the dense list: each event is a chat bubble (like the
  * workbench mailbox reader). Operator/agent messages align right, everything
  * else left. Bounded to the most recent events for performance. */
@@ -479,9 +741,11 @@ function bubbleFor(event) {
     el("span", "bubble-ts", shortTs(event.ts)),
   );
   bubble.appendChild(head);
-  const bodyText = summary.text || JSON.stringify(data);
-  bubble.appendChild(el("div", `bubble-body ${summary.cls || ""}`, bodyText));
-  if (summary.extra) bubble.appendChild(el("div", "bubble-meta", String(summary.extra)));
+  const format = state.streamFormat || "markdown";
+  bubble.appendChild(renderBubbleBody(event, format));
+  if (summary.extra && (format === "markdown" || format === "text")) {
+    bubble.appendChild(el("div", "bubble-meta", String(summary.extra)));
+  }
   bubble.addEventListener("click", () => { selectEvent(event, null); renderTiles(); });
   wrap.appendChild(bubble);
   return wrap;
@@ -498,6 +762,7 @@ function renderTiles() {
   const atBottom = tiles.scrollHeight - tiles.scrollTop - tiles.clientHeight < 60;
   tiles.replaceChildren();
   shown.forEach((e) => tiles.appendChild(bubbleFor(e)));
+  if ((state.streamFormat || "markdown") === "metta") ensureConversions(shown, "metta");
   if (atBottom) tiles.scrollTop = tiles.scrollHeight;
 }
 
@@ -1479,6 +1744,10 @@ function wireEvents() {
   $("st-export").onclick = () => exportView(state.views.streams, $("st-stream").value);
   $("st-clear").onclick = () => state.views.streams.clearView();
   $("st-mode").onclick = () => setStreamMode(state.streamMode === "tile" ? "list" : "tile");
+  $("st-format").addEventListener("change", () => {
+    state.streamFormat = $("st-format").value;
+    if (state.streamMode === "tile") renderTiles();
+  });
 
   // page actions
   $("wk-refresh").onclick = loadWorkers;

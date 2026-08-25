@@ -580,6 +580,26 @@ class WsCollabService:
     def delete_clone(self, clone_id: str, operator: str = "operator") -> dict[str, Any]:
         return {"deleted": self.voices.delete_clone(clone_id, operator=operator), "clone_id": clone_id}
 
+    def convert_representation(self, value: Any = None, to: str = "metta",
+                              items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Render a value (or a batch of values) as MeTTa or pretty JSON.
+
+        Server-side port of the workbench's markdown/MeTTa codec so clients can
+        display JSON/MeTTa views without duplicating the codec.
+        """
+
+        from . import metta_codec
+
+        if items is not None:
+            return {
+                "to": to,
+                "results": [
+                    {"id": item.get("id"), "text": metta_codec.convert_value(item.get("value"), to)}
+                    for item in items
+                ],
+            }
+        return {"to": to, "text": metta_codec.convert_value(value, to)}
+
     def set_voice_profile(self, agent_id: str, updates: dict[str, Any], operator: str = "operator") -> dict[str, Any]:
         return self.voices.set_profile(agent_id, updates, operator=operator).public()
 

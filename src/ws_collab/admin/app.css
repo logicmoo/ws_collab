@@ -492,6 +492,34 @@ tr:hover td { background: var(--bg-panel-raised); }
 .bubble-ts { margin-left: auto; font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); }
 .bubble-body { font-size: 13px; color: var(--text-secondary); white-space: pre-wrap; word-break: break-word; line-height: 1.35; }
 .bubble-meta { font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); margin-top: 4px; }
+
+/* Reused from the workbench markdown viewer (help_tabs.css .markdown-body) so
+ * rendered messages match the workspace exactly. */
+.markdown-body>*:first-child{margin-top:0!important}
+.markdown-body>*:last-child{margin-bottom:0!important}
+.markdown-body h1,.markdown-body h2,.markdown-body h3,.markdown-body h4{color:#f0f6fc;font-weight:600;line-height:1.25;margin:20px 0 10px}
+.markdown-body h1,.markdown-body h2{padding-bottom:7px;border-bottom:1px solid #30363d}
+.markdown-body h1{font-size:20px}.markdown-body h2{font-size:16px}.markdown-body h3{font-size:13px}.markdown-body h4{font-size:11px}
+.markdown-body p{margin:0 0 12px}
+.markdown-body ul,.markdown-body ol{margin:0 0 12px;padding-left:22px}
+.markdown-body li+li{margin-top:4px}
+.markdown-body li>p{margin:4px 0}
+.markdown-body a{color:#58a6ff;text-decoration:none}
+.markdown-body a:hover{text-decoration:underline}
+.markdown-body strong{color:#f0f6fc;font-weight:600}
+.markdown-body code{padding:2px 5px;border-radius:4px;background:#6e768166;color:#e6edf3;font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}
+.markdown-body pre{margin:0 0 14px;padding:12px;overflow:auto;border:1px solid #30363d;border-radius:6px;background:#161b22}
+.markdown-body pre code{padding:0;background:transparent;color:#e6edf3;white-space:pre;font-size:11px}
+.markdown-body blockquote{margin:0 0 12px;padding:2px 12px;border-left:3px solid #3b434b;color:#8b949e}
+.markdown-body blockquote p{margin:6px 0}
+.markdown-body table{display:block;width:100%;max-width:100%;margin:0 0 14px;overflow:auto;border-collapse:collapse}
+.markdown-body th,.markdown-body td{padding:6px 8px;border:1px solid #30363d;text-align:left;white-space:nowrap}
+.markdown-body th{color:#f0f6fc;background:#161b22;font-weight:600}
+.markdown-body tr:nth-child(2n){background:#161b2266}
+.markdown-body hr{height:1px;margin:18px 0;border:0;background:#30363d}
+.markdown-body input[type="checkbox"]{margin:0 6px 0 0;accent-color:var(--accent-teal)}
+.markdown-body img{max-width:100%;height:auto;border-radius:6px}
+.bubble-code{margin:0;padding:8px 10px;overflow-x:auto;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#e6edf3;font-family:var(--font-mono);font-size:11px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
 .event-viewport { position: absolute; top: 0; left: 0; right: 0; }
 
 .event-row {
