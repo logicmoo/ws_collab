@@ -59,10 +59,12 @@
       <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 3h12v8H6l-4 3z"/></svg>
       <span class="nav-label">Conversation</span>
     </div>
-    <div class="nav-item" data-page="streams" tabindex="0">
+    <div class="nav-item nav-expandable" id="nav-streams" data-page="streams" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
       <span class="nav-label">JSONL Streams</span>
+      <span class="nav-caret" id="nav-streams-caret">▸</span>
     </div>
+    <div class="nav-sub" id="nav-streams-sub" hidden></div>
 
     <div class="nav-group-title">Fleet</div>
     <div class="nav-item" data-page="workers" tabindex="0">

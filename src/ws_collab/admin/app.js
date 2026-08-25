@@ -68,6 +68,60 @@ function adoptStreams(capabilities) {
   STREAMS = Object.keys((capabilities && capabilities.streams) || {});
   const roles = (capabilities && capabilities.stream_roles) || {};
   TRANSCRIPT_STREAMS = (roles.speech_pipeline || []).filter((s) => STREAMS.includes(s));
+  populateStreamMenu();
+}
+
+/* The "JSONL Streams" nav item expands into one entry per durable stream, each
+ * showing its entry count and going bold when it has unread events. */
+function populateStreamMenu() {
+  const sub = document.getElementById("nav-streams-sub");
+  if (!sub) return;
+  sub.replaceChildren();
+  STREAMS.forEach((s) => {
+    const item = el("div", "nav-subitem");
+    item.dataset.stream = s;
+    item.tabIndex = 0;
+    item.append(el("span", "nav-subitem-label", s), el("span", "nav-subitem-count"));
+    const go = () => selectStream(s);
+    item.addEventListener("click", (e) => { e.stopPropagation(); go(); });
+    item.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+    sub.appendChild(item);
+  });
+  renderStreamMenu();
+}
+
+function scheduleStreamMenuRender() {
+  if (state._streamMenuRaf) return;
+  state._streamMenuRaf = requestAnimationFrame(() => { state._streamMenuRaf = null; renderStreamMenu(); });
+}
+
+function renderStreamMenu() {
+  const sub = document.getElementById("nav-streams-sub");
+  if (!sub) return;
+  sub.querySelectorAll(".nav-subitem").forEach((item) => {
+    const s = item.dataset.stream;
+    const stats = (state.streamStats && state.streamStats[s]) || { count: 0, unread: 0 };
+    const buffered = (state.buffers[s] || []).length;
+    const count = Math.max(stats.count || 0, buffered);
+    const countEl = item.querySelector(".nav-subitem-count");
+    if (countEl) countEl.textContent = count ? String(count) : "";
+    item.classList.toggle("unread", (stats.unread || 0) > 0);
+    item.title = `${s} — ${count} entries` + ((stats.unread || 0) > 0 ? `, ${stats.unread} unread` : "");
+  });
+}
+
+function selectStream(stream) {
+  const sel = document.getElementById("st-stream");
+  if (sel) {
+    sel.value = stream;
+    const view = state.views && state.views.streams;
+    if (view) { view.streams = [stream]; view.rebuild(state.buffers[stream] || []); }
+  }
+  if (state.streamStats && state.streamStats[stream]) state.streamStats[stream].unread = 0;
+  document.querySelectorAll("#nav-streams-sub .nav-subitem").forEach((n) =>
+    n.classList.toggle("active", n.dataset.stream === stream));
+  renderStreamMenu();
+  showPage("streams");
   if (!TRANSCRIPT_STREAMS.length) TRANSCRIPT_STREAMS = STREAMS.slice(0, 1);
 }
 
@@ -137,6 +191,14 @@ function ingest(event) {
     const dropped = buffer.splice(0, buffer.length - MAX_BUFFER);
     dropped.forEach((e) => seen.delete(e.seq));
   }
+  // Per-stream entry count (from the durable seq) + unread tracking for the menu.
+  if (!state.streamStats) state.streamStats = {};
+  const stats = state.streamStats[stream] || (state.streamStats[stream] = { count: 0, unread: 0 });
+  stats.count = Math.max(stats.count, (event.seq ?? -1) + 1);
+  const sel = document.getElementById("st-stream");
+  const viewingThis = state.page === "streams" && sel && sel.value === stream;
+  if (!viewingThis) stats.unread += 1;
+  scheduleStreamMenuRender();
   Object.values(state.views).forEach((view) => view.onEvent(event));
   return true;
 }
@@ -1261,6 +1323,17 @@ function wireEvents() {
     node.addEventListener("click", () => showPage(node.dataset.page));
     node.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); showPage(node.dataset.page); } });
   });
+  const streamsNav = document.getElementById("nav-streams");
+  if (streamsNav) {
+    streamsNav.addEventListener("click", () => {
+      const sub = document.getElementById("nav-streams-sub");
+      const caret = document.getElementById("nav-streams-caret");
+      if (!sub) return;
+      const collapsed = sub.hasAttribute("hidden");
+      if (collapsed) { sub.removeAttribute("hidden"); if (caret) caret.textContent = "▾"; }
+      else { sub.setAttribute("hidden", ""); if (caret) caret.textContent = "▸"; }
+    });
+  }
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
@@ -1324,8 +1397,13 @@ function wireEvents() {
   ["st-stream", "st-search", "st-type", "st-raw"].forEach((id) =>
     $(id).addEventListener("input", () => {
       const view = state.views.streams;
-      view.streams = [$("st-stream").value];
-      view.rebuild(state.buffers[$("st-stream").value] || []);
+      const cur = $("st-stream").value;
+      view.streams = [cur];
+      view.rebuild(state.buffers[cur] || []);
+      if (state.streamStats && state.streamStats[cur]) state.streamStats[cur].unread = 0;
+      document.querySelectorAll("#nav-streams-sub .nav-subitem").forEach((n) =>
+        n.classList.toggle("active", n.dataset.stream === cur));
+      renderStreamMenu();
     }));
   $("st-pause").onclick = () => {
     const view = state.views.streams;
@@ -1399,6 +1477,7 @@ async function refreshStatusBar() {
     $("sb-tts").textContent = diag.tts.is_speaking ? `tts speaking (${diag.tts.queue.length} queued)` : `tts idle (${diag.tts.queue.length} queued)`;
     $("sb-clients").textContent = `clients ${diag.broker.subscriptions}`;
     $("badge-transcript").textContent = state.views.transcript ? state.views.transcript.rows.length : 0;
+    renderStreamMenu();
   } catch (error) {
     if (error.status === 401) logout();
   }

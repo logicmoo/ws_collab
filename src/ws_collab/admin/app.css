@@ -204,6 +204,36 @@ html, body {
 }
 .nav-badge.alert { border-color: var(--status-danger); color: var(--status-danger); }
 
+/* Expandable "JSONL Streams" submenu: one row per stream, with entry count and
+ * a bold state when the stream has unread events. */
+.nav-caret { margin-left: auto; font-size: 10px; color: var(--text-muted); }
+.nav-sub { display: flex; flex-direction: column; padding: 2px 0; }
+.nav-subitem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 14px 3px 34px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.nav-subitem:hover { background: var(--bg-panel); color: var(--text-primary); }
+.nav-subitem.active { color: var(--accent-teal); }
+.nav-subitem.unread { font-weight: 700; color: var(--text-primary); }
+.nav-subitem-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-subitem-count {
+  margin-left: auto;
+  font-size: 9px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+}
+.nav-subitem.unread .nav-subitem-count { border-color: var(--accent-teal); color: var(--accent-teal); }
+.sidebar.collapsed .nav-sub, .sidebar.collapsed .nav-caret { display: none; }
+
 /* -------------------------------------------------------------------- main */
 .main {
   grid-area: main;
