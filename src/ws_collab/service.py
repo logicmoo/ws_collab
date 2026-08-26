@@ -196,18 +196,28 @@ class WsCollabService:
         # candidates and later use them intelligently. Durable on disk.
         self._field_cache: dict[str, dict[str, list[str]]] = {}
         self._field_types: dict[str, dict[str, str]] = {}
+        self._definition_field_cache: dict[str, dict[str, list[str]]] = {}
+        self._definition_field_types: dict[str, dict[str, str]] = {}
         # Per-field cache-limit overrides, layered: a per-(stream,field) override wins
         # over a global by-field override ("cache-overrides"), which wins over the
         # default cached_limit.
         self._field_overrides_global: dict[str, int] = {}
         self._field_overrides_stream: dict[str, dict[str, int]] = {}
+        self._field_overrides_observation: dict[str, dict[str, int]] = {}
+        self._field_overrides_observation_stream: dict[str, dict[str, dict[str, int]]] = {}
         self._field_cache_dirty = False
         self._field_cache_saved_at = 0.0
         self._load_field_cache()
+        # Rewrite legacy config into the scoped observation schema on startup.
+        self._save_cache_config()
 
     # ------------------------------------------- per-field value cache (candidates)
     _FIELD_CACHE_SKIP = {"id", "raw", "text", "timestamp", "ts", "seq", "mailboxId", "forwarded_by"}
     _FIELD_CACHE_MAX = 16
+    _FIELD_OBSERVATIONS = {
+        "chat_bubble": "Fields observed in chat message records.",
+        "mailbox_definition": "Fields observed in mailbox JSON definitions.",
+    }
 
     def _cache_config_path(self) -> Path:
         return Path(self.store.directory) / "field_cache_config.json"
@@ -236,14 +246,51 @@ class WsCollabService:
                         self._field_overrides_stream[stream] = {
                             str(f): int(v) for f, v in over.items() if isinstance(v, (int, float)) and int(v) > 0
                         }
+            observations_cfg = cfg.get("observations")
+            if isinstance(observations_cfg, dict):
+                for observation, observation_cfg in observations_cfg.items():
+                    if not isinstance(observation, str) or not isinstance(observation_cfg, dict):
+                        continue
+                    field_overrides = observation_cfg.get("cache-overrides")
+                    if isinstance(field_overrides, dict):
+                        self._field_overrides_observation[observation] = {
+                            str(field): int(limit)
+                            for field, limit in field_overrides.items()
+                            if isinstance(limit, (int, float)) and int(limit) > 0
+                        }
+                    stream_overrides = observation_cfg.get("streams")
+                    if isinstance(stream_overrides, dict):
+                        self._field_overrides_observation_stream[observation] = {
+                            str(stream): {
+                                str(field): int(limit)
+                                for field, limit in overrides.items()
+                                if isinstance(limit, (int, float)) and int(limit) > 0
+                            }
+                            for stream, overrides in stream_overrides.items()
+                            if isinstance(overrides, dict)
+                        }
 
         # --- data: cached values + inferred types ----------------------------
         try:
             data = json.loads(self._cache_data_path().read_text("utf-8"))
         except Exception:
             data = {}
-        if isinstance(data, dict):
-            for stream, entry in data.items():
+        observations = data.get("observations") if isinstance(data, dict) else None
+        if isinstance(observations, dict):
+            scoped_data = {
+                observation: (
+                    entry.get("streams")
+                    if isinstance(entry, dict) and isinstance(entry.get("streams"), dict)
+                    else {}
+                )
+                for observation, entry in observations.items()
+            }
+        else:
+            # Version 1 stored chat-message observations directly by stream.
+            scoped_data = {"chat_bubble": data if isinstance(data, dict) else {}}
+        for observation, streams in scoped_data.items():
+            cache, type_cache = self._observation_caches(observation)
+            for stream, entry in streams.items():
                 if not isinstance(stream, str) or not isinstance(entry, dict):
                     continue
                 out: dict[str, list[str]] = {}
@@ -256,12 +303,26 @@ class WsCollabService:
                     if not isinstance(values, list):
                         continue
                     out_types[field] = str(decl.get("type") or "string")
-                    out[field] = [str(v) for v in values][-self._field_limit(stream, field):]
-                self._field_cache[stream] = out
-                self._field_types[stream] = out_types
+                    out[field] = [str(v) for v in values][-self._field_limit(stream, field, observation):]
+                cache[stream] = out
+                type_cache[stream] = out_types
 
-    def _field_limit(self, stream: str, field: str) -> int:
-        """Effective cache limit: per-(stream,field) > global by-field > default."""
+    def _observation_caches(
+        self,
+        observation: str,
+    ) -> tuple[dict[str, dict[str, list[str]]], dict[str, dict[str, str]]]:
+        if observation == "mailbox_definition":
+            return self._definition_field_cache, self._definition_field_types
+        return self._field_cache, self._field_types
+
+    def _field_limit(self, stream: str, field: str, observation: str = "chat_bubble") -> int:
+        """Effective limit: observed-stream > observed-field > global stream/field > default."""
+        observed_stream = self._field_overrides_observation_stream.get(observation, {}).get(stream, {})
+        if field in observed_stream:
+            return observed_stream[field]
+        observed_fields = self._field_overrides_observation.get(observation, {})
+        if field in observed_fields:
+            return observed_fields[field]
         s = self._field_overrides_stream.get(stream, {})
         if field in s:
             return s[field]
@@ -277,23 +338,57 @@ class WsCollabService:
         streams = {s: dict(o) for s, o in self._field_overrides_stream.items() if o}
         if streams:
             cfg["streams"] = streams
+        cfg["observations"] = {
+            observation: {
+                "description": description,
+                **(
+                    {"cache-overrides": dict(self._field_overrides_observation[observation])}
+                    if self._field_overrides_observation.get(observation)
+                    else {}
+                ),
+                **(
+                    {"streams": {
+                        stream: dict(overrides)
+                        for stream, overrides in self._field_overrides_observation_stream[observation].items()
+                        if overrides
+                    }}
+                    if self._field_overrides_observation_stream.get(observation)
+                    else {}
+                ),
+            }
+            for observation, description in self._FIELD_OBSERVATIONS.items()
+        }
         return cfg
 
     def _cache_data_doc(self) -> dict[str, Any]:
-        # cache_data.json: the cached values per stream (auto-generated).
-        return {
-            stream: {
-                "cached_limit": self._FIELD_CACHE_MAX,
-                "fields": {
-                    field: {
-                        "type": self._field_types.get(stream, {}).get(field, "string"),
-                        "cached_limit": self._field_limit(stream, field),
-                        "values": values,
-                    }
-                    for field, values in fields.items()
-                },
+        # Cache data is separated by what was observed; message fields and
+        # mailbox-definition fields serve different UI decisions.
+        def streams_doc(observation: str) -> dict[str, Any]:
+            cache, types = self._observation_caches(observation)
+            return {
+                stream: {
+                    "cached_limit": self._FIELD_CACHE_MAX,
+                    "fields": {
+                        field: {
+                            "type": types.get(stream, {}).get(field, "string"),
+                            "cached_limit": self._field_limit(stream, field, observation),
+                            "values": values,
+                        }
+                        for field, values in fields.items()
+                    },
+                }
+                for stream, fields in cache.items()
             }
-            for stream, fields in self._field_cache.items()
+
+        return {
+            "schema_version": 2,
+            "observations": {
+                observation: {
+                    "description": description,
+                    "streams": streams_doc(observation),
+                }
+                for observation, description in self._FIELD_OBSERVATIONS.items()
+            },
         }
 
     def _save_cache_config(self) -> None:
@@ -327,13 +422,19 @@ class WsCollabService:
         except OSError:
             pass
 
-    def _remember_field_values(self, stream: str, messages: list[dict[str, Any]]) -> None:
-        """Record the last N distinct values of each primitive field per stream,
-        plus each field's inferred value type (string/number/boolean, or mixed)."""
-        if not stream or not messages:
+    def _remember_field_values(
+        self,
+        stream: str,
+        records: list[dict[str, Any]],
+        *,
+        observation: str = "chat_bubble",
+    ) -> None:
+        """Record primitive fields in the schema scope that observed them."""
+        if not stream or not records:
             return
-        bucket = self._field_cache.setdefault(stream, {})
-        types = self._field_types.setdefault(stream, {})
+        cache, type_cache = self._observation_caches(observation)
+        bucket = cache.setdefault(stream, {})
+        types = type_cache.setdefault(stream, {})
 
         def vtype(v: Any) -> str:
             if isinstance(v, bool):
@@ -343,7 +444,7 @@ class WsCollabService:
             return "string"
 
         def offer(field: str, value: Any) -> None:
-            if field in self._FIELD_CACHE_SKIP or value is None or isinstance(value, (dict, list)):
+            if field.split(".")[-1] in self._FIELD_CACHE_SKIP or value is None or isinstance(value, (dict, list)):
                 return
             sval = str(value)
             if sval == "":
@@ -360,26 +461,40 @@ class WsCollabService:
             if sval in seq:
                 seq.remove(sval)
             seq.append(sval)
-            lim = self._field_limit(stream, field)
+            lim = self._field_limit(stream, field, observation)
             if len(seq) > lim:
                 del seq[: len(seq) - lim]
             self._field_cache_dirty = True
 
-        for m in messages:
-            rec = m if isinstance(m, dict) else {}
-            for k, v in rec.items():
-                offer(k, v)
-            raw = rec.get("raw")
-            if isinstance(raw, dict):
-                for k, v in raw.items():
-                    offer(k, v)
+        def observe(prefix: str, value: Any) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    observe(f"{prefix}.{key}" if prefix else str(key), child)
+            else:
+                offer(prefix, value)
 
-    def field_values(self, mailbox: str) -> dict[str, Any]:
+        for item in records:
+            rec = item if isinstance(item, dict) else {}
+            for key, value in rec.items():
+                if key == "raw" and isinstance(value, dict):
+                    for raw_key, raw_value in value.items():
+                        observe(str(raw_key), raw_value)
+                else:
+                    observe(str(key), value)
+
+    def field_values(self, mailbox: str, *, observation: str = "chat_bubble") -> dict[str, Any]:
         """Candidate field values (and inferred types) for a mailbox, aggregated
-        across a merge's members."""
+        across a merge's members, within one observation scope."""
+        if observation not in self._FIELD_OBSERVATIONS:
+            raise ValidationError(f"unknown field observation: {observation}")
+        cache, type_cache = self._observation_caches(observation)
         streams: list[str] = []
-        spec = self._virtual.get(mailbox)
-        if spec:
+        if observation == "mailbox_definition" and mailbox in ("*", "all"):
+            streams = sorted(cache)
+        spec = self._virtual.get(mailbox) if observation == "chat_bubble" else None
+        if streams:
+            pass
+        elif spec:
             source = str(spec.get("source", ""))
             if source.startswith("merge:"):
                 target = source[len("merge:"):].strip()
@@ -394,7 +509,7 @@ class WsCollabService:
         merged: dict[str, list[str]] = {}
         types: dict[str, str] = {}
         for s in streams:
-            for field, values in self._field_cache.get(s, {}).items():
+            for field, values in cache.get(s, {}).items():
                 dest = merged.setdefault(field, [])
                 for v in values:
                     if v in dest:
@@ -402,20 +517,46 @@ class WsCollabService:
                     dest.append(v)
                 if len(dest) > self._FIELD_CACHE_MAX:
                     del dest[: len(dest) - self._FIELD_CACHE_MAX]
-            for field, t in self._field_types.get(s, {}).items():
+            for field, t in type_cache.get(s, {}).items():
                 prior = types.get(field)
                 types[field] = t if prior is None else (prior if prior == t else "mixed")
         limits: dict[str, int] = {}
         for s in streams:
-            for field in self._field_cache.get(s, {}):
-                limits[field] = max(limits.get(field, 0), self._field_limit(s, field))
+            for field in cache.get(s, {}):
+                limits[field] = max(limits.get(field, 0), self._field_limit(s, field, observation))
         fields = {
             field: {"type": types.get(field, "string"), "cached_limit": limits.get(field, self._FIELD_CACHE_MAX), "values": values}
             for field, values in merged.items()
         }
-        return {"mailbox": mailbox, "cached_limit": self._FIELD_CACHE_MAX, "fields": fields}
+        stream_fields = {
+            stream: {
+                "fields": {
+                    field: {
+                        "type": type_cache.get(stream, {}).get(field, "string"),
+                        "cached_limit": self._field_limit(stream, field, observation),
+                        "values": values,
+                    }
+                    for field, values in cache.get(stream, {}).items()
+                }
+            }
+            for stream in streams
+        }
+        return {
+            "mailbox": mailbox,
+            "observation": observation,
+            "cached_limit": self._FIELD_CACHE_MAX,
+            "fields": fields,
+            "streams": stream_fields,
+        }
 
-    def set_field_cache_limit(self, field: str, limit: int, *, stream: str = "") -> dict[str, Any]:
+    def set_field_cache_limit(
+        self,
+        field: str,
+        limit: int,
+        *,
+        stream: str = "",
+        observation: str = "",
+    ) -> dict[str, Any]:
         """Set a per-field cache limit. With ``stream`` it is a per-(stream,field)
         override; without, it is a global by-field override ("cache-overrides")."""
         field = str(field or "").strip()
@@ -424,23 +565,37 @@ class WsCollabService:
         lim = int(limit)
         if lim <= 0:
             raise ValidationError("limit must be a positive integer")
-        if stream:
+        if observation and observation not in self._FIELD_OBSERVATIONS:
+            raise ValidationError(f"unknown field observation: {observation}")
+        if observation and stream:
+            self._field_overrides_observation_stream.setdefault(observation, {}).setdefault(stream, {})[field] = lim
+        elif observation:
+            self._field_overrides_observation.setdefault(observation, {})[field] = lim
+        elif stream:
             self._field_overrides_stream.setdefault(stream, {})[field] = lim
         else:
             self._field_overrides_global[field] = lim
         # Re-trim any affected cached lists to the new effective limit.
-        for s, fields in self._field_cache.items():
-            if stream and s != stream:
-                continue
-            seq = fields.get(field)
-            if seq is not None:
-                eff = self._field_limit(s, field)
-                if len(seq) > eff:
-                    del seq[: len(seq) - eff]
+        observations = [observation] if observation else list(self._FIELD_OBSERVATIONS)
+        for observed in observations:
+            cache, _types = self._observation_caches(observed)
+            for s, fields in cache.items():
+                if stream and s != stream:
+                    continue
+                seq = fields.get(field)
+                if seq is not None:
+                    eff = self._field_limit(s, field, observed)
+                    if len(seq) > eff:
+                        del seq[: len(seq) - eff]
         self._field_cache_dirty = True
         self._save_cache_config()
         self._save_field_cache(force=True)
-        return {"stream": stream or "*", "field": field, "cached_limit": lim}
+        return {
+            "observation": observation or "*",
+            "stream": stream or "*",
+            "field": field,
+            "cached_limit": lim,
+        }
 
     def get_cache_config_file(self) -> dict[str, Any]:
         """Raw contents of the editable field-cache CONFIG file (limit overrides)."""
@@ -484,6 +639,8 @@ class WsCollabService:
         # Reload overrides and re-trim existing values to the new effective limits.
         self._field_overrides_global.clear()
         self._field_overrides_stream.clear()
+        self._field_overrides_observation.clear()
+        self._field_overrides_observation_stream.clear()
         glob = parsed.get("cache-overrides")
         if isinstance(glob, dict):
             for f, lim in glob.items():
@@ -496,11 +653,36 @@ class WsCollabService:
                     self._field_overrides_stream[s] = {
                         str(f): int(v) for f, v in over.items() if isinstance(v, (int, float)) and int(v) > 0
                     }
-        for s, fields in self._field_cache.items():
-            for f, seq in fields.items():
-                eff = self._field_limit(s, f)
-                if len(seq) > eff:
-                    del seq[: len(seq) - eff]
+        observations_cfg = parsed.get("observations")
+        if isinstance(observations_cfg, dict):
+            for observation, observation_cfg in observations_cfg.items():
+                if not isinstance(observation, str) or not isinstance(observation_cfg, dict):
+                    continue
+                field_overrides = observation_cfg.get("cache-overrides")
+                if isinstance(field_overrides, dict):
+                    self._field_overrides_observation[observation] = {
+                        str(field): int(limit)
+                        for field, limit in field_overrides.items()
+                        if isinstance(limit, (int, float)) and int(limit) > 0
+                    }
+                stream_overrides = observation_cfg.get("streams")
+                if isinstance(stream_overrides, dict):
+                    self._field_overrides_observation_stream[observation] = {
+                        str(stream): {
+                            str(field): int(limit)
+                            for field, limit in overrides.items()
+                            if isinstance(limit, (int, float)) and int(limit) > 0
+                        }
+                        for stream, overrides in stream_overrides.items()
+                        if isinstance(overrides, dict)
+                    }
+        for observation in self._FIELD_OBSERVATIONS:
+            cache, _types = self._observation_caches(observation)
+            for stream, fields in cache.items():
+                for field, seq in fields.items():
+                    effective = self._field_limit(stream, field, observation)
+                    if len(seq) > effective:
+                        del seq[: len(seq) - effective]
         self._field_cache_dirty = True
         self._save_field_cache(force=True)
         return {"ok": True, "path": str(path)}
@@ -885,11 +1067,11 @@ class WsCollabService:
                 return self._records_from_json(json.loads(path.read_text("utf-8-sig")))
             except Exception:
                 return []
-        # remote http(s) endpoint — a participant may cap/paginate its /v1, often
+        # remote http(s) endpoint â€” a participant may cap/paginate its /v1, often
         # *silently* (ask per_page=500, get its hard-capped 200, with no has_more).
         # Strategy: (1) discover the real cap from the first page's length; (2) page
-        # by that EFFECTIVE size — for page+per_page APIs the next page is computed
-        # from how many we've collected, so a 500→200 mismatch can't skip rows; for
+        # by that EFFECTIVE size â€” for page+per_page APIs the next page is computed
+        # from how many we've collected, so a 500â†’200 mismatch can't skip rows; for
         # offset APIs advance by (page-overlap); follow next_cursor when offered.
         # (3) keep going while new records appear, stopping on an empty/no-new page.
         # Dedup by id covers overlaps; _MAX_SCAN and a page ceiling bound it.
@@ -928,7 +1110,7 @@ class WsCollabService:
             offset_param = next((p for p in ("offset", "start", "skip", "after") if p in qs), "offset")
             mode = str(paging.get("mode") or ("page" if page_param else "offset")).lower()
             page_base = int(paging.get("base", 1))
-            # Requested page size — a probe for the server's real cap.
+            # Requested page size â€” a probe for the server's real cap.
             req_pp = int(paging.get("limit") or 0)
             if req_pp <= 0:
                 for p in (per_page_param, "limit"):
@@ -995,6 +1177,37 @@ class WsCollabService:
 
     _MAILBOX_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+    @staticmethod
+    def _activity_epoch(value: Any) -> float | None:
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    def _mailbox_activity(self, name: str) -> dict[str, Any]:
+        if name in self._virtual:
+            return {"lastActivityAt": None, "activityPerMinute": 0, "activityPerHour": 0}
+        try:
+            events = self.store.tail(name, 300)
+        except Exception:
+            return {"lastActivityAt": None, "activityPerMinute": 0, "activityPerHour": 0}
+        timestamps = [
+            stamp
+            for event in events
+            if (stamp := self._activity_epoch(getattr(event, "ts", None))) is not None
+        ]
+        now = time.time()
+        return {
+            "lastActivityAt": max(timestamps) if timestamps else None,
+            "activityPerMinute": sum(stamp >= now - 60 for stamp in timestamps),
+            "activityPerHour": sum(stamp >= now - 3600 for stamp in timestamps),
+        }
+
     def _mailbox_descriptor(self, name: str, stats: dict[str, Any] | None = None) -> dict[str, Any]:
         if stats is None:
             stats = {row["stream"]: row for row in self.store.stats()}
@@ -1022,7 +1235,7 @@ class WsCollabService:
             },
         }
 
-    def list_mailboxes(self) -> dict[str, Any]:
+    def list_mailboxes(self, agent: str = "", include_activity: bool = False) -> dict[str, Any]:
         """This place's directory of mailboxes: built-in streams plus any
         client-created mailboxes, each self-describing (name/purpose/source/
         transports + read/send/tail/ws endpoints). Hidden mailboxes are omitted;
@@ -1036,6 +1249,28 @@ class WsCollabService:
         ]
         for vname in self._virtual:
             mailboxes.append(self._virtual_descriptor(vname))
+        cursor_stats = stats if agent else {}
+        for descriptor in mailboxes:
+            stream_name = str(descriptor.get("id") or "")
+            if include_activity:
+                descriptor.update(self._mailbox_activity(stream_name))
+            if agent:
+                total = int((cursor_stats.get(stream_name) or {}).get("seq") or 0)
+                cursor = self._mailbox_cursor_payload(stream_name, agent, total)
+                descriptor.update({
+                    "unread": cursor["behind"],
+                    "cursorOffset": cursor["offset"],
+                    "cursorInitialized": cursor["initialized"],
+                    "lastReadMessageId": cursor["last_read_id"],
+                    "nextUnreadMessageId": cursor["next_unread_id"],
+                })
+        for descriptor in mailboxes:
+            self._remember_field_values(
+                str(descriptor.get("id") or ""),
+                [descriptor],
+                observation="mailbox_definition",
+            )
+        self._save_field_cache()
         return {"place": "ws_collab", "global_name": self._global_name, "mailboxes": mailboxes, "server_time": utc_now_iso()}
 
     def mailbox_config(self, mailbox: str) -> dict[str, Any]:
@@ -1119,7 +1354,7 @@ class WsCollabService:
             raise ConflictError(f"{name!r} is a built-in mailbox")
         source = str(source or "jsonl").strip()
         # A virtual source (merge:/self:/disk:/http) makes a read-only projected
-        # mailbox rather than a hosted JSONL stream — this is what "save this
+        # mailbox rather than a hosted JSONL stream â€” this is what "save this
         # merge combo as a stream" produces. It is durable across restarts.
         if source.startswith(("merge:", "self:", "disk:", "http://", "https://")):
             if name in self._dynamic_mailboxes:
@@ -1294,7 +1529,7 @@ class WsCollabService:
         substring."""
         if mailbox in self._virtual:
             # Loop prevention: a virtual stream already being resolved higher in the
-            # chain reads as empty (breaks virtual→virtual cycles at the call level).
+            # chain reads as empty (breaks virtualâ†’virtual cycles at the call level).
             if mailbox in _chain:
                 return {"messages": [], "user": sender or "", "peer": mailbox}
             child_chain = _chain | {mailbox}
@@ -1313,7 +1548,7 @@ class WsCollabService:
                 for sub in subs:
                     if sub == mailbox or sub in child_chain:
                         continue  # skip self and any stream already in the relay chain
-                    # Read sources unbounded — limit applies to the produced stream only.
+                    # Read sources unbounded â€” limit applies to the produced stream only.
                     merged.extend(self.mailbox_messages(sub, limit=_MAX_SCAN, _chain=child_chain).get("messages", []))
                 merged.sort(key=lambda m: str(m.get("timestamp") or ""))
                 messages = merged
@@ -1410,22 +1645,63 @@ class WsCollabService:
         })
         return {"message": {**message, "seq": published.get("seq"), "cursor": published.get("cursor")}}
 
-    def mailbox_cursor(self, mailbox: str, agent: str) -> dict[str, Any]:
-        """Cursor position of an agent on a mailbox. Streams are read
-        non-consumingly here, so this reports size and a zeroed position."""
-        stats = {row["stream"]: row for row in self.store.stats()}
-        total = int((stats.get(mailbox) or {}).get("seq") or 0)
+    def _mailbox_cursor_payload(self, mailbox: str, agent: str, total: int) -> dict[str, Any]:
+        position = self.cursors.get(mailbox, agent)
+        consumed = max(0, min(total, position.seq if position else 0))
+        last_read_id = None
+        next_unread_id = None
+        if mailbox in STREAMS or mailbox in self._dynamic_mailboxes:
+            try:
+                stream = self.store.stream(mailbox)
+                if consumed > 0:
+                    previous = stream.read(stream.cursor_at_seq(consumed - 1), 1).events
+                    if previous:
+                        last_read_id = previous[0].id
+                if consumed < total:
+                    upcoming = stream.read(stream.cursor_at_seq(consumed), 1).events
+                    if upcoming:
+                        next_unread_id = upcoming[0].id
+            except Exception:
+                pass
         return {
             "mailbox": mailbox,
             "agent": agent,
-            "initialized": False,
-            "offset": 0,
+            "initialized": position is not None,
+            "offset": consumed,
             "size": total,
-            "behind": total,
-            "entries_consumed": 0,
-            "entry_next": None,
+            "behind": max(0, total - consumed),
+            "entries_consumed": consumed,
+            "entry_next": next_unread_id,
             "entries_total": total,
+            "last_read_id": last_read_id,
+            "next_unread_id": next_unread_id,
         }
+
+    def mailbox_cursor(self, mailbox: str, agent: str) -> dict[str, Any]:
+        """Durable personal cursor and messages remaining beyond it."""
+        stats = {row["stream"]: row for row in self.store.stats()}
+        total = int((stats.get(mailbox) or {}).get("seq") or 0)
+        return self._mailbox_cursor_payload(mailbox, agent, total)
+
+    def mailbox_cursor_move(self, mailbox: str, agent: str, start: str = "now") -> dict[str, Any]:
+        if not mailbox or not agent:
+            raise ValidationError("mailbox and agent are required")
+        if mailbox not in STREAMS and mailbox not in self._dynamic_mailboxes:
+            return self.mailbox_cursor(mailbox, agent)
+        state = self.store.stream(mailbox)
+        token = state.cursor_at_start() if start == "beginning" else state.cursor_at_end()
+        self.cursors.reset(
+            mailbox,
+            agent,
+            token,
+            reason=f"mailbox UI moved cursor to {start}",
+            operator=agent,
+        )
+        return self.mailbox_cursor(mailbox, agent)
+
+    def mailbox_cursor_clear(self, mailbox: str, agent: str) -> dict[str, Any]:
+        self.cursors.delete(mailbox, agent)
+        return self.mailbox_cursor(mailbox, agent)
 
     def mailbox_record(self, record_id: str, record: dict[str, Any], mode: str = "at-end") -> dict[str, Any]:
         """Persist an edited record. Streams are append-only, so both "in-place"

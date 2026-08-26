@@ -122,6 +122,22 @@ class CursorManager:
         with self._lock:
             return [position.public() for position in self._cursors.values()]
 
+    def delete(self, stream: str, consumer: str) -> bool:
+        with self._lock:
+            removed = self._cursors.pop(self._key(stream, consumer), None)
+            if removed is None:
+                return False
+            self._save()
+            if self._audit_sink is not None:
+                self._audit_sink({
+                    "type": "CURSOR_REMOVED",
+                    "stream": stream,
+                    "consumer": consumer,
+                    "old_seq": removed.seq,
+                    "at": utc_now_iso(),
+                })
+            return True
+
     def history(self, stream: str, consumer: str) -> list[dict[str, Any]]:
         with self._lock:
             position = self._cursors.get(self._key(stream, consumer))

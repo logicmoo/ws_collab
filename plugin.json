@@ -16,7 +16,7 @@
   },
   "plugin-install": {
     "requires": [],
-    "install": "python -m pip install -e \"../ws_collab[all]\"",
+    "install": "python -m pip install -e \".[all]\"",
     "files": [],
     "steps": [
       "Install the WS_COLLAB package into the repository .venv.",

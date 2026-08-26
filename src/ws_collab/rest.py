@@ -343,9 +343,13 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     # Every durable JSONL stream is exposed as a "mailbox" so the shared workbench
     # ChatConversation UI can browse ws_collab streams (mailbox == stream file).
     @router.get(f"{mount}/mailbox/mailboxes")
-    async def mailbox_mailboxes(request: Request) -> dict[str, Any]:
+    async def mailbox_mailboxes(
+        request: Request,
+        agent: str = Query(""),
+        include_activity: bool = Query(False),
+    ) -> dict[str, Any]:
         await _require(request, "viewer")
-        return guarded(service.list_mailboxes)
+        return guarded(service.list_mailboxes, agent, include_activity)
 
     @router.get(f"{mount}/mailbox/agents")
     async def mailbox_agents(request: Request) -> dict[str, Any]:
@@ -378,9 +382,13 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         )
 
     @router.get(f"{mount}/mailbox/field-values")
-    async def mailbox_field_values(request: Request, mailbox: str = Query(...)) -> dict[str, Any]:
+    async def mailbox_field_values(
+        request: Request,
+        mailbox: str = Query(...),
+        observation: str = Query("chat_bubble"),
+    ) -> dict[str, Any]:
         await _require(request, "viewer")
-        return guarded(service.field_values, mailbox)
+        return guarded(service.field_values, mailbox, observation=observation)
 
     @router.post(f"{mount}/mailbox/field-limit")
     async def mailbox_field_limit(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
@@ -390,6 +398,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             str(body.get("field") or ""),
             int(body.get("limit") or 0),
             stream=str(body.get("stream") or ""),
+            observation=str(body.get("observation") or ""),
         )
 
     @router.get(f"{mount}/mailbox/cache-config")
@@ -433,12 +442,17 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     @router.post(f"{mount}/mailbox/cursor")
     async def mailbox_cursor_move(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
-        return guarded(service.mailbox_cursor, str(body.get("mailbox") or ""), str(body.get("agent") or ""))
+        return guarded(
+            service.mailbox_cursor_move,
+            str(body.get("mailbox") or ""),
+            str(body.get("agent") or ""),
+            str(body.get("start") or "now"),
+        )
 
     @router.delete(f"{mount}/mailbox/cursor")
     async def mailbox_cursor_clear(request: Request, mailbox: str = Query(...), agent: str = Query(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
-        return guarded(service.mailbox_cursor, mailbox, agent)
+        return guarded(service.mailbox_cursor_clear, mailbox, agent)
 
     @router.get(f"{mount}/mailbox/mailbox-config")
     async def mailbox_config_get(request: Request, mailbox: str = Query(...)) -> dict[str, Any]:
@@ -913,4 +927,3 @@ def create_static_router(ctx: AppContext) -> APIRouter:
         raise HTTPException(status_code=404, detail={"code": "not_found", "message": asset or "/"})
 
     return router
-

@@ -63,6 +63,53 @@ def test_prepare_creates_the_writable_tree(tmp_path) -> None:
     assert config.state_dir.is_dir() and config.cursors_dir.is_dir() and config.sessions_dir.is_dir()
 
 
+def test_field_cache_separates_mailbox_definitions_from_chat_bubbles(service: WsCollabService) -> None:
+    directory = service.list_mailboxes()["mailboxes"]
+    mailbox_id = next(item["id"] for item in directory if item["id"] == "conversation")
+    service._remember_field_values(
+        mailbox_id,
+        [{"from": "operator", "type": "CONVERSATION_MESSAGE", "raw": {"source_kind": "agent"}}],
+        observation="chat_bubble",
+    )
+
+    definitions = service.field_values(mailbox_id, observation="mailbox_definition")
+    bubbles = service.field_values(mailbox_id, observation="chat_bubble")
+
+    assert definitions["observation"] == "mailbox_definition"
+    assert {"kind", "source", "origin", "writable"} <= definitions["fields"].keys()
+    assert "from" not in definitions["fields"]
+    assert bubbles["observation"] == "chat_bubble"
+    assert {"from", "type", "source_kind"} <= bubbles["fields"].keys()
+    assert "purpose" not in bubbles["fields"]
+
+    data = service._cache_data_doc()
+    assert data["schema_version"] == 2
+    assert set(data["observations"]) == {"chat_bubble", "mailbox_definition"}
+    assert set(service._cache_config_doc()["observations"]) == {"chat_bubble", "mailbox_definition"}
+
+
+def test_mailbox_directory_uses_durable_personal_cursor(service: WsCollabService) -> None:
+    service.mailbox_send(to="conversation", text="first", sender="operator")
+    service.mailbox_send(to="conversation", text="second", sender="operator")
+
+    before = next(item for item in service.list_mailboxes("reader")["mailboxes"] if item["id"] == "conversation")
+    assert before["unread"] == 2
+    assert before["cursorOffset"] == 0
+
+    moved = service.mailbox_cursor_move("conversation", "reader", "now")
+    assert moved["initialized"] is True
+    assert moved["behind"] == 0
+    assert moved["last_read_id"]
+
+    after = next(item for item in service.list_mailboxes("reader")["mailboxes"] if item["id"] == "conversation")
+    assert after["unread"] == 0
+    assert after["lastReadMessageId"] == moved["last_read_id"]
+
+    cleared = service.mailbox_cursor_clear("conversation", "reader")
+    assert cleared["initialized"] is False
+    assert cleared["behind"] == 2
+
+
 def test_state_directory_is_relocatable(tmp_path) -> None:
     elsewhere = tmp_path / "somewhere-else"
     config = Config.from_env(_env(tmp_path, WS_COLLAB_STATE_DIR=str(elsewhere)))
