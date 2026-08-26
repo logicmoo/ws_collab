@@ -1,0 +1,6 @@
+instructions: |
+  Do not look at any other code on this filesystem
+
+automation:
+  auto_issue_session: true
+  remote_control: true
