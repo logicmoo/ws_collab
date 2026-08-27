@@ -22,7 +22,7 @@ from .audio.devices import DeviceRegistry
 from .audio.routing import RoutingManager
 from .audio.segment import AudioSegment
 from .classify import SourceClassifier
-from .config import Config
+from .config import Config, ECHO_POLICIES
 from .cursors import CursorManager
 from .disambiguator import build_disambiguator
 from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError
@@ -160,6 +160,10 @@ class WsCollabService:
         saved_capture_device = self.sound_settings.get("capture_device")
         if saved_capture_device:
             self.capture.set_preferred_device(saved_capture_device)
+        saved_echo_policy = self.sound_settings.get("echo_policy")
+        if saved_echo_policy in ECHO_POLICIES:
+            self.config.echo_policy = saved_echo_policy
+            self.classifier.echo_policy = saved_echo_policy
         self.prompt = PromptManager(config, self.publish, read_history=self._prompt_history_events)
         self.accuracy = accuracy_metrics.AccuracyAccumulator()
 
@@ -2314,6 +2318,24 @@ class WsCollabService:
         return self.capture.stop()
 
     def capture_state(self) -> dict[str, Any]:
+        return self.capture.state()
+
+    def set_echo_policy(self, policy: str) -> dict[str, Any]:
+        """Change how captured audio is reconciled against our own TTS, live.
+
+        Both the capture service (mute-during-tts check) and the classifier
+        (echo detection) read ``echo_policy`` on every use, not just at
+        startup, so updating both here takes effect immediately -- no
+        restart needed.
+        """
+
+        if policy not in ECHO_POLICIES:
+            raise ValidationError(f"invalid echo policy: {policy!r}", details={"allowed": sorted(ECHO_POLICIES)})
+        previous = self.config.echo_policy
+        self.config.echo_policy = policy
+        self.classifier.echo_policy = policy
+        self.sound_settings.set("echo_policy", policy)
+        self._audit_sink({"type": "AUDIO_POLICY_CHANGED", "action": "set_echo_policy", "previous": previous, "policy": policy})
         return self.capture.state()
 
     # ----------------------------------------------------------------- cursors

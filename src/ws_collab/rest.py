@@ -591,6 +591,11 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         await _require(request, "operator", mutating=True)
         return guarded(service.stop_capture)
 
+    @router.post(f"{mount}/audio/echo-policy")
+    async def set_echo_policy(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.set_echo_policy, body.get("policy", ""))
+
     @router.get(f"{mount}/audio/devices")
     async def list_devices(request: Request) -> dict[str, Any]:
         await _require(request, "viewer")

@@ -1402,6 +1402,46 @@ async function loadStt() {
     body.appendChild(p.root);
   } catch (error) { body.textContent = `error: ${error.message}`; }
   primeSttEngineRows();
+  startSttSensitivityPolling();
+}
+
+// Self-terminating poll of the server-side capture/VAD state -- shows the mic
+// "hunting" for a signal (threshold dropping below baseline while it hears
+// nothing) with a live up/down indicator, and keeps the echo-policy select in
+// sync with whatever is actually active. Stops itself once you navigate away
+// from the STT page; loadStt() restarts it when you come back.
+let sttSensPolling = false;
+let sttSensLastThreshold = null;
+
+function sttSensitivityBadgeUpdate(sens) {
+  const badge = $("stt-sensitivity-indicator");
+  if (!sens) { badge.textContent = "not listening"; badge.className = "badge"; sttSensLastThreshold = null; return; }
+  const pct = Math.round((1 - sens.current_threshold / sens.base_threshold) * 100);
+  const droppedBack = sttSensLastThreshold != null && sens.current_threshold > sttSensLastThreshold + 1e-6;
+  sttSensLastThreshold = sens.current_threshold;
+  if (pct <= 0) {
+    badge.textContent = droppedBack ? "🔻 back to baseline" : "● baseline sensitivity";
+    badge.className = "badge ok";
+  } else {
+    badge.textContent = `🔺 turning up +${pct}% (hunting for a signal…)`;
+    badge.className = "badge warn";
+  }
+}
+
+function pollSttSensitivityOnce() {
+  api(`${V1}/audio/capture`).then((capture) => {
+    sttSensitivityBadgeUpdate(capture.mic_sensitivity);
+    const policySelect = $("stt-echo-policy");
+    if (capture.echo_policy && document.activeElement !== policySelect) policySelect.value = capture.echo_policy;
+  }).catch(() => {});
+  if (state.page === "stt") setTimeout(pollSttSensitivityOnce, 1500);
+  else sttSensPolling = false;
+}
+
+function startSttSensitivityPolling() {
+  if (sttSensPolling) return;
+  sttSensPolling = true;
+  pollSttSensitivityOnce();
 }
 
 /* ------------------------------------------------------ live per-engine STT */
@@ -1572,7 +1612,10 @@ function startSttRecognizer(mode) {
   // The browser's own end-of-utterance detector -- the "thinks I'm done
   // talking" signal that was asked for. Fires before onend/onerror.
   recognizer.onspeechstart = () => setSpeechIndicator("🗣️ speaking…", "ok");
-  recognizer.onspeechend = () => { setSpeechIndicator("⏸ done talking (silence detected)", "warn"); playBeep(); };
+  recognizer.onspeechend = () => {
+    setSpeechIndicator("⏸ done talking (silence detected)", "warn");
+    if ($("stt-beep-enabled").checked) playBeep();
+  };
   recognizer.onerror = (e) => {
     lastError = e.error;
     status.textContent = `⚠ ${STT_ERROR_HINTS[e.error] || e.error}`;
@@ -2083,6 +2126,17 @@ function wireEvents() {
   $("stt-send").onclick = () => sttIngest($("stt-text").value);
   $("stt-text").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); sttIngest($("stt-text").value); } });
   $("stt-mic").onclick = toggleSttMic;
+  $("stt-echo-policy").onchange = async () => {
+    const policy = $("stt-echo-policy").value;
+    const status = $("stt-policy-status");
+    status.textContent = "applying…";
+    try {
+      await api(`${V1}/audio/echo-policy`, { method: "POST", body: { policy } });
+      status.textContent = "✓ applied";
+    } catch (error) {
+      status.textContent = `⚠ ${error.message}`;
+    }
+  };
   $("ac-refresh").onclick = loadAccuracy;
   $("ac-measure").onclick = async () => {
     try { await api(`${V1}/tts/measure`, { method: "POST", body: { agent_id: $("ac-agent").value, text: $("ac-text").value } }); loadAccuracy(); }

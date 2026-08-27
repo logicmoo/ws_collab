@@ -279,8 +279,21 @@
           <option value="single">Single utterance (stops itself when done)</option>
         </select>
         <label class="hint"><input type="checkbox" id="stt-send-partials" checked /> send partial hypotheses to server too</label>
+        <label class="hint"><input type="checkbox" id="stt-beep-enabled" checked /> 🔔 beep when done talking</label>
         <span id="stt-speech-state" class="badge"></span>
         <span class="hint" id="stt-mic-status"></span>
+      </div>
+      <div class="toolbar">
+        <span class="hint">Server-side mic:</span>
+        <span id="stt-sensitivity-indicator" class="badge">—</span>
+        <span class="hint">policy:</span>
+        <select id="stt-echo-policy" title="How captured audio is reconciled against our own TTS output">
+          <option value="mute_input_during_tts">Mute input during TTS</option>
+          <option value="listen_and_filter_tts">Listen and filter TTS (default)</option>
+          <option value="listen_and_measure_tts_accuracy">Listen and measure TTS accuracy</option>
+          <option value="full_duplex_with_echo_cancellation">Full duplex with echo cancellation</option>
+        </select>
+        <span class="hint" id="stt-policy-status"></span>
       </div>
       <div class="panel-body">
         <div class="panel">

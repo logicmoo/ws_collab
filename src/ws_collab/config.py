@@ -23,6 +23,14 @@ _FALSE = {"0", "false", "no", "off", "n", ""}
 
 ROLE_ORDER = ["viewer", "worker", "operator", "admin"]
 
+# How captured audio is reconciled against the system's own TTS output.
+ECHO_POLICIES = {
+    "mute_input_during_tts",
+    "listen_and_filter_tts",
+    "listen_and_measure_tts_accuracy",
+    "full_duplex_with_echo_cancellation",
+}
+
 
 def _plugin_env_variables() -> dict[str, str]:
     """The ``"env:variables"`` map declared in the sibling ``plugin.json``.
@@ -362,12 +370,7 @@ class Config:
             if path and not Path(path).is_file():
                 raise ConfigurationError(f"TLS {label} file not found: {path}")
 
-        if self.echo_policy not in {
-            "mute_input_during_tts",
-            "listen_and_filter_tts",
-            "listen_and_measure_tts_accuracy",
-            "full_duplex_with_echo_cancellation",
-        }:
+        if self.echo_policy not in ECHO_POLICIES:
             raise ConfigurationError(f"invalid echo policy: {self.echo_policy!r}")
 
         if self.disambiguator not in {"deterministic", "llm"}:
