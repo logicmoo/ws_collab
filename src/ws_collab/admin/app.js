@@ -202,6 +202,7 @@ function ingest(event) {
   scheduleStreamMenuRender();
   scheduleTilesRender(stream);
   Object.values(state.views).forEach((view) => view.onEvent(event));
+  if (stream === "stt_transcripts") handleSttTranscriptEvent(event);
   return true;
 }
 
@@ -1396,6 +1397,81 @@ async function loadStt() {
     ) : el("div", "hint", "No transcripts yet. Ingest text below, or use the mic button to test with real speech recognition."));
     body.appendChild(p.root);
   } catch (error) { body.textContent = `error: ${error.message}`; }
+  primeSttEngineRows();
+}
+
+/* ------------------------------------------------------ live per-engine STT */
+// One row per STT engine (as reported live by the server) plus a pinned,
+// highlighted "disambiguator" row for the final resolved result. Populated
+// from /v1/status on page load, then updated live from the WS stt_transcripts
+// stream in ingest() -- no polling, no page reload needed.
+const sttEngineRows = new Map();
+
+function sttEngineTbody() {
+  let tbody = document.querySelector("#stt-engine-body tbody");
+  if (tbody) return tbody;
+  const host = $("stt-engine-body");
+  host.replaceChildren();
+  const t = table(["Engine", "Status", "Confidence", "Text", "Time"], []);
+  host.appendChild(t);
+  return t.querySelector("tbody");
+}
+
+function sttEngineRow(engine) {
+  let row = sttEngineRows.get(engine);
+  if (row) return row;
+  const tbody = sttEngineTbody();
+  const tr = el("tr");
+  if (engine === "disambiguator") tr.classList.add("stt-final-row");
+  const tdEngine = el("td"); tdEngine.appendChild(mono(engine));
+  const tdStatus = el("td"); tdStatus.appendChild(badge("waiting…", ""));
+  const tdConf = el("td"); tdConf.textContent = "—";
+  const tdText = el("td"); tdText.textContent = "—";
+  const tdTime = el("td"); tdTime.textContent = "—";
+  tr.append(tdEngine, tdStatus, tdConf, tdText, tdTime);
+  // Keep the disambiguator's final-result row pinned to the bottom, visually
+  // separated from the individual per-engine hypotheses above it.
+  if (engine === "disambiguator") tbody.appendChild(tr);
+  else tbody.insertBefore(tr, tbody.querySelector(".stt-final-row"));
+  row = { tr, tdStatus, tdConf, tdText, tdTime };
+  sttEngineRows.set(engine, row);
+  return row;
+}
+
+function primeSttEngineRows() {
+  api(`${V1}/status`).then((status) => {
+    const engines = (status.subsystems && status.subsystems.stt && status.subsystems.stt.engines) || [];
+    $("stt-engine-hint").textContent = engines.length
+      ? `Configured engines: ${engines.join(", ")}, then disambiguator. Speak into the mic (Devices page → Start listening) to see live results.`
+      : "No STT engines configured.";
+    engines.forEach((name) => sttEngineRow(name));
+    sttEngineRow("disambiguator");
+  }).catch(() => { $("stt-engine-hint").textContent = "Could not load engine list from /v1/status."; });
+}
+
+function handleSttTranscriptEvent(event) {
+  const d = event.data || {};
+  const engine = d.engine || event.source_id;
+  if (!engine) return;
+  const row = sttEngineRow(engine);
+  const isDisambiguator = engine === "disambiguator";
+  const isError = event.type === "STT_ENGINE_ERROR";
+  const text = isDisambiguator ? d.resolved_text : (d.raw_text || d.normalized_text);
+  row.tdTime.textContent = shortTs(event.ts);
+  row.tdConf.textContent = d.confidence != null ? String(d.confidence) : "—";
+  if (isError) {
+    row.tdStatus.replaceChildren(badge("error", "danger"));
+    row.tdText.textContent = `⚠ ${d.error || "engine error"}`;
+  } else if (!text) {
+    row.tdStatus.replaceChildren(badge(d.is_final === false ? "listening…" : "no speech", ""));
+    row.tdText.textContent = "—";
+  } else {
+    row.tdStatus.replaceChildren(badge(
+      isDisambiguator ? "FINAL" : (d.is_final === false ? "partial" : "final"),
+      isDisambiguator ? "ok" : (d.is_final === false ? "warn" : "teal"),
+    ));
+    row.tdText.textContent = text;
+  }
 }
 
 async function sttIngest(text, opts = {}) {
@@ -1408,42 +1484,160 @@ async function sttIngest(text, opts = {}) {
         engine: $("stt-engine").value || "external",
         text: trimmed,
         language: $("stt-lang").value || "en",
-        confidence: Number($("stt-conf").value || 0.9),
+        confidence: opts.confidence != null ? opts.confidence : Number($("stt-conf").value || 0.9),
         is_final: opts.is_final !== undefined ? opts.is_final : $("stt-final").checked,
       },
     });
-    loadStt();
+    if (opts.is_final) loadStt();
   } catch (error) {
-    pushError(error.message);
+    if (!opts.silent) pushError(error.message);
   }
 }
 
+function sttLiveLog(text) {
+  const log = $("stt-live-log");
+  if (!log) return;
+  const line = el("div", "mono", `${new Date().toLocaleTimeString()}  ${text}`);
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+// Two listening modes -- this is an explicit "allowed to stop itself or not"
+// switch, since that's the actual source of confusion: the Web Speech API
+// naturally ends a session after a silence/no-speech timeout even when
+// `continuous` is set, and it does so silently unless we surface it.
+//  - single:     the browser is ALLOWED to stop itself once it thinks you're
+//                done talking (one utterance, no restart).
+//  - continuous: NOT allowed to stop itself -- any end/error auto-restarts
+//                (after a short delay, to dodge a start()-while-stopping
+//                race) until you explicitly click "Stop listening".
+// The speaking / done-talking indicator is shown in both modes.
 let sttRecognizer = null;
-function toggleSttMic() {
-  const status = $("stt-mic-status");
+let sttShouldContinue = false;
+let sttRestartTimer = null;
+
+const STT_ERROR_HINTS = {
+  "no-speech": "no speech detected (silence timeout)",
+  "audio-capture": "no microphone found / capture failed",
+  "not-allowed": "microphone permission blocked",
+  network: "network error",
+  aborted: "aborted",
+};
+
+function setSpeechIndicator(text, kind) {
+  const badge = $("stt-speech-state");
+  badge.textContent = text;
+  badge.className = `badge ${kind || ""}`;
+}
+
+// Short synthesized beep (Web Audio API -- no audio file needed) played the
+// moment the recognizer thinks you've stopped talking (onspeechend).
+let sttAudioCtx = null;
+function playBeep() {
+  try {
+    sttAudioCtx = sttAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (sttAudioCtx.state === "suspended") sttAudioCtx.resume();
+    const osc = sttAudioCtx.createOscillator();
+    const gain = sttAudioCtx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = 880; // A5 -- short, clearly audible "done" chirp
+    const now = sttAudioCtx.currentTime;
+    gain.gain.setValueAtTime(0.15, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+    osc.connect(gain).connect(sttAudioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.15);
+  } catch (error) { /* no audio output available -- non-fatal */ }
+}
+
+function startSttRecognizer(mode) {
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!Recognition) { status.textContent = "Browser Web Speech API not available (try Chrome/Edge over http://localhost)."; return; }
-  if (sttRecognizer) {
-    sttRecognizer.stop();
-    return;
-  }
+  const status = $("stt-mic-status");
   const recognizer = new Recognition();
   recognizer.lang = $("stt-lang").value || "en-US";
-  recognizer.continuous = true;
+  recognizer.continuous = mode !== "single";
   recognizer.interimResults = true;
-  recognizer.onstart = () => { status.textContent = "listening…"; $("stt-mic").textContent = "⏹ Stop"; };
-  recognizer.onerror = (e) => { status.textContent = `mic error: ${e.error}`; };
-  recognizer.onend = () => { sttRecognizer = null; status.textContent = "stopped"; $("stt-mic").textContent = "🎤 Record (browser mic)"; };
+  let lastError = null;
+  recognizer.onstart = () => {
+    lastError = null;
+    status.textContent = mode === "single" ? "🔴 listening for one utterance…" : "🔴 listening (won't stop itself)…";
+    $("stt-mic").textContent = "⏹ Stop listening";
+    $("stt-live-partial").textContent = "…";
+    setSpeechIndicator("🗣️ speaking…", "ok");
+  };
+  // The browser's own end-of-utterance detector -- the "thinks I'm done
+  // talking" signal that was asked for. Fires before onend/onerror.
+  recognizer.onspeechstart = () => setSpeechIndicator("🗣️ speaking…", "ok");
+  recognizer.onspeechend = () => { setSpeechIndicator("⏸ done talking (silence detected)", "warn"); playBeep(); };
+  recognizer.onerror = (e) => {
+    lastError = e.error;
+    status.textContent = `⚠ ${STT_ERROR_HINTS[e.error] || e.error}`;
+  };
+  recognizer.onend = () => {
+    sttRecognizer = null;
+    const reason = lastError ? (STT_ERROR_HINTS[lastError] || lastError) : "session ended";
+    if (sttShouldContinue && mode !== "single") {
+      // Continuous mode is not allowed to stop itself: restart after a short
+      // delay (a bare restart from inside onend can throw "already started").
+      status.textContent = `⏹ ${reason} — restarting (continuous mode)…`;
+      setSpeechIndicator("⏸ restarting…", "warn");
+      sttRestartTimer = setTimeout(() => { if (sttShouldContinue) startSttRecognizer(mode); }, 300);
+      return;
+    }
+    sttShouldContinue = false;
+    status.textContent = mode === "single" ? `stopped: ${reason}` : `stopped by user (${reason})`;
+    $("stt-mic").textContent = "🎤 Start listening";
+    $("stt-live-partial").textContent = "Click \"Start listening\" and speak…";
+    setSpeechIndicator("", "");
+  };
   recognizer.onresult = (event) => {
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const result = event.results[i];
       const transcript = result[0].transcript;
-      $("stt-text").value = transcript;
-      if (result.isFinal) sttIngest(transcript, { is_final: true });
+      const confidence = result[0].confidence || 0.9;
+      if (result.isFinal) {
+        $("stt-live-partial").textContent = "…";
+        sttLiveLog(transcript);
+        $("stt-text").value = transcript;
+        sttIngest(transcript, { is_final: true, confidence });
+      } else {
+        // Interim hypothesis: reflect it live as it changes, word by word.
+        $("stt-live-partial").textContent = transcript;
+        if ($("stt-send-partials").checked) sttIngest(transcript, { is_final: false, confidence, silent: true });
+      }
     }
   };
-  sttRecognizer = recognizer;
-  recognizer.start();
+  try {
+    recognizer.start();
+    sttRecognizer = recognizer;
+  } catch (err) {
+    // Almost always a start()-while-stopping race; retry shortly rather than
+    // silently doing nothing (which is what looked like "it just stops").
+    status.textContent = `⚠ could not restart (${err.message || err}) — retrying…`;
+    sttRestartTimer = setTimeout(() => { if (sttShouldContinue) startSttRecognizer(mode); }, 300);
+  }
+}
+
+function toggleSttMic() {
+  const status = $("stt-mic-status");
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Recognition) { status.textContent = "Browser Web Speech API not available (try Chrome/Edge over http://localhost)."; return; }
+  if (sttRecognizer || sttShouldContinue) {
+    // Also covers the ~300ms gap where a restart is pending but no recognizer
+    // instance exists yet -- otherwise "Stop" could appear to do nothing.
+    sttShouldContinue = false;
+    clearTimeout(sttRestartTimer);
+    if (sttRecognizer) sttRecognizer.stop();
+    else {
+      status.textContent = "stopped by user";
+      $("stt-mic").textContent = "🎤 Start listening";
+      $("stt-live-partial").textContent = "Click \"Start listening\" and speak…";
+      setSpeechIndicator("", "");
+    }
+    return;
+  }
+  sttShouldContinue = true;
+  startSttRecognizer($("stt-mic-mode").value || "continuous");
 }
 
 /* ---- accuracy */

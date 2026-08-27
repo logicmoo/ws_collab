@@ -273,8 +273,32 @@
     <section class="page" data-page="stt">
       <div class="toolbar">
         <button class="primary" id="stt-refresh">Refresh</button>
-        <button id="stt-mic" title="Use the browser's Web Speech API to recognize your mic and ingest it live">🎤 Record (browser mic)</button>
+        <button id="stt-mic" title="Use the browser's Web Speech API to recognize your mic in real time">🎤 Start listening</button>
+        <select id="stt-mic-mode" title="Whether the recognizer is allowed to stop itself">
+          <option value="continuous" selected>Continuous (never stops itself; auto-restarts)</option>
+          <option value="single">Single utterance (stops itself when done)</option>
+        </select>
+        <label class="hint"><input type="checkbox" id="stt-send-partials" checked /> send partial hypotheses to server too</label>
+        <span id="stt-speech-state" class="badge"></span>
         <span class="hint" id="stt-mic-status"></span>
+      </div>
+      <div class="panel-body">
+        <div class="panel">
+          <div class="panel-title">Live engine hypotheses (server-side capture → each engine → disambiguator, updates in real time)</div>
+          <div class="panel-content">
+            <div id="stt-engine-hint" class="hint">Waiting for server capabilities…</div>
+            <div id="stt-engine-body"></div>
+          </div>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="panel">
+          <div class="panel-title">Live recognition (browser mic → external ingest bridge, real-time)</div>
+          <div class="panel-content">
+            <div id="stt-live-log" style="max-height:180px;overflow-y:auto"></div>
+            <div id="stt-live-partial" class="hint" style="min-height:1.4em;font-style:italic;margin-top:6px">Click "Start listening" and speak…</div>
+          </div>
+        </div>
       </div>
       <div class="toolbar">
         <input type="text" id="stt-engine" placeholder="engine" value="external" style="width:120px" />

@@ -20,8 +20,17 @@ from pathlib import Path
 from typing import Any
 
 _HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+_SOURCE_ROOT = _HERE / "src"
+if str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
+
+# Another plugin may have put the whole plugins root on sys.path, which makes
+# THIS plugin directory importable as a namespace package called "ws_collab"
+# that shadows the real package in src/. Evict such a cached portion so the
+# regular package (with __init__.py) wins the import.
+_cached = sys.modules.get("ws_collab")
+if _cached is not None and getattr(_cached, "__file__", None) is None:
+    del sys.modules["ws_collab"]
 
 
 def _mode() -> str:

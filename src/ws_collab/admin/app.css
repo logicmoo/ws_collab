@@ -433,6 +433,9 @@ th {
 td { padding: 5px 8px; border-bottom: 1px solid var(--border-subtle); color: var(--text-secondary); }
 td.mono, .mono { font-family: var(--font-mono); font-size: 11px; }
 tr:hover td { background: var(--bg-panel-raised); }
+/* Disambiguator's resolved-final row: visually pinned/highlighted vs. the raw
+   per-engine hypothesis rows above it. */
+tr.stt-final-row td { background: var(--bg-panel-raised); border-top: 2px solid var(--accent-teal); font-weight: 600; }
 
 /* ------------------------------------------------------------------ badges */
 .badge {
