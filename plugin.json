@@ -8,11 +8,22 @@
   "scan": "startup",
   "routePrefix": "/ws_collab",
   "configPage": "http://127.0.0.1:5173/ws_collab/admin",
+  "mailboxEndpoint": {
+    "path": "/ws_collab/v1/mailbox/mailboxes",
+    "protocol": "ws_collab",
+    "description": "Mailbox directory (unread counts, activity, virtual mailboxes); sibling routes /messages, /agents, /send, /cursor share this base."
+  },
+  "servicesEndpoint": {
+    "path": "/ws_collab/endpoints",
+    "description": "Native self-description: every REST/WS/admin endpoint with auth level and docs (token-gated when auth is enabled)."
+  },
   "docs": "README.md",
   "kind": "custom",
   "requestTimeoutSeconds": 0,
   "env:variables": {
-    "WS_COLLAB_AUDIO_ENABLED": "1"
+    "WS_COLLAB_AUDIO_ENABLED": "1",
+    "WS_COLLAB_AUTH_DISABLED": "1",
+    "WS_COLLAB_REQUIRE_AUTH": "0"
   },
   "plugin-install": {
     "requires": [],
@@ -24,14 +35,46 @@
       "Open the administration console and confirm the transports answer."
     ]
   },
+  "plugin-uninstall": {
+    "uninstall": null,
+    "steps": [
+      "Stop the standalone WS_COLLAB server (or unset WS_COLLAB_PLUGIN_MODE=embedded and stop the embedded mount).",
+      "This is a vendored nested project (its own .git) -- remove its directory entirely to uninstall it, or leave it and just disable scanning it (set scan: disabled in plugins.json)."
+    ]
+  },
   "plugin-init": [
     {
       "command": "web_proxy",
       "description": "Redirects /ws_collab to the Workspace Collab plugin.",
-      "redirect": "http://127.0.0.1:8802/ws_collab",
+      "redirect": "http://127.0.0.1:8802",
       "path": "/ws_collab"
     }
   ],
+  "plugin-lifecycle": {
+    "standalone": true,
+    "hooks": {
+      "install": null,
+      "installAfter": null,
+      "uninstall": null,
+      "uninstallAfter": null,
+      "workbenchStartup": null,
+      "workbenchStartupAfter": null,
+      "workbenchShutdown": null,
+      "workbenchShutdownAfter": null,
+      "workspaceStartup": null,
+      "workspaceStartupAfter": null,
+      "workspaceShutdown": null,
+      "workspaceShutdownAfter": null
+    },
+    "note": "Runs as its own standalone server by default (set WS_COLLAB_PLUGIN_MODE=embedded to mount it in-process instead). A standalone plugin owns its own process start/stop, so a workbench restart does not restart it -- workbenchShutdown, if implemented, is only a heads-up notification, never a signal to stop or restart this plugin's own server."
+  },
+  "plugin-api": {
+    "status": { "method": "GET", "path": "/ws_collab/status", "description": "Subsystem rollup with an overall verdict." },
+    "config": { "method": "GET", "path": "/ws_collab/admin/", "description": "Token-gated operations workbench (same page as configPage)." },
+    "restart": null,
+    "shutdown": null,
+    "note": "The standalone server self-describes its full endpoint list at GET /ws_collab/endpoints (token-gated) -- this block only names the handful worth surfacing directly on the Plugins page. It has no HTTP restart/shutdown route of its own; stop/start its process the same way you started it."
+  },
   "ui": {
     "pages": [
       {
@@ -40,7 +83,7 @@
         "kind": "admin",
         "descriptor": "http://127.0.0.1:5173/ws_collab/admin",
         "glyph": "⚙",
-        "group": "PLUGINS"
+        "group": "CAPABILITIES"
       },
       {
         "id": "audio",
@@ -48,7 +91,7 @@
         "kind": "admin",
         "descriptor": "http://127.0.0.1:5173/ws_collab/admin/#audio",
         "glyph": "♪",
-        "group": "PLUGINS"
+        "group": "CAPABILITIES"
       },
       {
         "id": "monitor",
@@ -56,7 +99,7 @@
         "kind": "user",
         "descriptor": "http://127.0.0.1:5173/ws_collab/admin/#monitor",
         "glyph": "◉",
-        "group": "PLUGINS"
+        "group": "RUNTIME"
       }
     ]
   }

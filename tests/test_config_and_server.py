@@ -88,6 +88,69 @@ def test_field_cache_separates_mailbox_definitions_from_chat_bubbles(service: Ws
     assert set(service._cache_config_doc()["observations"]) == {"chat_bubble", "mailbox_definition"}
 
 
+def test_field_cache_growth_is_bounded(service: WsCollabService) -> None:
+    """Regression: the cache once observed its own on-disk document, minting
+    millions of ever-deeper dotted fields until the file reached gigabytes."""
+
+    limit = service._FIELD_CACHE_MAX_FIELDS_PER_STREAM
+    # Far more unique fields than the cap allows.
+    service._remember_field_values(
+        "conversation",
+        [{f"field_{i}": "x" for i in range(limit + 300)}],
+        observation="chat_bubble",
+    )
+    # A pathologically nested record (like a serialized copy of the cache itself).
+    nested: dict = {"leaf": "y"}
+    for depth in range(30):
+        nested = {f"level{depth}": nested}
+    # An absurdly long value must not be cached either.
+    service._remember_field_values(
+        "conversation",
+        [{"nested": nested, "huge": "z" * 100_000}],
+        observation="chat_bubble",
+    )
+
+    bucket = service._field_cache["conversation"]
+    assert len(bucket) <= limit
+    assert all(field.count(".") < service._FIELD_CACHE_MAX_FIELD_DEPTH for field in bucket)
+    assert "huge" not in bucket
+    assert all(
+        len(value) <= service._FIELD_CACHE_MAX_VALUE_CHARS
+        for values in bucket.values() for value in values
+    )
+
+
+def test_field_cache_never_observes_its_own_disk_documents(service: WsCollabService) -> None:
+    service._virtual["fields_seen_in_streams"] = {
+        "source": "disk:fields_seen_in_streams.json",
+        "purpose": "cache view",
+    }
+    service._remember_field_values(
+        "fields_seen_in_streams",
+        [{"observations": "chat_bubble", "schema_version": "2"}],
+        observation="chat_bubble",
+    )
+    assert "fields_seen_in_streams" not in service._field_cache
+
+
+def test_oversized_field_cache_file_is_quarantined_on_startup(tmp_path) -> None:
+    from ws_collab.context import build_context
+
+    config = Config.from_env(_env(tmp_path))
+    config.prepare_state_dir()
+    cache_path = Path(config.jsonl_dir) / "fields_seen_in_streams.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(b"{" + b" " * (65 * 1024 * 1024))
+
+    context = build_context(config)
+    try:
+        assert not cache_path.exists()
+        assert cache_path.with_name(cache_path.name + ".oversized").exists()
+        assert any("oversized" in warning for warning in context.service._warnings)
+    finally:
+        context.store.close()
+
+
 def test_mailbox_directory_uses_durable_personal_cursor(service: WsCollabService) -> None:
     service.mailbox_send(to="conversation", text="first", sender="operator")
     service.mailbox_send(to="conversation", text="second", sender="operator")

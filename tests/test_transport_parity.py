@@ -422,6 +422,22 @@ def test_websocket_requires_authentication_before_use(client) -> None:
     assert error and error["error"]["code"] == "authentication_required"
 
 
+def test_loopback_websocket_is_authenticated_automatically_when_auth_is_disabled(app_context) -> None:
+    from fastapi.testclient import TestClient
+
+    from ws_collab.server import build_app
+
+    app_context.config.auth_disabled = True
+    app = build_app(app_context, with_lifespan=False)
+    with TestClient(app, client=("127.0.0.1", 50000)) as local_client:
+        with local_client.websocket_connect("/ws_collab/ws") as ws:
+            auth = ws.receive_json()
+            assert auth["type"] == "auth_ok"
+            assert auth["principal"]["label"] == "local"
+            ws.send_json({"type": "subscribe", "streams": [CONVERSATION]})
+            assert _drain_until(ws, "subscribed")
+
+
 def test_websocket_rejects_invalid_credentials(client) -> None:
     with client.websocket_connect("/ws_collab/ws") as ws:
         ws.send_json({"type": "auth", "token": "wrong"})

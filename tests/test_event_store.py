@@ -239,7 +239,22 @@ def test_recovers_when_recovery_metadata_is_lost(config) -> None:
 def test_a_second_writer_cannot_take_over_the_directory(config) -> None:
     store = make_event_store(config)
     try:
-        with pytest.raises(ConflictError):
+        with pytest.raises(ConflictError) as conflict:
             make_event_store(config)
+        # The refusal names the live owner so operators know what to stop.
+        details = conflict.value.details
+        assert details["owner"] is not None
+        assert details["owner"]["pid"] == __import__("os").getpid()
+        assert details["owner_alive"] is True
+        assert "PID" in details["hint"]
     finally:
         store.close()
+
+
+def test_closing_the_store_removes_the_owner_stamp(config) -> None:
+    store = make_event_store(config)
+    owner_path = Path(store.directory) / ".ws_collab.owner.json"
+    assert owner_path.exists()
+    assert json.loads(owner_path.read_text(encoding="utf-8"))["pid"] == __import__("os").getpid()
+    store.close()
+    assert not owner_path.exists()
