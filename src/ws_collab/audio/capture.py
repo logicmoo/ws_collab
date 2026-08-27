@@ -77,6 +77,7 @@ class CaptureService:
         self._frames: queue.Queue = queue.Queue(maxsize=_MAX_QUEUED_FRAMES)
         self._worker: threading.Thread | None = None
         self._stop_worker = threading.Event()
+        self._vad: SimpleVad | None = None
 
     # ---------------------------------------------------------------- lifecycle
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -141,6 +142,7 @@ class CaptureService:
     def state(self) -> dict[str, Any]:
         with self._lock:
             device = self.devices.get(self._device_id)
+            vad = self._vad
             return {
                 "listening": self._listening,
                 "privacy_indicator": "LISTENING" if self._listening else "muted",
@@ -156,6 +158,13 @@ class CaptureService:
                 "dropped_echo": self._dropped_echo,
                 "dropped_frames": self._dropped_frames,
                 "error": self._stream_error,
+                "mic_sensitivity": {
+                    "base_threshold": round(vad.base_threshold, 5),
+                    "current_threshold": round(vad.threshold, 5),
+                    # True once the gate has quietly lowered itself below the
+                    # configured baseline while hunting for a signal.
+                    "hunting": vad.threshold < vad.base_threshold,
+                } if vad is not None else None,
             }
 
     def set_preferred_device(self, device_id: str) -> None:
@@ -275,6 +284,7 @@ class CaptureService:
                 self._frames.get_nowait()
             except queue.Empty:
                 break
+        self._vad = None
 
     def _segment_worker(self, rate: int) -> None:  # pragma: no cover - realtime
         """Run VAD over live frames and emit one segment per utterance."""
@@ -282,6 +292,7 @@ class CaptureService:
         import numpy as np
 
         vad = SimpleVad(self.config.vad_threshold, self.config.vad_silence_ms, frame_ms=FRAME_MS)
+        self._vad = vad
         pre_roll_frames = max(1, PRE_ROLL_MS // FRAME_MS)
         max_frames = max(1, MAX_UTTERANCE_MS // FRAME_MS)
         pre_roll: list[Any] = []

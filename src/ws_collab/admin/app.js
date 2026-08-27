@@ -1113,6 +1113,7 @@ async function loadDevices() {
     ]);
 
     const capPanel = panel("Capture state");
+    const sens = capture.mic_sensitivity;
     capPanel.content.appendChild(kv({
       listening: capture.listening, privacy: capture.privacy_indicator,
       device: capture.device_name || capture.device_id,
@@ -1120,6 +1121,9 @@ async function loadDevices() {
       echo_policy: capture.echo_policy, meter: capture.meter_level, peak: capture.peak_level,
       clipping: capture.clipping, captured: capture.captured,
       dropped_echo: capture.dropped_echo, dropped_frames: capture.dropped_frames,
+      // Adaptive VAD: the gate quietly gets more sensitive the longer it hears
+      // nothing, hunting for a signal, then snaps back once something crosses it.
+      mic_sensitivity: sens ? `${sens.current_threshold} / baseline ${sens.base_threshold}${sens.hunting ? " (hunting for a signal…)" : ""}` : "—",
       error: capture.error || "—",
     }));
     $("dv-capture").replaceChildren(capPanel.root);
