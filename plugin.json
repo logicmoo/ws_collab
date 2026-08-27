@@ -11,6 +11,7 @@
   "mailboxEndpoint": {
     "path": "/ws_collab/v1/mailbox/mailboxes",
     "protocol": "ws_collab",
+    "websocket": "/ws_collab/ws",
     "description": "Mailbox directory (unread counts, activity, virtual mailboxes); sibling routes /messages, /agents, /send, /cursor share this base."
   },
   "servicesEndpoint": {
