@@ -4,6 +4,13 @@ Uses ``faster-whisper`` when installed to transcribe real PCM. The model loads
 lazily off the event loop on first use. If the library/model is unavailable the
 driver reports itself unavailable with ``fallback=True`` so a deterministic
 double is substituted and the system keeps working.
+
+The same model size can be configured more than once with different settings
+so it behaves like a distinct recognizer -- e.g. two ``whisper:tiny.en``
+instances at different input gain levels, one attenuated to avoid clipping on
+a loud source and one boosted to pick up a quiet/distant voice. Configure
+extra settings as a query string after the model size, e.g.
+``whisper:tiny.en?gain=2.0``.
 """
 
 from __future__ import annotations
@@ -12,21 +19,47 @@ import asyncio
 import importlib.util
 import time
 
+import numpy as np
+
 from ws_collab.audio.segment import AudioSegment
 from ws_collab.drivers import DriverUnavailable, SttDriverSpec, logprob_to_confidence, pcm_to_float32
 from ws_collab.stt.base import Hypothesis, PartialCallback, SttAdapter, normalize_text
 
 
+def _parse_settings(spec: str) -> tuple[str, float]:
+    """Split ``model_size?gain=2.0`` into (model_size, gain)."""
+
+    model_size, _, params_str = spec.partition("?")
+    gain = 1.0
+    for pair in params_str.split("&"):
+        key, _, raw_value = pair.partition("=")
+        if key == "gain" and raw_value:
+            try:
+                gain = float(raw_value)
+            except ValueError:
+                pass
+    return model_size or "base", gain
+
+
 class WhisperAdapter(SttAdapter):
     is_remote = False
 
-    def __init__(self, name: str, model_size: str = "base", device: str = "cpu", compute_type: str = "int8", language: str | None = None):
+    def __init__(
+        self,
+        name: str,
+        model_size: str = "base",
+        device: str = "cpu",
+        compute_type: str = "int8",
+        language: str | None = None,
+        gain: float = 1.0,
+    ):
         self.name = name
-        self.model = f"whisper-{model_size}"
+        self.model = f"whisper-{model_size}" + (f"@gain={gain:g}" if gain != 1.0 else "")
         self.model_size = model_size
         self.device = device
         self.compute_type = compute_type
         self.language = language
+        self.gain = gain
         self._impl = None
         self._load_error: str | None = None
 
@@ -51,6 +84,10 @@ class WhisperAdapter(SttAdapter):
 
         def _run():  # pragma: no cover - optional dependency
             audio = pcm_to_float32(segment.samples, segment.sample_rate)
+            if self.gain != 1.0:
+                # Applied before inference so each instance of the same model
+                # genuinely sees different audio -- not just a relabeled copy.
+                audio = np.clip(audio * self.gain, -1.0, 1.0).astype("float32")
             segments, info = self._impl.transcribe(audio, language=self.language, beam_size=1)
             texts, logprobs = [], []
             for piece in segments:
@@ -74,8 +111,9 @@ def _build(name: str, config) -> SttAdapter:
             "faster-whisper is not installed; install it for real Whisper transcription",
             fallback=True,
         )
-    model_size = name.split(":", 1)[1] if ":" in name else "base"
-    return WhisperAdapter(name, model_size=model_size)
+    spec = name.split(":", 1)[1] if ":" in name else "base"
+    model_size, gain = _parse_settings(spec)
+    return WhisperAdapter(name, model_size=model_size, gain=gain)
 
 
 def get_driver() -> SttDriverSpec:
@@ -83,6 +121,11 @@ def get_driver() -> SttDriverSpec:
         id="whisper",
         aliases=["whisper", "faster-whisper"],
         build=_build,
-        description="Whisper via faster-whisper (recommended). Names may include a size, e.g. 'whisper:small'.",
+        description=(
+            "Whisper via faster-whisper (recommended). Names may include a size and "
+            "settings, e.g. 'whisper:small' or 'whisper:tiny.en?gain=2.0' -- the same "
+            "size can be configured more than once at different gains to act as "
+            "distinct recognizers."
+        ),
         is_remote=False,
     )
