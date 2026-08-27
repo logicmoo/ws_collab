@@ -91,6 +91,10 @@
       <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 13l4-5 3 3 5-7"/></svg>
       <span class="nav-label">TTS Accuracy</span>
     </div>
+    <div class="nav-item" data-page="stt" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M8 2a2.5 2.5 0 00-2.5 2.5v4a2.5 2.5 0 005 0v-4A2.5 2.5 0 008 2z"/><path d="M3.5 8v.5a4.5 4.5 0 009 0V8M8 13v1.5"/></svg>
+      <span class="nav-label">STT Test</span>
+    </div>
 
     <div class="nav-group-title">Control</div>
     <div class="nav-item" data-page="cursors" tabindex="0">
@@ -263,6 +267,24 @@
         <button id="ac-measure">Measure</button>
       </div>
       <div class="panel-body"><div id="ac-body"></div></div>
+    </section>
+
+    <!-- ---------------------------------------------------------- stt test -->
+    <section class="page" data-page="stt">
+      <div class="toolbar">
+        <button class="primary" id="stt-refresh">Refresh</button>
+        <button id="stt-mic" title="Use the browser's Web Speech API to recognize your mic and ingest it live">🎤 Record (browser mic)</button>
+        <span class="hint" id="stt-mic-status"></span>
+      </div>
+      <div class="toolbar">
+        <input type="text" id="stt-engine" placeholder="engine" value="external" style="width:120px" />
+        <input type="text" id="stt-lang" placeholder="language" value="en" style="width:80px" />
+        <input type="number" id="stt-conf" placeholder="confidence" value="0.9" min="0" max="1" step="0.05" style="width:90px" />
+        <label class="hint"><input type="checkbox" id="stt-final" checked /> final</label>
+        <input type="text" id="stt-text" placeholder="text to ingest as a transcript" style="flex:1;min-width:220px" />
+        <button id="stt-send">Ingest</button>
+      </div>
+      <div class="panel-body"><div id="stt-body"></div></div>
     </section>
 
     <!-- ------------------------------------------------------------ cursors -->

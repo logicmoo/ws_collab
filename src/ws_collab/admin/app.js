@@ -974,7 +974,7 @@ function showPage(page) {
   if (location.hash.slice(1) !== page) history.replaceState(null, "", `#${page}`);
   const loaders = {
     workers: loadWorkers, alerts: loadAlerts, devices: loadDevices, voices: loadVoices,
-    accuracy: loadAccuracy, cursors: loadCursors, prompt: loadPrompt, system: loadSystem,
+    accuracy: loadAccuracy, cursors: loadCursors, prompt: loadPrompt, system: loadSystem, stt: loadStt,
   };
   if (loaders[page]) loaders[page]();
   Object.values(state.views).forEach((v) => v.draw());
@@ -1370,6 +1370,80 @@ async function loadVoices() {
       })));
     body.appendChild(voicePanel.root);
   } catch (error) { body.textContent = `error: ${error.message}`; }
+}
+
+/* ---- stt test */
+async function loadStt() {
+  const body = $("stt-body");
+  try {
+    const data = await api(`${V1}/stt/transcripts?limit=100`);
+    const events = (data.events || []).slice().reverse();
+    body.replaceChildren();
+    const p = panel("Recent STT transcripts (newest first) — includes hypotheses ingested from this page or any recognizer");
+    p.content.appendChild(events.length ? table(
+      ["Time", "Engine", "Final", "Confidence", "Text", "Correlation"],
+      events.map((e) => {
+        const d = e.data || {};
+        const isError = e.type === "STT_ENGINE_ERROR";
+        const text = d.text || d.normalized_text || d.raw_text || (isError ? `⚠ ${d.error || "error"}` : "—");
+        return [
+          shortTs(e.ts), mono(d.engine || e.source_id || "—"),
+          d.is_final ? badge("final", "ok") : badge("partial", "warn"),
+          mono(d.confidence != null ? String(d.confidence) : "—"),
+          isError ? el("span", "hint", text) : (text || "—"), mono(d.correlation_id || e.correlation_id || e.id),
+        ];
+      })
+    ) : el("div", "hint", "No transcripts yet. Ingest text below, or use the mic button to test with real speech recognition."));
+    body.appendChild(p.root);
+  } catch (error) { body.textContent = `error: ${error.message}`; }
+}
+
+async function sttIngest(text, opts = {}) {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return;
+  try {
+    await api(`${V1}/stt/ingest`, {
+      method: "POST",
+      body: {
+        engine: $("stt-engine").value || "external",
+        text: trimmed,
+        language: $("stt-lang").value || "en",
+        confidence: Number($("stt-conf").value || 0.9),
+        is_final: opts.is_final !== undefined ? opts.is_final : $("stt-final").checked,
+      },
+    });
+    loadStt();
+  } catch (error) {
+    pushError(error.message);
+  }
+}
+
+let sttRecognizer = null;
+function toggleSttMic() {
+  const status = $("stt-mic-status");
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Recognition) { status.textContent = "Browser Web Speech API not available (try Chrome/Edge over http://localhost)."; return; }
+  if (sttRecognizer) {
+    sttRecognizer.stop();
+    return;
+  }
+  const recognizer = new Recognition();
+  recognizer.lang = $("stt-lang").value || "en-US";
+  recognizer.continuous = true;
+  recognizer.interimResults = true;
+  recognizer.onstart = () => { status.textContent = "listening…"; $("stt-mic").textContent = "⏹ Stop"; };
+  recognizer.onerror = (e) => { status.textContent = `mic error: ${e.error}`; };
+  recognizer.onend = () => { sttRecognizer = null; status.textContent = "stopped"; $("stt-mic").textContent = "🎤 Record (browser mic)"; };
+  recognizer.onresult = (event) => {
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const result = event.results[i];
+      const transcript = result[0].transcript;
+      $("stt-text").value = transcript;
+      if (result.isFinal) sttIngest(transcript, { is_final: true });
+    }
+  };
+  sttRecognizer = recognizer;
+  recognizer.start();
 }
 
 /* ---- accuracy */
@@ -1807,6 +1881,10 @@ function wireEvents() {
     try { await api(`${V1}/voices/assign`, { method: "POST", body: { policy: $("vc-policy").value } }); loadVoices(); }
     catch (error) { pushError(error.message); }
   };
+  $("stt-refresh").onclick = loadStt;
+  $("stt-send").onclick = () => sttIngest($("stt-text").value);
+  $("stt-text").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); sttIngest($("stt-text").value); } });
+  $("stt-mic").onclick = toggleSttMic;
   $("ac-refresh").onclick = loadAccuracy;
   $("ac-measure").onclick = async () => {
     try { await api(`${V1}/tts/measure`, { method: "POST", body: { agent_id: $("ac-agent").value, text: $("ac-text").value } }); loadAccuracy(); }
@@ -1923,8 +2001,28 @@ function consumeTokenFromUrl() {
   return token;
 }
 
+/* When the server has authentication disabled (loopback-only deployments),
+ * unauthenticated requests are treated as an implicit admin. Probe whoami
+ * with no token first so the login form is skipped entirely in that case;
+ * only fall back to the sign-in gate if the server actually rejects it.
+ */
+async function tryAnonymousBoot() {
+  try {
+    await api(`${V1}/auth/whoami`);
+    boot();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const urlToken = consumeTokenFromUrl();
-if (urlToken) signIn(urlToken);
-else if (state.token) boot();
+if (urlToken) {
+  signIn(urlToken);
+} else if (state.token) {
+  boot();
+} else {
+  tryAnonymousBoot().then((ok) => { if (!ok) { $("login").hidden = false; } });
+}
 
 })();

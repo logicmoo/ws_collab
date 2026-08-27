@@ -61,7 +61,7 @@ Documentation = "https://example.invalid/ws_collab/docs"
 version = { attr = "ws_collab.__version__" }
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["ws_collab*"]
 
 # The driver folders under ws_collab/drivers/{stt,tts}/* are intentionally NOT
