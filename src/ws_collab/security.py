@@ -231,6 +231,12 @@ class Security:
 
         if self.config.admin_remote:
             return True
+        return self.is_loopback_client(client_ip)
+
+    @staticmethod
+    def is_loopback_client(client_ip: str | None) -> bool:
+        """Return whether the peer address is an IPv4 or IPv6 loopback address."""
+
         if not client_ip:
             return False
         try:

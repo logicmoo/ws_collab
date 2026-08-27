@@ -214,6 +214,12 @@ class WsCollabService:
     # ------------------------------------------- per-field value cache (candidates)
     _FIELD_CACHE_SKIP = {"id", "raw", "text", "timestamp", "ts", "seq", "mailboxId", "forwarded_by"}
     _FIELD_CACHE_MAX = 16
+    # Hard bounds that keep the cache from growing without limit no matter what
+    # records are observed (a previous incident nested the cache's own on-disk
+    # document into itself until the file reached gigabytes).
+    _FIELD_CACHE_MAX_FIELDS_PER_STREAM = 512
+    _FIELD_CACHE_MAX_FIELD_DEPTH = 6
+    _FIELD_CACHE_MAX_VALUE_CHARS = 256
     _FIELD_OBSERVATIONS = {
         "chat_bubble": "Fields observed in chat message records.",
         "mailbox_definition": "Fields observed in mailbox JSON definitions.",
@@ -272,7 +278,21 @@ class WsCollabService:
 
         # --- data: cached values + inferred types ----------------------------
         try:
-            data = json.loads(self._cache_data_path().read_text("utf-8"))
+            data_path = self._cache_data_path()
+            # Self-heal: a bounded cache stays tiny; a huge file means a past
+            # runaway (e.g. the cache observing its own document). Set it aside
+            # instead of spending minutes/gigabytes parsing it.
+            try:
+                if data_path.stat().st_size > 64 * 1024 * 1024:
+                    quarantine = data_path.with_name(data_path.name + ".oversized")
+                    quarantine.unlink(missing_ok=True)
+                    data_path.rename(quarantine)
+                    self._warnings.append(
+                        f"field cache {data_path.name} was oversized and has been reset; old file kept as {quarantine.name}"
+                    )
+            except OSError:
+                pass
+            data = json.loads(data_path.read_text("utf-8"))
         except Exception:
             data = {}
         observations = data.get("observations") if isinstance(data, dict) else None
@@ -299,11 +319,17 @@ class WsCollabService:
                 for field, decl in fields.items():
                     if not isinstance(field, str) or not isinstance(decl, dict):
                         continue
+                    if field.count(".") >= self._FIELD_CACHE_MAX_FIELD_DEPTH:
+                        continue
+                    if len(out) >= self._FIELD_CACHE_MAX_FIELDS_PER_STREAM:
+                        break
                     values = decl.get("values")
                     if not isinstance(values, list):
                         continue
                     out_types[field] = str(decl.get("type") or "string")
-                    out[field] = [str(v) for v in values][-self._field_limit(stream, field, observation):]
+                    out[field] = [
+                        str(v) for v in values if len(str(v)) <= self._FIELD_CACHE_MAX_VALUE_CHARS
+                    ][-self._field_limit(stream, field, observation):]
                 cache[stream] = out
                 type_cache[stream] = out_types
 
@@ -422,6 +448,27 @@ class WsCollabService:
         except OSError:
             pass
 
+    def _is_internal_cache_source(self, source: str) -> bool:
+        """True when a virtual source reads one of this service's own cache
+        files -- observing those would feed the cache back into itself (the
+        exact loop that once grew the cache file to gigabytes)."""
+        if source.startswith("disk:"):
+            path_str = source[len("disk:"):]
+        elif source.startswith("file:"):
+            path_str = source[len("file:"):]
+        elif source.endswith(".json"):
+            path_str = source
+        else:
+            return False
+        path = Path(path_str)
+        if not path.is_absolute():
+            path = Path(self.store.directory) / path
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        return resolved in {self._cache_data_path().resolve(), self._cache_config_path().resolve()}
+
     def _remember_field_values(
         self,
         stream: str,
@@ -431,6 +478,9 @@ class WsCollabService:
     ) -> None:
         """Record primitive fields in the schema scope that observed them."""
         if not stream or not records:
+            return
+        spec = self._virtual.get(stream)
+        if spec and self._is_internal_cache_source(str(spec.get("source", ""))):
             return
         cache, type_cache = self._observation_caches(observation)
         bucket = cache.setdefault(stream, {})
@@ -446,9 +496,14 @@ class WsCollabService:
         def offer(field: str, value: Any) -> None:
             if field.split(".")[-1] in self._FIELD_CACHE_SKIP or value is None or isinstance(value, (dict, list)):
                 return
-            sval = str(value)
-            if sval == "":
+            if field.count(".") >= self._FIELD_CACHE_MAX_FIELD_DEPTH:
                 return
+            sval = str(value)
+            if sval == "" or len(sval) > self._FIELD_CACHE_MAX_VALUE_CHARS:
+                return
+            if field not in bucket and len(bucket) >= self._FIELD_CACHE_MAX_FIELDS_PER_STREAM:
+                # Bounded: evict the oldest-known field so recent schema wins.
+                bucket.pop(next(iter(bucket)), None)
             t = vtype(value)
             prior = types.get(field)
             if prior is None:

@@ -63,7 +63,11 @@ class _WsConnection:
         self.service = ctx.service
         self.security = ctx.security
         self.client_ip = client_ip
-        self.principal = None
+        self.principal = (
+            self.security.default_principal()
+            if self.security.is_loopback_client(client_ip)
+            else None
+        )
         self.sub: Subscription | None = None
         self.streams: set[str] = set()
         self.filters: dict[str, Any] = {}
@@ -115,6 +119,8 @@ class _WsConnection:
         writer = asyncio.create_task(self._writer())
         pinger = asyncio.create_task(self._pinger())
         try:
+            if self.principal is not None:
+                await self._send_auth_ok()
             await self._reader()
         finally:
             for task in (writer, pinger):
@@ -187,6 +193,11 @@ class _WsConnection:
             raise AuthenticationError("invalid token")
         self.principal = principal
         self.security.audit("ws_auth", label=principal.label, role=principal.role)
+        await self._send_auth_ok()
+
+    async def _send_auth_ok(self) -> None:
+        principal = self.principal
+        assert principal is not None
         await self._send({
             "type": "auth_ok",
             "principal": principal.public(),

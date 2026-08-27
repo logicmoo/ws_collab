@@ -495,6 +495,7 @@ class JsonlStore:
         """Best-effort exclusive lock so only one writer owns the data directory."""
 
         lock_path = self.directory / ".ws_collab.lock"
+        owner_path = self.directory / ".ws_collab.owner.json"
         try:
             handle = open(lock_path, "a+")
             if os.name == "nt":
@@ -507,11 +508,70 @@ class JsonlStore:
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             self._owner_lock_handle = handle
+            self._write_owner_stamp(owner_path)
         except OSError as error:
+            details: dict[str, Any] = {"directory": str(self.directory), "reason": str(error)}
+            details.update(self._describe_current_owner(owner_path))
             raise ConflictError(
                 "another writer already owns this JSONL directory",
-                details={"directory": str(self.directory), "reason": str(error)},
+                details=details,
             ) from error
+
+    def _write_owner_stamp(self, owner_path: Path) -> None:
+        """Record who holds the lock so a conflicting starter can name the owner."""
+
+        import sys
+
+        try:
+            owner_path.write_text(json.dumps({
+                "pid": os.getpid(),
+                "argv": sys.argv,
+                "executable": sys.executable,
+                "cwd": str(Path.cwd()),
+                "started": utc_now_iso(),
+            }, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _describe_current_owner(owner_path: Path) -> dict[str, Any]:
+        """Best-effort report of the current lock owner and whether it is alive."""
+
+        try:
+            owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"owner": None, "hint": "owner stamp missing; find the process holding .ws_collab.lock"}
+        alive: bool | None = None
+        pid = owner.get("pid")
+        if isinstance(pid, int):
+            try:
+                import psutil  # type: ignore
+
+                alive = psutil.pid_exists(pid)
+            except ImportError:
+                if os.name == "nt":
+                    import ctypes
+
+                    handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+                    if handle:
+                        ctypes.windll.kernel32.CloseHandle(handle)
+                        alive = True
+                    else:
+                        alive = False
+                else:  # pragma: no cover - exercised on POSIX
+                    try:
+                        os.kill(pid, 0)
+                        alive = True
+                    except ProcessLookupError:
+                        alive = False
+                    except OSError:
+                        alive = None
+        hint = (
+            f"stop PID {pid} (or wait for it to exit) before starting another writer"
+            if alive
+            else "owner appears dead; if the lock persists remove stale handles or reboot"
+        )
+        return {"owner": owner, "owner_alive": alive, "hint": hint}
 
     def stream(self, name: str) -> _StreamState:
         if name not in STREAMS and name not in self._dynamic:
@@ -568,3 +628,7 @@ class JsonlStore:
                 pass
             self._owner_lock_handle.close()
             self._owner_lock_handle = None
+            try:
+                (self.directory / ".ws_collab.owner.json").unlink(missing_ok=True)
+            except OSError:
+                pass
