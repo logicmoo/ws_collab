@@ -1937,6 +1937,13 @@ function getMeetSectionOpen(key) {
 function setMeetSectionOpen(key, isOpen) {
   localStorage.setItem(`ws_collab_meet_section_open_${key}`, isOpen ? "1" : "0");
 }
+function getMeetKindFilter(kind) {
+  const raw = localStorage.getItem(`ws_collab_meet_kind_filter_${kind}`);
+  return raw === null ? true : raw === "1";
+}
+function setMeetKindFilter(kind, isOpen) {
+  localStorage.setItem(`ws_collab_meet_kind_filter_${kind}`, isOpen ? "1" : "0");
+}
 
 /* One checkbox+label in the global toggle row, driving every content node
  * in `contentNodes` (one per meeting, same section type) at once via the
@@ -1958,6 +1965,20 @@ function meetSectionToggle(label, count, defaultOn, contentNodes) {
   };
   wrap.appendChild(box);
   wrap.appendChild(document.createTextNode(" " + (count == null ? label : `${label} (${count})`)));
+  return wrap;
+}
+
+function meetKindToggle(kind, label) {
+  const wrap = el("label", "meet-section-toggle");
+  const box = el("input");
+  box.type = "checkbox";
+  box.checked = getMeetKindFilter(kind);
+  box.onchange = () => {
+    setMeetKindFilter(kind, box.checked);
+    loadMeet();
+  };
+  wrap.appendChild(box);
+  wrap.appendChild(document.createTextNode(` ${label}`));
   return wrap;
 }
 
@@ -2185,6 +2206,7 @@ function meetScrollSection(clearKey, label) {
 }
 
 function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, debugRows, bridgeOnline, emitCount, hostProfile, meetingState, recipients) {
+  groups = groups.filter(({ kind }) => getMeetKindFilter(kind || "driver"));
   const priorOpen = new Map();
   container.querySelectorAll(".meet-tree-meeting").forEach((d) => {
     if (d.dataset.url) priorOpen.set(d.dataset.url, d.open);
@@ -2355,6 +2377,11 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
 async function loadMeet() {
   const statusLine = $("meet-status-line");
   const dot = $("meet-nav-dot");
+  $("meet-kind-toolbar").replaceChildren(
+    el("span", "mini-label", "Show:"),
+    meetKindToggle("driver", "Driver meetings"),
+    meetKindToggle("client", "Client meetings"),
+  );
   let health;
   try {
     const capture = await api(`${V1}/audio/capture`);
