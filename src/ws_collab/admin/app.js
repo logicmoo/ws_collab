@@ -1005,7 +1005,7 @@ function showPage(page) {
   const loaders = {
     workers: loadWorkers, alerts: loadAlerts, devices: loadDevices, voices: loadVoices,
     accuracy: loadAccuracy, cursors: loadCursors, prompt: loadPrompt, system: loadSystem,
-    meet: loadMeetWithPolling, stt: loadStt, meetbridge: loadMeetBridge,
+    meet: loadMeetWithPolling, stt: loadStt, meetbridge: loadMeetBridge, processes: loadProcesses,
   };
   if (loaders[page]) loaders[page]();
   Object.values(state.views).forEach((v) => v.draw());
@@ -1609,6 +1609,94 @@ async function postMeetBridgeCommand(command) {
   loadMeetBridge();
 }
 
+async function postMeetSso(path, body, confirmText) {
+  if (confirmText && !confirm(confirmText)) return;
+  const resultEl = $("mb-sso-result");
+  resultEl.textContent = `${path} — sending…`;
+  try {
+    const result = await api(`${V1}${path}`, { method: "POST", body });
+    resultEl.textContent = result.warning
+      ? `${body.role} → ok (${result.warning})`
+      : `${body.role} → ok`;
+  } catch (error) {
+    resultEl.textContent = `${body.role} → error: ${error.message}`;
+  }
+  loadMeetSso();
+}
+
+async function loadMeetSso() {
+  const body = $("mb-sso-body");
+  try {
+    const data = await api(`${V1}/meet/sso/profiles`);
+    const rows = (data.profiles || []).map((profile) => {
+      const actions = el("span", "meet-row-actions");
+      actions.append(
+        actionButton("Sign in / refresh", "mini", () => postMeetSso("/meet/sso/open", { role: profile.role })),
+        actionButton("Forget", "mini danger", () => postMeetSso(
+          "/meet/sso/forget",
+          { role: profile.role },
+          `Forget the saved Google sign-in profile for ${profile.role}? This deletes the profile directory on disk.`,
+        )),
+      );
+      return [
+        (profile.role || "—").toUpperCase(),
+        profile.path || "—",
+        badge(profile.exists ? "yes" : "no", profile.exists ? "ok" : "warn"),
+        actions,
+      ];
+    });
+    body.replaceChildren(table(["Role", "Path", "Exists", "Actions"], rows));
+  } catch (error) {
+    body.replaceChildren(el("div", "hint", `error loading Meet SSO profiles: ${error.message}`));
+  }
+}
+
+async function postProcessCommand(command) {
+  const resultEl = $("ps-command-result");
+  resultEl.textContent = `${command} — sending…`;
+  try {
+    const result = await api(`${MEET_BRIDGE_BASE}/command`, { method: "POST", body: { command } });
+    resultEl.textContent = `${command} → ${result.verdict}`;
+  } catch (error) {
+    resultEl.textContent = `${command} → error: ${error.message}`;
+  }
+  loadProcesses();
+}
+
+async function loadProcesses() {
+  const body = $("ps-body");
+  const statusLine = $("ps-status-line");
+  try {
+    const health = await api(`${MEET_BRIDGE_BASE}/health`);
+    statusLine.textContent = health.meetingUrl ? `bridge online — ${health.meetingUrl}` : "bridge online — no meeting";
+    const rows = (health.processes || []).map((proc) => {
+      const actions = el("span", "meet-row-actions");
+      actions.append(
+        actionButton("Foreground", "mini", () => postProcessCommand(`/foreground ${proc.role}`)),
+        actionButton("Kill process", "mini danger", () => postProcessCommand(`/kill-process ${proc.role}`)),
+      );
+      const alive = proc.alive === true ? badge("alive", "ok")
+        : proc.alive === false ? badge("dead", "danger")
+          : "\u2014";
+      return [
+        (proc.role || "—").toUpperCase(),
+        proc.pid == null ? "—" : String(proc.pid),
+        proc.backend || "windows",
+        proc.port == null ? "—" : String(proc.port),
+        proc.profile || "—",
+        alive,
+        actions,
+      ];
+    });
+    body.replaceChildren(rows.length
+      ? table(["Role", "PID", "Backend", "Port", "Profile", "Alive", "Actions"], rows)
+      : el("div", "hint", "No bridge-launched browser processes are currently tracked. In --attach-only mode that is expected for HOST; COMPANION appears only after it launches."));
+  } catch (error) {
+    statusLine.textContent = `bridge offline (${error.message}) — run "ws-collab-meet-bridge"`;
+    body.replaceChildren(el("div", "hint", "Bridge unreachable. Start it with \"ws-collab-meet-bridge\"; this page only shows child processes the bridge launched itself."));
+  }
+}
+
 /* Builds the "Us" rows for a meeting: HOST is real hardware and always
  * listed first (never automated, so its device is just "real"); COMPANION
  * always follows — every driver is structurally a HOST+COMPANION pair, so
@@ -1645,10 +1733,15 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
     if (typeof profile === "string") return profile;
     return profile.label || (profile.known === false ? "unknown" : "\u2014");
   };
+  const ssoLink = (profile) => {
+    const link = el("a", null, ssoLabel(profile));
+    link.href = "#meetbridge";
+    return link;
+  };
   if (kind === "client") {
     const ssoVal = isCurrent ? null : (roomSnapshot && roomSnapshot.hostProfile);
     const action = isCurrent ? actionsFor("guest") : rejoin("not current");
-    const rows = [["GUEST_CLIENT", ssoLabel(ssoVal), isCurrent ? "not implemented yet" : "not current", url, "\u2014", "\u2014", action]];
+    const rows = [["GUEST_CLIENT", ssoLink(ssoVal), isCurrent ? "not implemented yet" : "not current", meetCopyLink(url), "\u2014", "\u2014", action]];
     return { rows, note: "CLIENT/GUEST mode is designed but not built server-side yet — Foreground/Disconnect will honestly report “not implemented yet”; there is no live guest tab to join/leave." };
   }
   if (!isCurrent) {
@@ -1657,19 +1750,19 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
     const asOf = roomSnapshot && roomSnapshot.updatedAt
       ? ` (as of ${shortTs(new Date(roomSnapshot.updatedAt * 1000).toISOString())})` : "";
     const rows = [
-      ["HOST", ssoLabel(roomSnapshot && roomSnapshot.hostProfile), "not current" + asOf, url, "\u2014", "\u2014", rejoin("not current")],
-      ["COMPANION", ssoLabel(snapCompanion && snapCompanion.profile), "not current" + asOf, url, "\u2014", "\u2014", rejoin("not current")],
+      ["HOST", ssoLink(roomSnapshot && roomSnapshot.hostProfile), "not current" + asOf, meetCopyLink(url), "\u2014", "\u2014", rejoin("not current")],
+      ["COMPANION", ssoLink(snapCompanion && snapCompanion.profile), "not current" + asOf, meetCopyLink(url), "\u2014", "\u2014", rejoin("not current")],
     ];
     return { rows, note: roomSnapshot
       ? "Not the current meeting — SSO/state is the last known snapshot from when the bridge was last here; Join re-attaches the live driver. This driver slot is also available to relay a different real-world audio source into a Meet room here instead — a Discord Voice Channel, Zoom call, or plain audio call, for example — but that is not built yet; every driver today only probes this machine's Physical Computer mic/speakers."
       : "Not the current meeting — never seen live yet, so no snapshot exists; Join attaches the live driver here. This driver slot is also available to relay a different real-world audio source into a Meet room here instead — a Discord Voice Channel, Zoom call, or plain audio call, for example — but that is not built yet; every driver today only probes this machine's Physical Computer mic/speakers." };
   }
-  const rows = [["HOST", ssoLabel(hostProfile), "in-call", url, "real microphone (untouched)", "real speakers (untouched)", actionsFor("host")]];
+  const rows = [["HOST", ssoLink(hostProfile), "in-call", meetCopyLink(url), "real microphone (untouched)", "real speakers (untouched)", actionsFor("host")]];
   const companion = (clients || []).find((c) => c.role === "companion");
   if (companion) {
-    rows.push(["COMPANION", ssoLabel(companion.profile), companion.state || "\u2014", url, companion.mic || "\u2014", companion.speak || "\u2014", actionsFor("companion")]);
+    rows.push(["COMPANION", ssoLink(companion.profile), companion.state || "\u2014", meetCopyLink(url), companion.mic || "\u2014", companion.speak || "\u2014", actionsFor("companion")]);
   } else {
-    rows.push(["COMPANION", "\u2014", "not armed (no --companion)", url, "\u2014", "\u2014", "\u2014"]);
+    rows.push(["COMPANION", "\u2014", "not armed (no --companion)", meetCopyLink(url), "\u2014", "\u2014", "\u2014"]);
   }
   // Any OTHER controlled identity beyond host/companion (e.g. a future
   // CLIENT/GUEST sharing this driver) still gets listed, in whatever order
@@ -1677,7 +1770,7 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
   // "not implemented yet" server-side until that identity is real, rather
   // than silently no-op-ing or erroring obscurely.
   (clients || []).filter((c) => c.role !== "companion").forEach((c) => rows.push([
-    (c.role || "").toUpperCase(), ssoLabel(c.profile), c.state || "\u2014", url, c.mic || "\u2014", c.speak || "\u2014", actionsFor(c.role),
+    (c.role || "").toUpperCase(), ssoLink(c.profile), c.state || "\u2014", meetCopyLink(url), c.mic || "\u2014", c.speak || "\u2014", actionsFor(c.role),
   ]));
   return { rows, note: null };
 }
@@ -1832,11 +1925,13 @@ function setMeetAutoscroll(label, on) {
  * number is changed, since "set it to N rows" is an explicit request. */
 const MEET_ROW_H = 24; // matches the app-wide dense-table row height elsewhere
 function getMeetRowCount(label) {
-  const raw = parseInt(localStorage.getItem(`ws_collab_meet_rows_${label}`), 10);
+  const stored = localStorage.getItem(`ws_collab_meet_rows_${label}`);
+  if (stored === "all") return "all";
+  const raw = parseInt(stored, 10);
   return Number.isFinite(raw) && raw >= 2 ? raw : 10;
 }
 function setMeetRowCount(label, rows) {
-  localStorage.setItem(`ws_collab_meet_rows_${label}`, String(rows));
+  localStorage.setItem(`ws_collab_meet_rows_${label}`, rows === "all" ? "all" : String(Math.max(2, parseInt(rows, 10) || 10)));
 }
 function meetBoxHeightPx(rows) { return MEET_ROW_H + rows * MEET_ROW_H; }
 /* Applies the persisted row count to EVERY currently-rendered box of this
@@ -1848,9 +1943,9 @@ function meetBoxHeightPx(rows) { return MEET_ROW_H + rows * MEET_ROW_H; }
  * special is needed for that beyond the height change itself. */
 function applyMeetRowCount(label) {
   const rows = getMeetRowCount(label);
-  const px = meetBoxHeightPx(rows);
   document.querySelectorAll(`.meet-scroll-box[data-section-label="${label}"]`).forEach((box) => {
-    box.style.height = `${px}px`;
+    if (rows === "all") box.style.removeProperty("height");
+    else box.style.height = `${meetBoxHeightPx(rows)}px`;
     if (getMeetAutoscroll(label)) box.scrollTop = box.scrollHeight;
   });
 }
@@ -1864,6 +1959,22 @@ function applyMeetRowCount(label) {
  * durable preference the way the autoscroll toggle is. */
 const meetClearedAt = new Map();
 function meetClearCutoff(key) { return meetClearedAt.get(key) || 0; }
+
+function meetCopyLink(url) {
+  const room = meetRoomId(url) || url;
+  const link = el("a", "mono", room);
+  link.href = "#";
+  link.title = "Click to copy the full meeting URL to your clipboard.";
+  link.onclick = (e) => {
+    e.preventDefault();
+    navigator.clipboard.writeText(url).then(() => {
+      const original = link.textContent;
+      link.textContent = "copied!";
+      setTimeout(() => { link.textContent = original; }, 1000);
+    }).catch(() => {});
+  };
+  return link;
+}
 
 /* One streaming section: a small toolbar (Clear + an Autoscroll on/off
  * toggle, default ON per the operator's request) above a fixed-height
@@ -1896,23 +2007,36 @@ function meetScrollSection(clearKey, label) {
   // Applied to every currently-rendered box of this type at once via
   // applyMeetRowCount(), not just this one, so changing it in any one
   // meeting's toolbar keeps every meeting's same-type box in sync.
-  const rowsLabel = el("span", "mini-label", "rows");
-  const rowsInput = el("input", "mini-input");
-  rowsInput.type = "number";
-  rowsInput.min = "2";
-  rowsInput.step = "1";
-  rowsInput.value = String(getMeetRowCount(label));
-  rowsInput.title = "Visible rows before the box starts scrolling internally (still resizable by dragging the corner).";
-  rowsInput.onchange = () => {
-    const n = Math.max(2, parseInt(rowsInput.value, 10) || 10);
-    rowsInput.value = String(n);
-    setMeetRowCount(label, n);
+  const presetValues = [3, 10, 20, "all"];
+  const showLabel = el("span", "mini-label", "Show");
+  const exactLabel = el("span", "mini-label", "Exact");
+  const exactInput = el("input", "mini-input");
+  exactInput.type = "number";
+  exactInput.min = "2";
+  exactInput.step = "1";
+  exactInput.title = "Custom visible-row count before the box starts scrolling internally; leave blank while using presets.";
+  const presetButtons = presetValues.map((value) => actionButton(value === "all" ? "ALL" : String(value), "mini toggle", () => {
+    setMeetRowCount(label, value);
     applyMeetRowCount(label);
+    paintRows();
+  }));
+  const paintRows = () => {
+    const current = getMeetRowCount(label);
+    presetButtons.forEach((btn, idx) => btn.classList.toggle("on", presetValues[idx] === current));
+    exactInput.value = typeof current === "number" && !presetValues.includes(current) ? String(current) : "";
   };
-  toolbar.append(clearBtn, autoBtn, rowsLabel, rowsInput);
+  exactInput.onchange = () => {
+    const parsed = Math.max(2, parseInt(exactInput.value, 10) || 10);
+    setMeetRowCount(label, parsed);
+    applyMeetRowCount(label);
+    paintRows();
+  };
+  paintRows();
+  toolbar.append(clearBtn, autoBtn, showLabel, ...presetButtons, exactLabel, exactInput);
   const box = el("div", "meet-scroll-box");
   box.dataset.sectionLabel = label;
-  box.style.height = `${meetBoxHeightPx(getMeetRowCount(label))}px`;
+  const initialRows = getMeetRowCount(label);
+  if (initialRows !== "all") box.style.height = `${meetBoxHeightPx(initialRows)}px`;
   wrap.append(toolbar, box);
   return { wrap, box };
 }
@@ -2253,6 +2377,7 @@ function mbPollOnce() {
 async function loadMeetBridge() {
   const feed = $("mb-captions-feed");
   if (!feed.hasChildNodes()) feed.appendChild(el("div", "hint", "Caption lines appear here the moment anyone speaks in the bridged meeting."));
+  loadMeetSso();
   if (mbPolling) return;
   mbPolling = true;
   mbPollOnce();
@@ -3110,6 +3235,7 @@ function wireEvents() {
     postMeetCommand(`/say ${text}`);
   };
   $("mb-refresh").onclick = loadMeetBridge;
+  $("ps-refresh").onclick = loadProcesses;
   $("mb-join-btn").onclick = () => {
     const url = $("mb-join-url").value.trim();
     if (!url) { pushError("Enter a meeting URL to join."); return; }

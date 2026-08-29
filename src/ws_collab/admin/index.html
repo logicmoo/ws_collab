@@ -105,6 +105,10 @@
       <span class="nav-label">Meet Bridge</span>
       <span class="status-dot" id="meetbridge-nav-dot" title="Bridge status"></span>
     </div>
+    <div class="nav-item" data-page="processes" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="M5 6h6M5 8h6M5 10h4"/></svg>
+      <span class="nav-label">Processes</span>
+    </div>
 
     <div class="nav-group-title">Control</div>
     <div class="nav-item" data-page="cursors" tabindex="0">
@@ -374,6 +378,37 @@
           <div class="panel-title" id="mb-captions-title">Live captions</div>
           <div class="panel-content">
             <div id="mb-captions-feed" style="max-height:360px;overflow-y:auto"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">SSO / Chrome profiles</div>
+          <div class="panel-content">
+            <div class="hint" style="margin-bottom:8px">
+              Open a normal Chrome window on a saved Meet profile to sign in or refresh Google SSO, even when the bridge is not running.
+            </div>
+            <div class="mono hint" id="mb-sso-result"></div>
+            <div id="mb-sso-body"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- processes -->
+    <section class="page" data-page="processes">
+      <div class="toolbar">
+        <button class="primary" id="ps-refresh">Refresh</button>
+        <span class="mono hint" id="ps-status-line">checking…</span>
+      </div>
+      <div class="panel-body">
+        <div class="panel">
+          <div class="panel-title">Meet bridge child processes</div>
+          <div class="panel-content">
+            <div class="hint" style="margin-bottom:8px">
+              Read-only view of the browser processes this bridge launched itself. It is not a general system process manager.
+            </div>
+            <div class="mono hint" id="ps-command-result"></div>
+            <div id="ps-body"></div>
           </div>
         </div>
       </div>

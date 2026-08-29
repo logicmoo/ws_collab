@@ -88,6 +88,10 @@ def _find_wsl_browser(distro: str) -> str:
     )
 
 
+def companion_profile_path(profile: Path) -> Path:
+    return profile.with_name(profile.name + "_companion")
+
+
 def build_launch(
     backend: str,
     port: int,
@@ -243,7 +247,7 @@ def close_tab(cdp_endpoint: str, tab_id: str) -> None:
         pass
 
 
-def launch_browser(args: Any) -> str:
+def launch_browser(args: Any) -> tuple[str, subprocess.Popen[bytes] | None]:
     """Pop up the bridge's own browser so the operator can pick their Google
     account (SSO); returns the CDP endpoint once it is answering."""
     port = args.port
@@ -261,7 +265,7 @@ def launch_browser(args: Any) -> str:
             wsl_distro=getattr(args, "wsl_distro", None),
             extra_args=["--autoplay-policy=no-user-gesture-required", "--new-window"],
         )
-        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         label = Path(find_browser(args.browser)).name if getattr(args, "browser_backend", "windows") == "windows" else "WSL Chrome/Chromium"
         print(f"[bridge] browser window opened ({label}, profile {profile})")
         print("[bridge] pick your Google account in that window (SSO persists for next time)...")
@@ -270,6 +274,7 @@ def launch_browser(args: Any) -> str:
             time.sleep(0.5)
         if not cdp_alive(cdp):
             raise SystemExit("The launched browser never opened its DevTools port -- is another instance using the profile?")
+        return cdp, process
     elif args.meet or args.new:
         # Browser already up: only open a NEW tab if one isn't already
         # sitting on this exact meeting room. Otherwise every restart of
@@ -286,7 +291,7 @@ def launch_browser(args: Any) -> str:
         existing_room = existing_match.group(1) if existing_match else None
         if not (existing and target_room and target_room == existing_room):
             open_url(cdp, target)
-    return cdp
+    return cdp, None
 
 
 def wait_for_meet_tab(cdp: str, timeout: float = 900.0, require_room: bool = False) -> dict[str, Any]:

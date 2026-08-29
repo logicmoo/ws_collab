@@ -760,6 +760,21 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         auth = await _require(request, "operator", mutating=True)
         return guarded(service.set_voice_profile, agent_id, body, auth.principal.label)
 
+    @router.get(f"{mount}/meet/sso/profiles")
+    async def meet_sso_profiles(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.list_meet_sso_profiles)
+
+    @router.post(f"{mount}/meet/sso/open")
+    async def meet_sso_open(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.open_meet_sso_profile, body.get("role", ""))
+
+    @router.post(f"{mount}/meet/sso/forget")
+    async def meet_sso_forget(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.forget_meet_sso_profile, body.get("role", ""))
+
     # ---------------------------------------------------------------- convert
     @router.post(f"{mount}/convert")
     async def convert_representation(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:

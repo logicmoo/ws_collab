@@ -10,6 +10,9 @@ idempotency, filters, validation, auditing, and worker/routing/prompt logic.
 from __future__ import annotations
 
 import asyncio
+import json
+import shutil
+import subprocess
 import re
 import time
 import uuid
@@ -62,6 +65,7 @@ from .tts.engine import TtsEngine
 from .tts.voices import VoiceManager
 from .workers import WorkerMonitor
 from . import __version__
+from .meet_bridge.cdp import DEFAULT_PROFILE, companion_profile_path, find_browser
 
 
 # The canonical capture source that STT engine routes hang off.
@@ -214,6 +218,78 @@ class WsCollabService:
         self._load_field_cache()
         # Rewrite legacy config into the scoped observation schema on startup.
         self._save_cache_config()
+
+    def _meet_bridge_health(self, timeout: float = 0.5) -> dict[str, Any] | None:
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:48699/health", timeout=timeout) as response:  # noqa: S310
+                return json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    def _meet_sso_profiles_default(self) -> list[dict[str, Any]]:
+        host = DEFAULT_PROFILE.expanduser()
+        companion = companion_profile_path(host)
+        return [
+            {"role": "host", "path": str(host), "exists": host.is_dir()},
+            {"role": "companion", "path": str(companion), "exists": companion.is_dir()},
+        ]
+
+    def list_meet_sso_profiles(self) -> dict[str, Any]:
+        profiles = {entry["role"]: entry for entry in self._meet_sso_profiles_default()}
+        health = self._meet_bridge_health()
+        if health:
+            host_profile = (health.get("hostProfile") or {}).get("path")
+            if host_profile:
+                p = Path(host_profile).expanduser()
+                profiles["host"] = {"role": "host", "path": str(p), "exists": p.is_dir()}
+            for client in health.get("clients") or []:
+                if str(client.get("role") or "") == "companion" and client.get("profile"):
+                    p = Path(str(client["profile"])).expanduser()
+                    profiles["companion"] = {"role": "companion", "path": str(p), "exists": p.is_dir()}
+        return {"profiles": list(profiles.values())}
+
+    def _meet_sso_profile_path(self, role: str) -> Path:
+        profiles = {entry["role"]: Path(str(entry["path"])).expanduser() for entry in self.list_meet_sso_profiles()["profiles"]}
+        if role not in profiles:
+            raise ValidationError(f"unknown role {role!r}")
+        return profiles[role]
+
+    def _meet_sso_in_use_warning(self, role: str, path: Path) -> str | None:
+        health = self._meet_bridge_health()
+        if not health:
+            return "bridge not reachable to confirm whether this profile is already in use"
+        for proc in health.get("processes") or []:
+            if str(proc.get("role") or "") == role and str(proc.get("profile") or "") == str(path) and proc.get("alive") is True:
+                return f"{role} profile appears to be in use by the running meet bridge process (pid {proc.get('pid')})"
+        return None
+
+    def open_meet_sso_profile(self, role: str) -> dict[str, Any]:
+        role = str(role or "").strip().lower()
+        path = self._meet_sso_profile_path(role)
+        path.mkdir(parents=True, exist_ok=True)
+        warning = self._meet_sso_in_use_warning(role, path)
+        argv = [
+            find_browser(None),
+            f"--user-data-dir={path}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--new-window",
+            "https://accounts.google.com/",
+        ]
+        process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"ok": True, "role": role, "path": str(path), "pid": process.pid, "warning": warning}
+
+    def forget_meet_sso_profile(self, role: str) -> dict[str, Any]:
+        role = str(role or "").strip().lower()
+        path = self._meet_sso_profile_path(role)
+        warning = self._meet_sso_in_use_warning(role, path)
+        if warning and "in use" in warning:
+            raise ConflictError("Close the bridge browser window first; that profile appears to be in use by the running meet bridge process.")
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+        return {"ok": True, "role": role, "path": str(path), "deleted": True, "warning": warning}
 
     # ------------------------------------------- per-field value cache (candidates)
     _FIELD_CACHE_SKIP = {"id", "raw", "text", "timestamp", "ts", "seq", "mailboxId", "forwarded_by"}

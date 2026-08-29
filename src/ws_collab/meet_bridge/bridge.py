@@ -93,6 +93,7 @@ from .cdp import (
     build_launch,
     cdp_alive,
     close_tab,
+    companion_profile_path,
     find_browser,
     find_meet_tab,
     launch_browser,
@@ -126,6 +127,21 @@ _ROOM_RE = re.compile(r"meet\.google\.com/([a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4})", r
 def room_id(url: str | None) -> str | None:
     match = _ROOM_RE.search(url or "")
     return match.group(1).lower() if match else None
+
+
+def _terminate_process(process: subprocess.Popen[Any] | None) -> bool:
+    if process is None:
+        return False
+    if process.poll() is not None:
+        return True
+    process.terminate()
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if process.poll() is not None:
+            return True
+        time.sleep(0.1)
+    process.kill()
+    return process.poll() is not None
 
 
 def message_text(message: dict[str, Any]) -> str:
@@ -198,7 +214,9 @@ def main() -> None:
     # tab if one is open, otherwise CREATE the servant meeting.
     cdp_endpoint = args.cdp
     if not args.attach_only:
-        cdp_endpoint = launch_browser(args)
+        cdp_endpoint, host_process = launch_browser(args)
+    else:
+        host_process = None
 
     if args.list_tabs:
         for tab_entry in list_tabs(cdp_endpoint):
@@ -325,6 +343,9 @@ def main() -> None:
     # `captionCount` = distinct stored rows (add/edit collapses to one per
     # key); `emitCount` = total raw emit() calls ever made (every add AND
     # every edit counted separately).
+    holder["host_process"] = host_process
+    holder["host_profile"] = str(Path(args.profile).expanduser()) if not args.attach_only else None
+    holder["companion_process"] = None
     status: dict[str, Any] = {"ok": True, "service": "ws_collab_meet_bridge", "meetingUrl": holder.get("url"), "lastCaptionAt": None, "captionCount": 0, "emitCount": 0, "outbox": args.outbox, "recipients": recipients, "hostProfile": _host_profile_info(), "browserBackend": args.browser_backend}
     captions_log: list[dict[str, Any]] = []  # ring buffer for the ws_collab STT driver
     captions_index: dict[str, int] = {}  # row key -> index into captions_log, for in-place ADD/EDIT
@@ -382,6 +403,31 @@ def main() -> None:
             })
         return clients
 
+    def _process_info(role: str, process: subprocess.Popen[Any] | None, *, port: int, profile: Path | str | None, backend: str) -> dict[str, Any]:
+        return {
+            "role": role,
+            "pid": process.pid if process else None,
+            "alive": (process.poll() is None) if process else None,
+            "port": port,
+            "profile": str(profile) if profile else None,
+            "backend": backend,
+        }
+
+    def _tracked_processes() -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        host_proc = holder.get("host_process")
+        if host_proc is not None or not args.attach_only:
+            rows.append(_process_info("host", host_proc, port=args.port, profile=holder.get("host_profile"), backend=args.browser_backend))
+        if args.companion:
+            rows.append(_process_info(
+                "companion",
+                holder.get("companion_process"),
+                port=args.companion_port or (args.port + 1),
+                profile=holder.get("companion_profile"),
+                backend=args.browser_backend,
+            ))
+        return rows
+
     def _snapshot_current_meeting_state() -> None:
         """Record host/companion profile+state for whichever room we're
         CURRENTLY in, keyed by its room id -- called every main-loop tick
@@ -430,7 +476,7 @@ def main() -> None:
                     _snapshot_current_meeting_state()
                     body = json.dumps({
                         **status, "meetingUrl": holder.get("url"), "clients": _controlled_clients(),
-                        "debug": debug_rows, "meetingState": meeting_state,
+                        "debug": debug_rows, "meetingState": meeting_state, "processes": _tracked_processes(),
                     }).encode("utf-8")
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
@@ -507,8 +553,7 @@ def main() -> None:
     def companion_loop() -> None:
         companion_port = args.companion_port or (args.port + 1)
         companion_cdp = f"http://127.0.0.1:{companion_port}"
-        companion_profile = Path(args.profile).expanduser()
-        companion_profile = companion_profile.with_name(companion_profile.name + "_companion")
+        companion_profile = companion_profile_path(Path(args.profile).expanduser())
         # Stashed on `holder` (not just this closure's locals) so
         # _controlled_clients() (SSO/profile display) and disconnect_browsers()
         # (needs the tab id to hang up over CDP) can reach them from outside
@@ -537,7 +582,7 @@ def main() -> None:
             try:
                 if not cdp_alive(companion_cdp):
                     companion_profile.mkdir(parents=True, exist_ok=True)
-                    subprocess.Popen(
+                    holder["companion_process"] = subprocess.Popen(
                         build_launch(
                             getattr(args, "browser_backend", "windows"),
                             companion_port,
@@ -801,6 +846,32 @@ def main() -> None:
         log(f"[bridge] {verdict}", role=(wanted or "bridge"))
         return verdict
 
+    def kill_process(role: str | None = None) -> str:
+        wanted = (role or "").strip().lower() or None
+        if wanted == "guest":
+            return "kill failed: guest/client tabs are not implemented yet"
+        if wanted not in ("host", "companion"):
+            return f"kill failed: unknown role {wanted!r}"
+        key = f"{wanted}_process"
+        process = holder.get(key)
+        if process is None:
+            return f"kill failed: no process tracked for {wanted} (attach-only mode, or never launched)"
+        ok = _terminate_process(process)
+        if ok:
+            holder[key] = process
+            if wanted == "host":
+                holder["tab"] = None
+                holder["tab_id"] = None
+                holder["url"] = None
+            else:
+                holder["companion_tab"] = None
+                holder["companion_tab_id"] = None
+            verdict = f"killed:{wanted}"
+        else:
+            verdict = f"kill failed: {wanted} did not exit"
+        log(f"[bridge] {verdict}", role=wanted)
+        return verdict
+
     def disconnect_browsers(role: str | None = None) -> str:
         """/disconnect [host|companion] (+ alias /hangup): hang up by
         closing the browser tab(s) this process controls, over CDP -- the
@@ -891,6 +962,10 @@ def main() -> None:
             parts = command.split(None, 1)
             role = parts[1].strip() if len(parts) > 1 else None
             return disconnect_browsers(role)
+        if lowered.startswith("/kill-process"):
+            parts = command.split(None, 1)
+            role = parts[1].strip() if len(parts) > 1 else None
+            return kill_process(role)
         return None
 
     def out_loop() -> None:
