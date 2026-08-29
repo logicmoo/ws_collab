@@ -52,9 +52,39 @@ def test_meet_role_settings_reject_duplicate_accounts(service, monkeypatch, tmp_
             "sso_2": {"id": "sso_2", "email": "two@example.test", "authuser": 1},
         },
     )
+    monkeypatch.setattr(
+        service,
+        "list_meet_sso_accounts",
+        lambda: {
+            "accounts": [
+                {"id": "sso_1", "email": "one@example.test", "authuser": 0, "signed_in": True},
+                {"id": "sso_2", "email": "two@example.test", "authuser": 1, "signed_in": True},
+            ]
+        },
+    )
 
     with pytest.raises(ValidationError, match="distinct signed-in accounts"):
         service.set_meet_role_assignments({"host": "sso_1", "companion": "sso_1"})
+
+
+def test_meet_roles_remain_unassigned_until_operator_selects_accounts(service, monkeypatch, tmp_path) -> None:
+    profile = tmp_path / "profile"
+    monkeypatch.setattr(service, "_meet_bridge_health", lambda timeout=0.5: None)
+    service.meet_browser_settings.set("profile_path", str(profile))
+    service._set_meet_profile_state(
+        profile,
+        accounts={
+            "sso_1": {"id": "sso_1", "email": "one@example.test", "authuser": 0},
+            "sso_2": {"id": "sso_2", "email": "two@example.test", "authuser": 1},
+        },
+    )
+
+    settings = service.get_meet_role_assignments()
+
+    assert settings["role_account_map"] == {}
+    assert "--role-authuser" not in settings["role_arguments"]
+    assert f"--profile {profile}" in settings["role_arguments"]
+    assert "--browser-backend windows" in settings["role_arguments"]
 
 
 def test_live_account_reconciliation_keeps_stable_sso_ids(service, tmp_path) -> None:

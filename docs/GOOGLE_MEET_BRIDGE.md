@@ -44,6 +44,11 @@ First run: one Chrome window pops up with a persistent profile. Sign in every
 Google account the bridge will use; the sessions persist across runs.
 `--forget-sso` wipes the whole browser profile.
 
+Every driver launch has a live SSO preflight. The browser opens to Google's
+account chooser, but no Meet tab or HOST/COMPANION automation starts until two
+distinct accounts report active signed-in sessions in the required `authuser`
+slots. Persisted `sso_N` records alone do not satisfy this gate.
+
 ## Accounts and Meet roles
 
 Browser sign-in state is account-centric. The admin **SSO / Browser** page
@@ -61,9 +66,9 @@ ws-collab-meet-bridge --companion \
   --role-authuser companion=1
 ```
 
-The defaults are HOST `authuser=0`, COMPANION `authuser=1`, and the reserved
-future GUEST slot `authuser=2`. Assign accounts on the **Google Meet** page
-rather than associating particular email addresses with roles in configuration.
+There are no implicit role defaults. Assign the live accounts on the **Google
+Meet** page; its launch arguments translate the stable `sso_N` choices into
+Google's current numeric `authuser` slots.
 
 The Browser and SSO panels are intentionally account-only: Browser configures
 the single profile path and backend, while SSO manages signed-in accounts.

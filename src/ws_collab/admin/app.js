@@ -1668,15 +1668,38 @@ async function postMeetSso(path, body, confirmText) {
   loadBrowserSettings();
 }
 
-async function loadBrowserSettings() {
+async function scanMeetSsoAccounts() {
+  const result = $("br-result");
+  result.textContent = "scanning live Google sessions...";
+  try {
+    const ssoState = await api(`${V1}/meet/sso/accounts`);
+    await loadBrowserSettings(ssoState);
+    result.textContent = ssoState.ready_for_meet
+      ? `scan complete: ${ssoState.signed_in_count} signed-in accounts; ready for Meet role assignment`
+      : `scan complete: ${ssoState.signed_in_count || 0}/2 signed-in accounts`;
+  } catch (error) {
+    result.textContent = `scan error: ${error.message}`;
+  }
+}
+
+async function loadBrowserSettings(scannedSsoState = null) {
   const body = $("br-settings");
   const result = $("br-result");
   try {
-    const [data, sso] = await Promise.all([
-      api(`${V1}/meet/browser-settings`),
-      api(`${V1}/meet/sso/accounts`),
-    ]);
-    const accounts = sso.accounts || [];
+    const data = await api(`${V1}/meet/browser-settings`);
+    let accounts = data.accounts || [];
+    let ssoState = scannedSsoState || { accounts };
+    if (!scannedSsoState) {
+      try {
+        ssoState = await api(`${V1}/meet/sso/accounts`);
+        accounts = ssoState.accounts || accounts;
+      } catch (_error) {
+        // A running pre-upgrade server already includes accounts in its browser
+        // settings response; use them until that process is manually restarted.
+      }
+    } else {
+      accounts = scannedSsoState.accounts || accounts;
+    }
     const backend = el("select");
     ["windows", "wsl"].forEach((value) => backend.appendChild(new Option(value, value)));
     backend.value = data.browser_backend || "windows";
@@ -1714,12 +1737,13 @@ async function loadBrowserSettings() {
           ["Profile path", profile],
         ],
       ),
-      el("div", "hint", "Next launch command"),
+      el("div", "hint", "Browser launch base (choose role accounts on the Google Meet page before starting)"),
       preview,
     );
 
     const ssoActions = el("div", "toolbar");
     ssoActions.append(
+      actionButton("Scan signed-in accounts", "", scanMeetSsoAccounts),
       actionButton("Sign in another account", "primary", () => postMeetSso("/meet/sso/open", { add_account: true })),
       actionButton("Forget browser profile", "danger", () => postMeetSso(
         "/meet/sso/forget",
@@ -1728,10 +1752,17 @@ async function loadBrowserSettings() {
       )),
     );
     ssoPanel.content.append(
+      el(
+        "div",
+        "hint",
+        ssoState.ready_for_meet
+          ? `${ssoState.signed_in_count} live Google sessions confirmed. Meet drivers may start after roles are assigned on the Google Meet page.`
+          : `${ssoState.signed_in_count || 0}/2 live Google sessions confirmed. Meet drivers remain blocked.`,
+      ),
       el("div", "hint", "The browser uses one Chrome profile/process. Signed-in Google accounts are tracked by stable local IDs even if Google changes their authuser slots."),
       ssoActions,
       table(
-        ["Local ID", "Email", "Authuser", "Actions"],
+        ["Local ID", "Email", "Authuser", "Live session", "Actions"],
         accounts.length
           ? accounts.map((account) => {
               const actions = el("span", "meet-row-actions");
@@ -1740,10 +1771,11 @@ async function loadBrowserSettings() {
                 account.id || "-",
                 account.email || account.label || "unknown",
                 account.authuser == null ? "-" : String(account.authuser),
+                account.signed_in ? "Signed in" : "Not confirmed",
                 actions,
               ];
             })
-          : [["-", "No signed-in accounts are known yet. Use 'Sign in another account', then refresh.", "-", "-"]],
+          : [["-", "No signed-in accounts are known yet. Use 'Sign in another account', then refresh.", "-", "-", "-"]],
       ),
     );
 
@@ -3531,7 +3563,7 @@ function wireEvents() {
     postMeetCommand(`/say ${text}`);
   };
   $("mb-refresh").onclick = loadMeetBridge;
-  $("br-refresh").onclick = loadBrowserSettings;
+  $("br-refresh").onclick = () => loadBrowserSettings();
   $("ps-refresh").onclick = loadProcesses;
   $("mb-join-btn").onclick = () => {
     const url = $("mb-join-url").value.trim();

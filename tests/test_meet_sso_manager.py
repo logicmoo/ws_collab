@@ -11,7 +11,12 @@ def test_list_meet_sso_accounts_is_account_centric_when_bridge_offline(client, a
     monkeypatch.setattr(service_mod, "DEFAULT_PROFILE", host)
     monkeypatch.setattr(service_mod.WsCollabService, "_meet_bridge_health", lambda self, timeout=0.5: None)
     body = client.get(f"{V1}/meet/sso/accounts", headers=admin_headers).json()
-    assert body == {"profile_path": str(host), "accounts": []}
+    assert body == {
+        "profile_path": str(host),
+        "accounts": [],
+        "signed_in_count": 0,
+        "ready_for_meet": False,
+    }
 
 
 def test_open_meet_sso_account_launches_sign_in_page(client, admin_headers, monkeypatch, tmp_path):
@@ -21,6 +26,7 @@ def test_open_meet_sso_account_launches_sign_in_page(client, admin_headers, monk
     monkeypatch.setattr(service_mod, "DEFAULT_PROFILE", host)
     monkeypatch.setattr(service_mod.WsCollabService, "_meet_bridge_health", lambda self, timeout=0.5: None)
     monkeypatch.setattr(service_mod, "find_browser", lambda explicit: r"C:\Chrome\chrome.exe")
+    monkeypatch.setattr(service_mod, "cdp_alive", lambda _endpoint: False)
 
     launched = {}
 
@@ -34,8 +40,36 @@ def test_open_meet_sso_account_launches_sign_in_page(client, admin_headers, monk
     assert body["ok"] is True
     assert body["pid"] == 4321
     assert any(str(host) in arg for arg in launched["argv"])
+    assert "--remote-debugging-port=9223" in launched["argv"]
     assert launched["argv"][-1] == "https://accounts.google.com/AccountChooser?continue=https://accounts.google.com/"
     assert body["reused_bridge_window"] is False
+
+
+def test_list_meet_sso_accounts_reports_only_live_sign_ins_as_ready(
+    client, app_context, admin_headers, monkeypatch, tmp_path
+):
+    from ws_collab import service as service_mod
+
+    profile = tmp_path / "meet_profile"
+    monkeypatch.setattr(service_mod, "DEFAULT_PROFILE", profile)
+    monkeypatch.setattr(service_mod.WsCollabService, "_meet_bridge_health", lambda self, timeout=0.5: None)
+    monkeypatch.setattr(
+        service_mod.WsCollabService,
+        "_meet_browser_live_accounts",
+        lambda self: [
+            {"email": "one@example.test", "authuser": 0, "signedIn": True},
+            {"email": "two@example.test", "authuser": 1, "signedIn": True},
+        ],
+    )
+
+    body = client.get(f"{V1}/meet/sso/accounts", headers=admin_headers).json()
+
+    assert body["ready_for_meet"] is True
+    assert body["signed_in_count"] == 2
+    assert [(row["email"], row["signed_in"]) for row in body["accounts"]] == [
+        ("one@example.test", True),
+        ("two@example.test", True),
+    ]
 
 
 def test_open_meet_sso_account_reuses_and_foregrounds_bridge_window(

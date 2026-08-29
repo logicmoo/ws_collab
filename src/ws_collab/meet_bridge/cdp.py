@@ -24,6 +24,7 @@ from typing import Any
 from websocket import create_connection  # websocket-client
 
 DEFAULT_CDP = "http://127.0.0.1:9222"
+DEFAULT_POPUP_PORT = 9223
 _PLUGIN_ROOT = Path(__file__).resolve().parents[3]
 _OLD_DEFAULT_PROFILE = Path.home() / ".cache" / "ws_collab_models" / "meet_bridge_profile"
 DEFAULT_PROFILE = Path(
@@ -266,6 +267,108 @@ def close_tab(cdp_endpoint: str, tab_id: str) -> None:
         _http_touch(f"{cdp_endpoint}/json/close/{tab_id}")
     except Exception:
         pass
+
+
+def read_google_account(tab: CdpTab | None) -> dict[str, Any] | None:
+    """Read the live Google session represented by an account page."""
+    if tab is None:
+        return None
+    try:
+        raw = tab.evaluate(
+            r"""
+(() => {
+  const ready = document.readyState;
+  const url = location.href;
+  const label = [...document.querySelectorAll('[aria-label*="Google Account"]')]
+    .map((el) => (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())
+    .find((value) => /\([^()]+@[^()]+\)/.test(value));
+  if (!label) return JSON.stringify({ signedIn: false, ready, url });
+  const match = label.match(/\(([^()]+@[^()]+)\)/);
+  return JSON.stringify({ signedIn: true, ready, url, label, email: match ? match[1] : null });
+})()
+"""
+        )
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def scan_signed_in_sso_accounts(
+    cdp_endpoint: str,
+    *,
+    authusers: list[int] | None = None,
+    timeout: float = 5.0,
+) -> list[dict[str, Any]]:
+    """Probe Google authuser slots and return only distinct live sign-ins."""
+    accounts: list[dict[str, Any]] = []
+    seen_emails: set[str] = set()
+    slots = authusers if authusers is not None else list(range(10))
+    for authuser in slots:
+        try:
+            existing_ids = {str(tab.get("id")) for tab in list_tabs(cdp_endpoint) if tab.get("id")}
+        except Exception:
+            existing_ids = set()
+        info = open_url(cdp_endpoint, f"https://myaccount.google.com/?authuser={authuser}")
+        if not info or not info.get("webSocketDebuggerUrl"):
+            break
+        probe = CdpTab(info["webSocketDebuggerUrl"])
+        account: dict[str, Any] | None = None
+        try:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                candidate = read_google_account(probe)
+                email = str((candidate or {}).get("email") or "").strip().lower()
+                if candidate and candidate.get("signedIn") is True and email:
+                    account = dict(candidate)
+                    account["email"] = email
+                    break
+                time.sleep(0.25)
+        finally:
+            probe.close()
+            tab_id = str(info.get("id") or "")
+            if tab_id and tab_id not in existing_ids:
+                close_tab(cdp_endpoint, tab_id)
+        if account is None:
+            if authusers is None:
+                break
+            continue
+        email = str(account["email"])
+        if email in seen_emails:
+            if authusers is None:
+                break
+            continue
+        seen_emails.add(email)
+        account["authuser"] = authuser
+        accounts.append(account)
+    return accounts
+
+
+def browser_profile_root(cdp_endpoint: str, *, timeout: float = 3.0) -> Path | None:
+    """Return the user-data directory of the Chrome instance on a CDP port."""
+    try:
+        existing_ids = {str(tab.get("id")) for tab in list_tabs(cdp_endpoint) if tab.get("id")}
+    except Exception:
+        return None
+    info = open_url(cdp_endpoint, "chrome://version/")
+    if not info or not info.get("webSocketDebuggerUrl"):
+        return None
+    tab = CdpTab(info["webSocketDebuggerUrl"])
+    try:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            text = str(tab.evaluate("document.body?.innerText || ''") or "")
+            for line in text.splitlines():
+                label, separator, value = line.partition("\t")
+                if separator and label.strip() == "Profile Path" and value.strip():
+                    return Path(value.strip()).parent
+            time.sleep(0.1)
+    finally:
+        tab.close()
+        tab_id = str(info.get("id") or "")
+        if tab_id and tab_id not in existing_ids:
+            close_tab(cdp_endpoint, tab_id)
+    return None
 
 
 def launch_browser(args: Any) -> tuple[str, subprocess.Popen[bytes] | None]:

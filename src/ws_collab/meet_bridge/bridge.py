@@ -89,6 +89,7 @@ from .audio_out import (
 )
 from .cdp import (
     DEFAULT_CDP,
+    DEFAULT_POPUP_PORT,
     DEFAULT_PROFILE,
     CdpTab,
     cdp_alive,
@@ -99,6 +100,8 @@ from .cdp import (
     launch_browser,
     list_tabs,
     open_url,
+    read_google_account,
+    scan_signed_in_sso_accounts,
     wait_for_meet_tab,
 )
 from .mailbox_client import DEFAULT_BASE_URL as DEFAULT_MAILBOX_BASE
@@ -116,26 +119,18 @@ from .tracker import CaptionTracker
 DEFAULT_RECIPIENTS = ["conversation"]
 DEFAULT_SENDER_PREFIX = "meet-"
 DEFAULT_OUTBOX = "google-meet"
+SSO_SETUP_URL = "https://accounts.google.com/AccountChooser?continue=https://accounts.google.com/"
 
 # Meet's own room-id shape ("xxx-yyyy-zzz") -- the stable identity used to key
 # per-room state (meeting_state below) regardless of whether that room is a
 # HOST+COMPANION driver/servant meeting or (once built) a CLIENT/GUEST
 # meeting the bridge just sits in: both are keyed the same way, uniformly.
 _ROOM_RE = re.compile(r"meet\.google\.com/([a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4})", re.IGNORECASE)
-MEET_ROLE_ORDER = ("host", "companion", "guest")
 
 
 def room_id(url: str | None) -> str | None:
     match = _ROOM_RE.search(url or "")
     return match.group(1).lower() if match else None
-
-
-def _default_authuser_for_role(role: str) -> int | None:
-    role = str(role or "").strip().lower()
-    try:
-        return MEET_ROLE_ORDER.index(role)
-    except ValueError:
-        return None
 
 
 def parse_role_authusers(values: list[str] | None) -> dict[str, int]:
@@ -179,6 +174,48 @@ def with_authuser(url: str, authuser: int | None) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(params), parts.fragment))
 
 
+def sso_preflight_ready(
+    accounts: list[dict[str, Any]],
+    *,
+    required_authusers: set[int],
+    minimum_accounts: int = 2,
+) -> bool:
+    signed_in = {
+        int(account["authuser"]): str(account.get("email") or "").strip().lower()
+        for account in accounts
+        if account.get("signedIn") is True
+        and str(account.get("email") or "").strip()
+        and isinstance(account.get("authuser"), int)
+    }
+    return len(set(signed_in.values())) >= minimum_accounts and required_authusers.issubset(signed_in)
+
+
+def wait_for_sso_preflight(
+    cdp_endpoint: str,
+    *,
+    required_authusers: set[int],
+    browser_process: subprocess.Popen[Any] | None,
+) -> list[dict[str, Any]]:
+    probe_slots = sorted({0, 1, *required_authusers})
+    last_summary: tuple[int, tuple[int, ...]] | None = None
+    while True:
+        accounts = scan_signed_in_sso_accounts(cdp_endpoint, authusers=probe_slots)
+        signed_slots = tuple(sorted(int(account["authuser"]) for account in accounts))
+        summary = (len({str(account.get("email") or "").lower() for account in accounts}), signed_slots)
+        if summary != last_summary:
+            print(
+                f"[bridge] SSO preflight: {summary[0]}/2 distinct Google accounts signed in "
+                f"(live authuser slots: {', '.join(map(str, signed_slots)) or 'none'})"
+            )
+            last_summary = summary
+        if sso_preflight_ready(accounts, required_authusers=required_authusers):
+            print("[bridge] SSO preflight passed -- starting Meet drivers")
+            return accounts
+        if browser_process is not None and browser_process.poll() is not None:
+            raise SystemExit("Meet browser closed before two Google accounts were signed in.")
+        time.sleep(2.0)
+
+
 def _terminate_process(process: subprocess.Popen[Any] | None) -> bool:
     if process is None:
         return False
@@ -218,7 +255,7 @@ def main() -> None:
     parser.add_argument("--browser-backend", choices=["windows", "wsl"], default=os.environ.get("MEET_BRIDGE_BROWSER_BACKEND", "windows"), help="How to host the Chrome window(s): 'windows' (default, a normal visible window) or 'wsl' (runs inside WSL2 under a real Xvfb virtual display -- genuinely invisible on the Windows desktop, not just off-screen)")
     parser.add_argument("--wsl-distro", default=os.environ.get("MEET_BRIDGE_WSL_DISTRO"), help="WSL distro name for --browser-backend wsl (default: first distro from `wsl -l -q`)")
     parser.add_argument("--profile", default=str(migrated_default), help="Persistent profile dir for the popup browser (keeps your SSO login; default %(default)s)")
-    parser.add_argument("--port", type=int, default=9223, help="DevTools port for the popup browser (default %(default)s)")
+    parser.add_argument("--port", type=int, default=DEFAULT_POPUP_PORT, help="DevTools port for the popup browser (default %(default)s)")
     parser.add_argument("--role-authuser", action="append", default=None, help="Map a role to an authuser slot, e.g. --role-authuser host=0 --role-authuser companion=1 (future guest/client slots can be added the same way)")
     parser.add_argument("--forget-sso", action="store_true", help="Wipe the popup browser's stored Google login (profile dir) and exit -- use when the SSO session expired or to switch accounts")
     parser.add_argument("--list-tabs", action="store_true", help="List CDP tabs and exit")
@@ -239,7 +276,7 @@ def main() -> None:
 
     def role_authuser(role: str) -> int | None:
         wanted = str(role or "").strip().lower()
-        return args.role_authusers.get(wanted, _default_authuser_for_role(wanted))
+        return args.role_authusers.get(wanted)
 
     def role_target_url(url: str, role: str) -> str:
         return with_authuser(url, role_authuser(role))
@@ -292,12 +329,6 @@ def main() -> None:
             time.sleep(1.5)
         raise SystemExit("Timed out waiting for a Google Meet tab (15 min).")
 
-    if args.companion:
-        host_authuser = role_authuser("host")
-        companion_authuser = role_authuser("companion")
-        if host_authuser is not None and companion_authuser is not None and host_authuser == companion_authuser:
-            raise SystemExit("host and companion require distinct authuser slots; override with --role-authuser")
-
     if args.list_audio_devices:
         list_audio_devices()
         return
@@ -323,14 +354,23 @@ def main() -> None:
             print(f"[bridge] nothing to forget ({profile} does not exist)")
         return
 
-    # SSO popup mode: unless --attach-only, the bridge owns a popup browser
-    # (persistent SSO profile). Default with no --meet/--new: reuse a meeting
-    # tab if one is open, otherwise CREATE the servant meeting.
+    assigned_authusers: list[int] = []
+    if not args.list_tabs:
+        required_roles = ["host", *(["companion"] if args.companion else [])]
+        missing_roles = [role for role in required_roles if role_authuser(role) is None]
+        if missing_roles:
+            raise SystemExit(
+                "Assign signed-in SSO accounts on the Google Meet admin page before starting "
+                f"the drivers (missing --role-authuser for: {', '.join(missing_roles)})."
+            )
+        assigned_authusers = [int(role_authuser(role)) for role in required_roles]
+        if len(assigned_authusers) != len(set(assigned_authusers)):
+            raise SystemExit("host and companion require distinct signed-in SSO accounts")
+
+    # Browser setup is account-centric. Meet automation is not initialized
+    # until two distinct Google sessions are live in this one profile.
     cdp_endpoint = args.cdp
-    args.launch_url = role_target_url(
-        args.meet or ("https://meet.google.com/new" if args.new else "https://accounts.google.com/"),
-        "host",
-    )
+    args.launch_url = SSO_SETUP_URL
     if not args.attach_only:
         cdp_endpoint, host_process = launch_browser(args)
     else:
@@ -340,6 +380,13 @@ def main() -> None:
         for tab_entry in list_tabs(cdp_endpoint):
             print(f"{tab_entry.get('type'):8} {tab_entry.get('title', '')[:60]!r} {tab_entry.get('url', '')[:90]}")
         return
+
+    required_authusers = set(assigned_authusers)
+    signed_sso_accounts = wait_for_sso_preflight(
+        cdp_endpoint,
+        required_authusers=required_authusers,
+        browser_process=host_process,
+    )
 
     mailbox = MailboxClient(args.mailbox_base)
     recipients = args.to or list(DEFAULT_RECIPIENTS)
@@ -355,17 +402,31 @@ def main() -> None:
                 "start Chrome with --remote-debugging-port=9222, join the Meet, then rerun."
             )
     else:
-        tab_info = find_controlled_meet_tab(cdp_endpoint, "host")
-        if args.new or not tab_info:
-            if tab_info is None and not args.meet:
-                open_url(cdp_endpoint, role_target_url("https://meet.google.com/new", "host"))
-                created_servant = not args.new  # implicit servant meeting
-            tab_info = wait_for_controlled_meet_tab(cdp_endpoint, "host", require_room=True)
-            created_servant = created_servant or args.new
+        wanted_url = args.meet or "https://meet.google.com/new"
+        tab_info = find_controlled_meet_tab(
+            cdp_endpoint,
+            "host",
+            wanted_room=args.meet,
+        )
+        if args.new or tab_info is None:
+            open_url(cdp_endpoint, role_target_url(wanted_url, "host"))
+            tab_info = wait_for_controlled_meet_tab(
+                cdp_endpoint,
+                "host",
+                require_room=True,
+                wanted_room=args.meet,
+            )
+            created_servant = not args.meet
         elif args.meet:
-            tab_info = wait_for_controlled_meet_tab(cdp_endpoint, "host")
+            tab_info = wait_for_controlled_meet_tab(cdp_endpoint, "host", wanted_room=args.meet)
 
-    holder: dict[str, Any] = {"tab": CdpTab(tab_info["webSocketDebuggerUrl"]), "url": str(tab_info.get("url") or "").split("?")[0], "tab_id": tab_info.get("id")}
+    holder: dict[str, Any] = {
+        "tab": CdpTab(tab_info["webSocketDebuggerUrl"]),
+        "url": str(tab_info.get("url") or "").split("?")[0],
+        "tab_id": tab_info.get("id"),
+        "sso_accounts": signed_sso_accounts,
+        "sso_accounts_scanned_at": time.time(),
+    }
     meeting_url = str(tab_info.get("url") or "").split("?")[0]
     print(f"[bridge] attached: {tab_info.get('title', '')!r} {meeting_url}")
 
@@ -443,39 +504,15 @@ def main() -> None:
     tracker = CaptionTracker(args.settle)
     stop = threading.Event()
 
+    def whoami(tab: CdpTab | None) -> dict[str, Any] | None:
+        return read_google_account(tab)
+
     def refresh_sso_accounts(force: bool = False) -> list[dict[str, Any]]:
         last_scan = float(holder.get("sso_accounts_scanned_at") or 0.0)
         cached = holder.get("sso_accounts")
         if not force and cached is not None and time.time() - last_scan < 10.0:
             return list(cached)
-        accounts: list[dict[str, Any]] = []
-        authuser = 0
-        while not stop.is_set():
-            info = open_url(cdp_endpoint, with_authuser("https://accounts.google.com/", authuser))
-            if not info or not info.get("webSocketDebuggerUrl"):
-                break
-            probe = CdpTab(info["webSocketDebuggerUrl"])
-            try:
-                deadline = time.time() + 10.0
-                account = None
-                while time.time() < deadline and not stop.is_set():
-                    account = whoami(probe)
-                    if isinstance(account, dict):
-                        break
-                    time.sleep(0.3)
-                if not isinstance(account, dict) or not account.get("signedIn"):
-                    break
-                account_row = dict(account)
-                account_row["authuser"] = authuser
-                accounts.append(account_row)
-            finally:
-                try:
-                    probe.close()
-                except Exception:
-                    pass
-                if info.get("id"):
-                    close_tab(cdp_endpoint, str(info.get("id")))
-            authuser += 1
+        accounts = scan_signed_in_sso_accounts(cdp_endpoint)
         holder["sso_accounts"] = accounts
         holder["sso_accounts_scanned_at"] = time.time()
         return list(accounts)
@@ -575,26 +612,6 @@ def main() -> None:
                 "authuser": role_authuser("companion"),
             })
         return clients
-
-    def whoami(tab: CdpTab | None) -> dict[str, Any] | None:
-        if tab is None:
-            return None
-        try:
-            raw = tab.evaluate(
-                """
-(() => {
-  const el = document.querySelector('a[aria-label*="Google Account"]');
-  if (!el) return JSON.stringify({ signedIn: false });
-  const label = (el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
-  const match = label.match(/\\(([^()]+@[^()]+)\\)/);
-  return JSON.stringify({ signedIn: true, label, email: match ? match[1] : null });
-})()
-"""
-            )
-            data = json.loads(raw) if isinstance(raw, str) else raw
-            return data if isinstance(data, dict) else None
-        except Exception:
-            return None
 
     def _process_info(role: str, process: subprocess.Popen[Any] | None, *, port: int, profile: Path | str | None, backend: str) -> dict[str, Any]:
         return {

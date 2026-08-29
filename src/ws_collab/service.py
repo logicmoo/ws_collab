@@ -66,7 +66,16 @@ from .tts.engine import TtsEngine
 from .tts.voices import VoiceManager
 from .workers import WorkerMonitor
 from . import __version__
-from .meet_bridge.cdp import DEFAULT_PROFILE, find_browser
+from .meet_bridge.cdp import (
+    DEFAULT_POPUP_PORT,
+    DEFAULT_PROFILE,
+    CdpTab,
+    browser_profile_root,
+    cdp_alive,
+    find_browser,
+    open_url,
+    scan_signed_in_sso_accounts,
+)
 from .meet_browser_settings import MeetBrowserSettings
 
 
@@ -91,14 +100,6 @@ def _coerce_authuser(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return authuser if authuser >= 0 else None
-
-
-def _default_authuser_for_role(role: str) -> int | None:
-    role = str(role or "").strip().lower()
-    try:
-        return MEET_ROLES.index(role)
-    except ValueError:
-        return None
 
 
 def _markdown_title(path: Path) -> str:
@@ -300,15 +301,6 @@ class WsCollabService:
                     continue
                 cleaned[role_name] = value
                 assigned.add(value)
-        for role in MEET_ROLES:
-            if role in cleaned:
-                continue
-            for account_id in sorted(accounts, key=_sso_sort_key):
-                if account_id in assigned:
-                    continue
-                cleaned[role] = account_id
-                assigned.add(account_id)
-                break
         return cleaned
 
     def _persist_live_sso_accounts(self, health: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
@@ -411,21 +403,45 @@ class WsCollabService:
             authuser = _coerce_authuser((accounts.get(account_id or "") or {}).get("authuser"))
             if authuser is not None:
                 resolved[role] = authuser
-                continue
-            default_authuser = _default_authuser_for_role(role)
-            if default_authuser is not None:
-                resolved[role] = default_authuser
         return resolved
 
     def _meet_bridge_health_for_settings(self) -> dict[str, Any] | None:
         return self._meet_bridge_health()
 
+    def _meet_browser_live_accounts(self) -> list[dict[str, Any]] | None:
+        cdp_endpoint = f"http://127.0.0.1:{DEFAULT_POPUP_PORT}"
+        if not cdp_alive(cdp_endpoint):
+            return None
+        live_profile = browser_profile_root(cdp_endpoint)
+        if live_profile is None or live_profile.resolve() != self._meet_profile_path().resolve():
+            return None
+        return scan_signed_in_sso_accounts(cdp_endpoint, timeout=2.0)
+
     def list_meet_sso_accounts(self) -> dict[str, Any]:
         health = self._meet_bridge_health_for_settings()
-        accounts = self._sso_accounts(health)
+        live_accounts = (health or {}).get("ssoAccounts")
+        if live_accounts is None:
+            live_accounts = self._meet_browser_live_accounts()
+        account_health = health
+        if account_health is None and live_accounts is not None:
+            account_health = {
+                "hostProfile": {"path": str(self._meet_profile_path())},
+                "ssoAccounts": live_accounts,
+            }
+        accounts = self._sso_accounts(account_health)
+        signed_in_emails = {
+            str(row.get("email") or "").strip().lower()
+            for row in live_accounts or []
+            if row.get("signedIn") is True and str(row.get("email") or "").strip()
+        }
+        rows = self._sso_account_rows(accounts)
+        for row in rows:
+            row["signed_in"] = str(row.get("email") or "").strip().lower() in signed_in_emails
         return {
             "profile_path": str(self._meet_profile_path()),
-            "accounts": self._sso_account_rows(accounts),
+            "accounts": rows,
+            "signed_in_count": len(signed_in_emails),
+            "ready_for_meet": len(signed_in_emails) >= 2,
         }
 
     def get_meet_browser_settings(self) -> dict[str, Any]:
@@ -453,10 +469,18 @@ class WsCollabService:
 
     def get_meet_role_assignments(self) -> dict[str, Any]:
         profile_path = self._meet_profile_path()
+        backend = str(self.meet_browser_settings.get("browser_backend") or "windows")
         health = self._meet_bridge_health_for_settings()
         accounts = self._sso_accounts(health, profile_path=profile_path)
         role_account_map = self._meet_role_account_map(accounts, profile_path)
-        command = ["ws-collab-meet-bridge", "--companion"]
+        command = [
+            "ws-collab-meet-bridge",
+            "--profile",
+            str(profile_path),
+            "--browser-backend",
+            backend,
+            "--companion",
+        ]
         for role, authuser in self._meet_role_authusers(accounts, role_account_map).items():
             if role in ("host", "companion") or role_account_map.get(role):
                 command.extend(["--role-authuser", f"{role}={authuser}"])
@@ -469,7 +493,17 @@ class WsCollabService:
 
     def set_meet_role_assignments(self, role_account_map: dict[str, Any] | None) -> dict[str, Any]:
         profile_path = self._meet_profile_path()
-        accounts = self._sso_accounts(profile_path=profile_path)
+        sso_state = self.list_meet_sso_accounts()
+        accounts = {
+            str(row["id"]): row
+            for row in sso_state.get("accounts") or []
+            if row.get("id")
+        }
+        signed_in_ids = {
+            account_id
+            for account_id, account in accounts.items()
+            if account.get("signed_in") is True
+        }
         cleaned: dict[str, str] = {}
         for role, account_id in (role_account_map or {}).items():
             role_name = str(role or "").strip().lower()
@@ -478,6 +512,8 @@ class WsCollabService:
                 raise ValidationError(f"unknown Meet role: {role_name!r}")
             if value and value not in accounts:
                 raise ValidationError(f"unknown SSO account for {role_name}: {value}")
+            if value and value not in signed_in_ids:
+                raise ValidationError(f"SSO account for {role_name} is not currently signed in: {value}")
             if value:
                 cleaned[role_name] = value
         if len(cleaned.values()) != len(set(cleaned.values())):
@@ -546,8 +582,25 @@ class WsCollabService:
             verdict = str((result or {}).get("verdict") or "")
             if result and result.get("ok") and verdict.startswith("sso:"):
                 return {"ok": True, "account_id": account_id or None, "path": str(path), "reused_bridge_window": True, "warning": warning}
+        cdp_endpoint = f"http://127.0.0.1:{DEFAULT_POPUP_PORT}"
+        if cdp_alive(cdp_endpoint) and browser_profile_root(cdp_endpoint) == path.resolve():
+            info = open_url(cdp_endpoint, target_url)
+            if info and info.get("webSocketDebuggerUrl"):
+                tab = CdpTab(info["webSocketDebuggerUrl"])
+                try:
+                    tab.bring_to_front()
+                finally:
+                    tab.close()
+                return {
+                    "ok": True,
+                    "account_id": account_id or None,
+                    "path": str(path),
+                    "reused_bridge_window": True,
+                    "warning": warning,
+                }
         argv = [
             find_browser(None),
+            f"--remote-debugging-port={DEFAULT_POPUP_PORT}",
             f"--user-data-dir={path}",
             "--no-first-run",
             "--no-default-browser-check",
