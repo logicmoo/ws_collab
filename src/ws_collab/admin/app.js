@@ -1834,7 +1834,7 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
   };
   if (kind === "client") {
     const ssoVal = isCurrent ? null : (roomSnapshot && roomSnapshot.hostProfile);
-    const action = isCurrent ? actionsFor("guest") : rejoin("not current");
+    const action = isCurrent ? actionsFor("guest") : actionButton("Join as guest (not implemented yet)", "mini", () => postMeetCommand("/foreground guest"));
     const rows = [["GUEST_CLIENT", ssoLink(ssoVal), isCurrent ? "not implemented yet" : "not current", meetCopyLink(url), "\u2014", "\u2014", action]];
     return { rows, note: "CLIENT/GUEST mode is designed but not built server-side yet — Foreground/Disconnect will honestly report “not implemented yet”; there is no live guest tab to join/leave." };
   }
