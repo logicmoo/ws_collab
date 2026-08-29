@@ -44,6 +44,30 @@ def test_open_meet_sso_profile_launches_browser(client, admin_headers, monkeypat
     assert body["pid"] == 4321
     assert any(str(host) in arg for arg in launched["argv"])
     assert launched["argv"][-1] == "https://accounts.google.com/"
+    assert body["reused_bridge_window"] is False
+
+
+def test_open_meet_sso_profile_reuses_bridge_window_when_process_is_alive(client, admin_headers, monkeypatch, tmp_path):
+    from ws_collab import service as service_mod
+
+    host = tmp_path / "meet_profile"
+    host.mkdir()
+    monkeypatch.setattr(service_mod, "DEFAULT_PROFILE", host)
+    monkeypatch.setattr(service_mod.WsCollabService, "_meet_bridge_health", lambda self, timeout=0.5: {
+        "processes": [{"role": "host", "profile": str(host), "alive": True, "pid": 2468}],
+    })
+    monkeypatch.setattr(service_mod.WsCollabService, "_meet_bridge_command", lambda self, command, timeout=1.0: {
+        "ok": True,
+        "verdict": "sso:host",
+    })
+
+    def fail_popen(*args, **kwargs):
+        raise AssertionError("should not launch a new browser when bridge window can be reused")
+
+    monkeypatch.setattr(service_mod.subprocess, "Popen", fail_popen)
+    body = client.post(f"{V1}/meet/sso/open", headers=admin_headers, json={"role": "host"}).json()
+    assert body["ok"] is True
+    assert body["reused_bridge_window"] is True
 
 
 def test_forget_meet_sso_profile_refuses_when_bridge_reports_profile_in_use(client, admin_headers, monkeypatch, tmp_path):

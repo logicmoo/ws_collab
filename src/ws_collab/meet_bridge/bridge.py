@@ -846,6 +846,36 @@ def main() -> None:
         log(f"[bridge] {verdict}", role=(wanted or "bridge"))
         return verdict
 
+    def sso_browsers(role: str | None = None) -> str:
+        wanted = (role or "").strip().lower() or None
+        if wanted == "guest":
+            return "sso failed: guest/client tabs are not implemented yet"
+        if wanted not in ("host", "companion"):
+            return f"sso failed: unknown role {wanted!r}"
+        target_url = "https://accounts.google.com/"
+        if wanted == "host":
+            tab = holder.get("tab")
+            if tab is None:
+                return "sso failed: host has no live tab"
+            try:
+                tab.evaluate(f"location.href = {json.dumps(target_url)}")
+            except Exception as error:  # noqa: BLE001
+                return f"sso failed: host navigation failed ({error})"
+        else:
+            tab = holder.get("companion_tab")
+            if tab is None:
+                return "sso failed: companion has no live tab"
+            try:
+                tab.evaluate(f"location.href = {json.dumps(target_url)}")
+            except Exception as error:  # noqa: BLE001
+                return f"sso failed: companion navigation failed ({error})"
+        focus_verdict = foreground_browsers(wanted)
+        verdict = f"sso:{wanted}"
+        if "failed:" in focus_verdict:
+            verdict += f" ({focus_verdict})"
+        log(f"[bridge] {verdict}", role=wanted)
+        return verdict
+
     def kill_process(role: str | None = None) -> str:
         wanted = (role or "").strip().lower() or None
         if wanted == "guest":
@@ -966,6 +996,10 @@ def main() -> None:
             parts = command.split(None, 1)
             role = parts[1].strip() if len(parts) > 1 else None
             return kill_process(role)
+        if lowered.startswith("/sso"):
+            parts = command.split(None, 1)
+            role = parts[1].strip() if len(parts) > 1 else None
+            return sso_browsers(role)
         return None
 
     def out_loop() -> None:

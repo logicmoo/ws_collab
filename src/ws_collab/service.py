@@ -265,11 +265,44 @@ class WsCollabService:
                 return f"{role} profile appears to be in use by the running meet bridge process (pid {proc.get('pid')})"
         return None
 
+    def _meet_bridge_command(self, command: str, timeout: float = 1.0) -> dict[str, Any] | None:
+        import urllib.request
+
+        payload = json.dumps({"command": command}).encode("utf-8")
+        request = urllib.request.Request(
+            "http://127.0.0.1:48699/command",
+            data=payload,
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+                return json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    def _meet_bridge_can_reuse_sso(self, health: dict[str, Any] | None, role: str, path: Path) -> bool:
+        if not health:
+            return False
+        for proc in health.get("processes") or []:
+            if (
+                str(proc.get("role") or "") == role
+                and str(proc.get("profile") or "") == str(path)
+                and proc.get("alive") is True
+            ):
+                return True
+        return False
+
     def open_meet_sso_profile(self, role: str) -> dict[str, Any]:
         role = str(role or "").strip().lower()
         path = self._meet_sso_profile_path(role)
         path.mkdir(parents=True, exist_ok=True)
+        health = self._meet_bridge_health()
         warning = self._meet_sso_in_use_warning(role, path)
+        if self._meet_bridge_can_reuse_sso(health, role, path):
+            result = self._meet_bridge_command(f"/sso {role}")
+            if result and result.get("ok") and str(result.get("verdict") or "").startswith(f"sso:{role}"):
+                return {"ok": True, "role": role, "path": str(path), "reused_bridge_window": True, "warning": warning}
         argv = [
             find_browser(None),
             f"--user-data-dir={path}",
@@ -279,7 +312,7 @@ class WsCollabService:
             "https://accounts.google.com/",
         ]
         process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return {"ok": True, "role": role, "path": str(path), "pid": process.pid, "warning": warning}
+        return {"ok": True, "role": role, "path": str(path), "pid": process.pid, "reused_bridge_window": False, "warning": warning}
 
     def forget_meet_sso_profile(self, role: str) -> dict[str, Any]:
         role = str(role or "").strip().lower()
