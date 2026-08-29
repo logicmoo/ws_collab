@@ -56,19 +56,33 @@ discovers accounts in the profile and gives them stable local IDs (`sso_1`,
 `sso_2`, ...). Those IDs remain attached to known accounts even if Google
 changes their numeric `authuser` slots. `role_account_map` is only the mapping
 from a Meet role such as HOST or COMPANION to one of those account IDs. Each
-active role must use a distinct account.
+role is assigned independently; multiple roles may select the same account.
 
 The next-launch command includes the current numeric slots:
 
 ```
 ws-collab-meet-bridge --companion \
   --role-authuser host=0 \
-  --role-authuser companion=1
+  --role-email host=first.account@example.test \
+  --role-authuser companion=1 \
+  --role-email companion=second.account@example.test
 ```
 
 There are no implicit role defaults. Assign the live accounts on the **Google
 Meet** page; its launch arguments translate the stable `sso_N` choices into
-Google's current numeric `authuser` slots.
+Google's current numeric `authuser` slots and include the expected email. The
+bridge verifies each live slot/email pair and each created Meet page before it
+allows join automation.
+
+The admin UI stores role accounts as global defaults. Every meeting without its
+own configuration inherits those defaults. Use **Accounts** on a meeting to save
+an independent HOST/COMPANION override, or **Use global defaults** to remove the
+override and resume inheritance.
+
+Each meeting's Connector table also exposes the assignment directly as a combo.
+It lists every known identity as `email-or-name (sso_N)`. Choosing `(default)`
+removes that role's meeting override; the stable `sso_N` is translated to the
+current email and numeric `authuser` slot only when the bridge command is built.
 
 The Browser and SSO panels are intentionally account-only: Browser configures
 the single profile path and backend, while SSO manages signed-in accounts.
@@ -111,25 +125,30 @@ Limitation: in `--browser-backend wsl` mode, `/foreground` can only report that
 the tab exists -- it cannot raise a real Windows OS window, because Xvfb-hosted
 Chrome has no desktop window by design.
 
-## HTTP API (what ws_collab consumes)
+## Server-managed HTTP API
 
-The bridge exposes a small local, unauthenticated HTTP API on its own port
-(default `48699`, `--status-port` to change):
+The ws_collab server owns the bridge worker lifecycle and exposes its API through
+the authenticated `/ws_collab/v1/meet/bridge` routes:
 
-- `GET /health` -- `{ok, service, meetingUrl, captionCount, lastCaptionAt,
+- `GET /status` -- `{ok, service, meetingUrl, captionCount, lastCaptionAt,
   outbox, recipients, clients, debug}`.
 - `GET /captions?since=<epoch>` -- every caption row (`key`, `at`,
   `updated_at`, `speaker`, `text`, `final`, `replaces`, `meetingUrl`) whose
   `updated_at` is newer than `since`.
 - `POST /command {"command": "/join <url>" | "/new" | "/say <text>"}`.
+  Join and New start the worker when it is offline.
+
+The Chrome/CDP automation remains in a child worker because it has blocking
+browser and audio loops. Its loopback-only port (`48699` by default) is an
+internal implementation detail, so the UI does not need direct access and a
+worker failure cannot take down the REST/WebSocket server.
 
 `ws_collab.drivers.stt.google_meet` polls `/captions` for whatever wall-clock
 window an `AudioSegment` covers and resolves it through the normal
 disambiguator/timeline pipeline, exactly like a native engine. The admin
 UI's **Google Meet** page (deep ops view: HOST+COMPANION connector rows,
 per-meeting captions/debug) and **Meet Bridge** page (a simpler live
-transcript + join/new front door) are both just HTTP consumers of this same
-API -- as is any other tool that wants Meet's captions.
+transcript + join/new front door) both consume the authenticated server API.
 
 ## Mailbox integration
 

@@ -208,6 +208,28 @@ Repositioning backwards requires `"allow_replay": true`; forwards requires
 `GET /ws_collab/admin` — loopback-only unless `WS_COLLAB_ADMIN_REMOTE=1` (which
 requires TLS).
 
+| Method | Path | Role |
+| --- | --- | --- |
+| GET | `/ws_collab/v1/admin/ui-state/{page}` | viewer |
+| POST | `/ws_collab/v1/admin/ui-state/{page}` | operator |
+
+The page-state endpoint stores JSON snapshots in
+`collab_state/admin_ui_state.json`. Credential-like fields are removed before
+the atomic write.
+
+### Google Meet bridge
+
+The authenticated server owns the Chrome/CDP worker and proxies its internal
+loopback API. `POST /meet/bridge/command` starts the worker automatically for
+`/join <url>` and `/new` when it is offline.
+
+| Method | Path | Role |
+| --- | --- | --- |
+| GET | `/ws_collab/v1/meet/bridge/status` | viewer |
+| GET | `/ws_collab/v1/meet/bridge/captions?since=<epoch>` | viewer |
+| POST | `/ws_collab/v1/meet/bridge/command` | operator |
+| POST | `/ws_collab/v1/meet/bridge/start` | operator |
+
 ## WebSocket protocol
 
 Connect to `/ws_collab/ws`, then authenticate before anything else.

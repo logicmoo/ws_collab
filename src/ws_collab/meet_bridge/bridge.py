@@ -153,6 +153,21 @@ def parse_role_authusers(values: list[str] | None) -> dict[str, int]:
     return resolved
 
 
+def parse_role_emails(values: list[str] | None) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    for raw in values or []:
+        text = str(raw or "").strip()
+        if "=" not in text:
+            raise SystemExit(f"--role-email expects ROLE=EMAIL, got: {text!r}")
+        role, email = text.split("=", 1)
+        role_name = role.strip().lower()
+        email_address = email.strip().lower()
+        if not role_name or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email_address):
+            raise SystemExit(f"--role-email expects ROLE=EMAIL, got: {text!r}")
+        resolved[role_name] = email_address
+    return resolved
+
+
 def authuser_from_url(url: str | None) -> int | None:
     try:
         params = dict(parse_qsl(urlsplit(str(url or "")).query, keep_blank_values=True))
@@ -178,6 +193,7 @@ def sso_preflight_ready(
     accounts: list[dict[str, Any]],
     *,
     required_authusers: set[int],
+    required_accounts: dict[int, str] | None = None,
     minimum_accounts: int = 2,
 ) -> bool:
     signed_in = {
@@ -187,13 +203,44 @@ def sso_preflight_ready(
         and str(account.get("email") or "").strip()
         and isinstance(account.get("authuser"), int)
     }
-    return len(set(signed_in.values())) >= minimum_accounts and required_authusers.issubset(signed_in)
+    if len(set(signed_in.values())) < minimum_accounts or not required_authusers.issubset(signed_in):
+        return False
+    return all(signed_in.get(authuser) == email.strip().lower() for authuser, email in (required_accounts or {}).items())
+
+
+def match_role_account(
+    dom_account: dict[str, Any] | None,
+    *,
+    tab_url: str,
+    expected_authuser: int | None,
+    expected_email: str,
+    scanned_accounts: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Verify a role from Meet's DOM or its preflight-validated authuser slot."""
+    wanted_email = expected_email.strip().lower()
+    actual_email = str((dom_account or {}).get("email") or "").strip().lower()
+    if actual_email:
+        if actual_email != wanted_email:
+            raise ValueError(f"browser page uses {actual_email}, expected {wanted_email}")
+        if (dom_account or {}).get("signedIn") is True:
+            return dict(dom_account or {})
+    if expected_authuser is None or authuser_from_url(tab_url) != expected_authuser:
+        return None
+    for account in scanned_accounts:
+        if (
+            account.get("authuser") == expected_authuser
+            and account.get("signedIn") is True
+            and str(account.get("email") or "").strip().lower() == wanted_email
+        ):
+            return dict(account)
+    return None
 
 
 def wait_for_sso_preflight(
     cdp_endpoint: str,
     *,
     required_authusers: set[int],
+    required_accounts: dict[int, str] | None = None,
     browser_process: subprocess.Popen[Any] | None,
 ) -> list[dict[str, Any]]:
     probe_slots = sorted({0, 1, *required_authusers})
@@ -208,7 +255,11 @@ def wait_for_sso_preflight(
                 f"(live authuser slots: {', '.join(map(str, signed_slots)) or 'none'})"
             )
             last_summary = summary
-        if sso_preflight_ready(accounts, required_authusers=required_authusers):
+        if sso_preflight_ready(
+            accounts,
+            required_authusers=required_authusers,
+            required_accounts=required_accounts,
+        ):
             print("[bridge] SSO preflight passed -- starting Meet drivers")
             return accounts
         if browser_process is not None and browser_process.poll() is not None:
@@ -257,6 +308,7 @@ def main() -> None:
     parser.add_argument("--profile", default=str(migrated_default), help="Persistent profile dir for the popup browser (keeps your SSO login; default %(default)s)")
     parser.add_argument("--port", type=int, default=DEFAULT_POPUP_PORT, help="DevTools port for the popup browser (default %(default)s)")
     parser.add_argument("--role-authuser", action="append", default=None, help="Map a role to an authuser slot, e.g. --role-authuser host=0 --role-authuser companion=1 (future guest/client slots can be added the same way)")
+    parser.add_argument("--role-email", action="append", default=None, help="Expected signed-in email for a role, e.g. --role-email host=person@example.com; startup refuses a mismatched authuser slot")
     parser.add_argument("--forget-sso", action="store_true", help="Wipe the popup browser's stored Google login (profile dir) and exit -- use when the SSO session expired or to switch accounts")
     parser.add_argument("--list-tabs", action="store_true", help="List CDP tabs and exit")
     parser.add_argument("--mailbox-base", default=os.environ.get("WS_COLLAB_MAILBOX_BASE", DEFAULT_MAILBOX_BASE), help="ws_collab REST base URL for mailbox IN/OUT (default %(default)s)")
@@ -273,6 +325,7 @@ def main() -> None:
     parser.add_argument("--mic-select-device", default=os.environ.get("MEET_BRIDGE_MIC_SELECT_DEVICE"), help="Name (substring) of the device Meet's own Audio Settings mic dropdown should select, e.g. a virtual cable's 'Output' side -- omit to leave Meet's mic selection alone (env MEET_BRIDGE_MIC_SELECT_DEVICE)")
     args = parser.parse_args()
     args.role_authusers = parse_role_authusers(args.role_authuser)
+    args.role_emails = parse_role_emails(args.role_email)
 
     def role_authuser(role: str) -> int | None:
         wanted = str(role or "").strip().lower()
@@ -280,6 +333,35 @@ def main() -> None:
 
     def role_target_url(url: str, role: str) -> str:
         return with_authuser(url, role_authuser(role))
+
+    def role_email(role: str) -> str | None:
+        return args.role_emails.get(str(role or "").strip().lower())
+
+    def verify_role_tab_account(tab: CdpTab, role: str, timeout: float = 10.0) -> dict[str, Any]:
+        expected_email = role_email(role)
+        if not expected_email:
+            raise RuntimeError(f"{role} has no expected SSO email")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            account = read_google_account(tab)
+            try:
+                tab_url = str(tab.evaluate("location.href") or "")
+            except Exception:
+                tab_url = ""
+            try:
+                verified = match_role_account(
+                    account,
+                    tab_url=tab_url,
+                    expected_authuser=role_authuser(role),
+                    expected_email=expected_email,
+                    scanned_accounts=signed_sso_accounts,
+                )
+            except ValueError as error:
+                raise RuntimeError(f"{role} {error}") from error
+            if verified:
+                return verified
+            time.sleep(0.25)
+        raise RuntimeError(f"could not verify {role} browser page as {expected_email}")
 
     def find_controlled_meet_tab(
         cdp: str,
@@ -363,6 +445,12 @@ def main() -> None:
                 "Assign signed-in SSO accounts on the Google Meet admin page before starting "
                 f"the drivers (missing --role-authuser for: {', '.join(missing_roles)})."
             )
+        missing_emails = [role for role in required_roles if role_email(role) is None]
+        if missing_emails:
+            raise SystemExit(
+                "Assign signed-in SSO accounts on the Google Meet admin page before starting "
+                f"the drivers (missing --role-email for: {', '.join(missing_emails)})."
+            )
         assigned_authusers = [int(role_authuser(role)) for role in required_roles]
         if len(assigned_authusers) != len(set(assigned_authusers)):
             raise SystemExit("host and companion require distinct signed-in SSO accounts")
@@ -382,9 +470,14 @@ def main() -> None:
         return
 
     required_authusers = set(assigned_authusers)
+    required_accounts = {
+        int(role_authuser(role)): str(role_email(role))
+        for role in required_roles
+    }
     signed_sso_accounts = wait_for_sso_preflight(
         cdp_endpoint,
         required_authusers=required_authusers,
+        required_accounts=required_accounts,
         browser_process=host_process,
     )
 
@@ -408,6 +501,10 @@ def main() -> None:
             "host",
             wanted_room=args.meet,
         )
+        if tab_info is None:
+            print(f"[host] no existing browser page for {role_email('host')}; creating one with authuser={role_authuser('host')}")
+        else:
+            print(f"[host] existing browser page found for {role_email('host')}: {tab_info.get('url')}")
         if args.new or tab_info is None:
             open_url(cdp_endpoint, role_target_url(wanted_url, "host"))
             tab_info = wait_for_controlled_meet_tab(
@@ -420,8 +517,15 @@ def main() -> None:
         elif args.meet:
             tab_info = wait_for_controlled_meet_tab(cdp_endpoint, "host", wanted_room=args.meet)
 
+    host_tab = CdpTab(tab_info["webSocketDebuggerUrl"])
+    try:
+        host_account = verify_role_tab_account(host_tab, "host")
+    except RuntimeError as error:
+        host_tab.close()
+        raise SystemExit(f"Refusing to join: {error}") from error
     holder: dict[str, Any] = {
-        "tab": CdpTab(tab_info["webSocketDebuggerUrl"]),
+        "tab": host_tab,
+        "host_account": host_account,
         "url": str(tab_info.get("url") or "").split("?")[0],
         "tab_id": tab_info.get("id"),
         "sso_accounts": signed_sso_accounts,
@@ -802,6 +906,11 @@ def main() -> None:
                     companion_tab = None
                 info = find_controlled_meet_tab(companion_cdp, "companion", wanted_room=target if operator_joined else None)
                 if not info:
+                    log(
+                        f"[companion] no existing browser page for {role_email('companion')}; "
+                        f"creating one with authuser={role_authuser('companion')}",
+                        role="companion",
+                    )
                     opened = open_url(companion_cdp, role_target_url(target, "companion"))
                     companion_tab = None
                     holder["companion_tab"] = None
@@ -815,6 +924,15 @@ def main() -> None:
                         continue
                 if companion_tab is None:
                     companion_tab = CdpTab(info["webSocketDebuggerUrl"])
+                    try:
+                        holder["companion_account"] = verify_role_tab_account(companion_tab, "companion")
+                    except RuntimeError as error:
+                        companion_tab.close()
+                        companion_tab = None
+                        holder["companion_tab"] = None
+                        holder["companion_tab_id"] = None
+                        log(f"[companion] refusing to join: {error}", err=True, role="companion")
+                        return
                     holder["companion_tab"] = companion_tab
                     holder["companion_tab_id"] = info.get("id")
                     mic_ready = False

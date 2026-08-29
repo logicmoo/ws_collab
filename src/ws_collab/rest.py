@@ -797,12 +797,60 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     @router.get(f"{mount}/meet/role-assignments")
     async def meet_role_assignments(request: Request) -> dict[str, Any]:
         await _require(request, "viewer")
-        return guarded(service.get_meet_role_assignments)
+        return guarded(
+            service.get_meet_role_assignments,
+            request.query_params.get("meeting_url", ""),
+        )
 
     @router.post(f"{mount}/meet/role-assignments")
     async def set_meet_role_assignments(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
-        return guarded(service.set_meet_role_assignments, body.get("role_account_map"))
+        return guarded(
+            service.set_meet_role_assignments,
+            body.get("role_account_map"),
+            body.get("meeting_url", ""),
+        )
+
+    @router.delete(f"{mount}/meet/role-assignments")
+    async def clear_meet_role_assignments(request: Request) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.clear_meet_role_assignments,
+            request.query_params.get("meeting_url", ""),
+        )
+
+    @router.post(f"{mount}/meet/bridge/start")
+    async def start_meet_bridge(
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.start_meet_bridge,
+            body.get("meeting_url", ""),
+            new=bool(body.get("new", False)),
+        )
+
+    @router.get(f"{mount}/meet/bridge/status")
+    async def meet_bridge_status(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.meet_bridge_health)
+
+    @router.get(f"{mount}/meet/bridge/captions")
+    async def meet_bridge_captions(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(
+            service.meet_bridge_captions,
+            request.query_params.get("since", "0") or "0",
+        )
+
+    @router.post(f"{mount}/meet/bridge/command")
+    async def meet_bridge_command(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.meet_bridge_command, body.get("command", ""))
 
     @router.post(f"{mount}/meet/sso/open")
     async def meet_sso_open(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
@@ -812,6 +860,11 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             body.get("account_id", ""),
             bool(body.get("add_account", False)),
         )
+
+    @router.post(f"{mount}/meet/sso/foreground")
+    async def meet_sso_foreground(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.foreground_meet_sso_account, body.get("account_id", ""))
 
     @router.post(f"{mount}/meet/sso/forget")
     async def meet_sso_forget(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
@@ -897,6 +950,20 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     async def prompt_rollback(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         auth = await _require(request, "operator", mutating=True)
         return guarded(service.prompt_rollback, int(body.get("version", 0)), auth.principal.label)
+
+    @router.get(f"{mount}/admin/ui-state/{{page}}")
+    async def get_admin_ui_state(request: Request, page: str) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.get_admin_ui_state, page)
+
+    @router.post(f"{mount}/admin/ui-state/{{page}}")
+    async def set_admin_ui_state(
+        request: Request,
+        page: str,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.set_admin_ui_state, page, body.get("state"))
 
     # --------------------------------------------------------- config/diag/audit
     @router.get(f"{mount}/config")

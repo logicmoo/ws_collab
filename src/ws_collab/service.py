@@ -14,6 +14,7 @@ import json
 import shutil
 import subprocess
 import re
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from .audio.secondary_capture import SecondaryCaptureService
 from .audio.devices import DeviceRegistry
 from .audio.routing import RoutingManager
 from .audio.segment import AudioSegment
+from .admin_ui_state import AdminUIState
 from .classify import SourceClassifier
 from .config import Config, ECHO_POLICIES
 from .cursors import CursorManager
@@ -73,6 +75,8 @@ from .meet_bridge.cdp import (
     browser_profile_root,
     cdp_alive,
     find_browser,
+    find_sso_tab,
+    foreground_sso_tab,
     open_url,
     scan_signed_in_sso_accounts,
 )
@@ -176,6 +180,8 @@ class WsCollabService:
         self.routing = RoutingManager(config.state_dir, audit_sink=self._audit_sink)
         self.sound_settings = SoundSettings(config.state_dir)
         self.meet_browser_settings = MeetBrowserSettings(config.state_dir)
+        self.admin_ui_state = AdminUIState(config.state_dir)
+        self._meet_bridge_process: subprocess.Popen[Any] | None = None
         self.voices = VoiceManager(config, config.state_dir, audit_sink=self._audit_sink)
         self.workers = WorkerMonitor(config, self.publish, announce=self._announce)
         self.classifier = SourceClassifier(config.echo_policy)
@@ -255,6 +261,15 @@ class WsCollabService:
         except Exception:
             return None
 
+    def _meet_bridge_port_open(self) -> bool:
+        import socket
+
+        try:
+            with socket.create_connection(("127.0.0.1", 48699), timeout=0.25):
+                return True
+        except OSError:
+            return False
+
     def _meet_profile_path(self) -> Path:
         return Path(str(self.meet_browser_settings.get("profile_path") or DEFAULT_PROFILE)).expanduser()
 
@@ -267,11 +282,13 @@ class WsCollabService:
         *,
         accounts: dict[str, Any] | None = None,
         role_account_map: dict[str, Any] | None = None,
+        meeting_role_account_maps: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self.meet_browser_settings.set_profile_state(
             profile_path or self._meet_profile_path(),
             accounts=accounts,
             role_account_map=role_account_map,
+            meeting_role_account_maps=meeting_role_account_maps,
         )
 
     def _normalize_sso_accounts(self, accounts: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
@@ -293,14 +310,12 @@ class WsCollabService:
 
     def _normalize_role_account_map(self, mapping: dict[str, Any] | None, accounts: dict[str, dict[str, Any]]) -> dict[str, str]:
         cleaned: dict[str, str] = {}
-        assigned: set[str] = set()
         if isinstance(mapping, dict):
             for role_name in MEET_ROLES:
                 value = str(mapping.get(role_name) or "").strip()
-                if not value or value not in accounts or value in assigned:
+                if not value or value not in accounts:
                     continue
                 cleaned[role_name] = value
-                assigned.add(value)
         return cleaned
 
     def _persist_live_sso_accounts(self, health: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
@@ -366,7 +381,8 @@ class WsCollabService:
                     return accounts
         state = self._meet_profile_state(path)
         accounts = self._normalize_sso_accounts(state.get("accounts"))
-        self._set_meet_profile_state(path, accounts=accounts)
+        if accounts != state.get("accounts"):
+            self._set_meet_profile_state(path, accounts=accounts)
         return accounts
 
     def _sso_account_rows(self, accounts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -379,8 +395,58 @@ class WsCollabService:
         path = Path(profile_path or self._meet_profile_path()).expanduser()
         state = self._meet_profile_state(path)
         role_account_map = self._normalize_role_account_map(state.get("role_account_map"), accounts)
-        self._set_meet_profile_state(path, role_account_map=role_account_map)
+        if role_account_map != state.get("role_account_map"):
+            self._set_meet_profile_state(path, role_account_map=role_account_map)
         return role_account_map
+
+    @staticmethod
+    def _meet_assignment_key(meeting_url: str) -> str:
+        value = str(meeting_url or "").strip()
+        match = re.match(
+            r"^https?://meet\.google\.com/([a-z0-9-]+)(?:[/?#].*)?$",
+            value,
+            re.IGNORECASE,
+        )
+        if not match:
+            raise ValidationError("meeting_url must be a Google Meet room URL")
+        return f"https://meet.google.com/{match.group(1).lower()}"
+
+    def _meeting_role_overrides(
+        self,
+        accounts: dict[str, dict[str, Any]],
+        profile_path: Path,
+        meeting_url: str,
+    ) -> dict[str, str | None]:
+        key = self._meet_assignment_key(meeting_url)
+        raw_maps = self._meet_profile_state(profile_path).get("meeting_role_account_maps", {})
+        raw = raw_maps.get(key, {}) if isinstance(raw_maps, dict) else {}
+        if not isinstance(raw, dict):
+            return {}
+        overrides: dict[str, str | None] = {}
+        for role in MEET_ROLES:
+            if role not in raw:
+                continue
+            account_id = str(raw.get(role) or "").strip()
+            if account_id in accounts:
+                overrides[role] = account_id
+        return overrides
+
+    def _effective_meet_role_account_map(
+        self,
+        accounts: dict[str, dict[str, Any]],
+        profile_path: Path,
+        meeting_url: str = "",
+    ) -> tuple[dict[str, str], dict[str, str | None]]:
+        effective = self._meet_role_account_map(accounts, profile_path)
+        overrides: dict[str, str | None] = {}
+        if meeting_url:
+            overrides = self._meeting_role_overrides(accounts, profile_path, meeting_url)
+            for role, account_id in overrides.items():
+                if account_id:
+                    effective[role] = account_id
+                else:
+                    effective.pop(role, None)
+        return effective, overrides
 
     def _meet_role_assignments(self, accounts: dict[str, dict[str, Any]], role_account_map: dict[str, str]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -409,13 +475,19 @@ class WsCollabService:
         return self._meet_bridge_health()
 
     def _meet_browser_live_accounts(self) -> list[dict[str, Any]] | None:
+        cdp_endpoint = self._meet_browser_cdp_for_profile(self._meet_profile_path())
+        if cdp_endpoint is None:
+            return None
+        return scan_signed_in_sso_accounts(cdp_endpoint, timeout=2.0)
+
+    def _meet_browser_cdp_for_profile(self, profile_path: Path) -> str | None:
         cdp_endpoint = f"http://127.0.0.1:{DEFAULT_POPUP_PORT}"
         if not cdp_alive(cdp_endpoint):
             return None
         live_profile = browser_profile_root(cdp_endpoint)
-        if live_profile is None or live_profile.resolve() != self._meet_profile_path().resolve():
+        if live_profile is None or live_profile.resolve() != profile_path.resolve():
             return None
-        return scan_signed_in_sso_accounts(cdp_endpoint, timeout=2.0)
+        return cdp_endpoint
 
     def list_meet_sso_accounts(self) -> dict[str, Any]:
         health = self._meet_bridge_health_for_settings()
@@ -467,12 +539,17 @@ class WsCollabService:
         self.meet_browser_settings.set("profile_path", path)
         return self.get_meet_browser_settings()
 
-    def get_meet_role_assignments(self) -> dict[str, Any]:
+    def get_meet_role_assignments(self, meeting_url: str = "") -> dict[str, Any]:
         profile_path = self._meet_profile_path()
         backend = str(self.meet_browser_settings.get("browser_backend") or "windows")
         health = self._meet_bridge_health_for_settings()
         accounts = self._sso_accounts(health, profile_path=profile_path)
-        role_account_map = self._meet_role_account_map(accounts, profile_path)
+        role_account_map, role_overrides = self._effective_meet_role_account_map(
+            accounts,
+            profile_path,
+            meeting_url,
+        )
+        global_role_account_map = self._meet_role_account_map(accounts, profile_path)
         command = [
             "ws-collab-meet-bridge",
             "--profile",
@@ -481,17 +558,48 @@ class WsCollabService:
             backend,
             "--companion",
         ]
+        if meeting_url:
+            command.extend(["--meet", self._meet_assignment_key(meeting_url)])
         for role, authuser in self._meet_role_authusers(accounts, role_account_map).items():
             if role in ("host", "companion") or role_account_map.get(role):
                 command.extend(["--role-authuser", f"{role}={authuser}"])
+                account = accounts.get(role_account_map.get(role, ""), {})
+                email = str(account.get("email") or "").strip().lower()
+                if email:
+                    command.extend(["--role-email", f"{role}={email}"])
+        role_assignments = self._meet_role_assignments(accounts, role_account_map)
+        stored_meeting_maps = self._meet_profile_state(profile_path).get("meeting_role_account_maps", {})
+        meeting_role_account_maps = (
+            stored_meeting_maps if isinstance(stored_meeting_maps, dict) else {}
+        )
+        cdp_endpoint = self._meet_browser_cdp_for_profile(profile_path)
+        for assignment in role_assignments:
+            account = accounts.get(str(assignment.get("account_id") or ""), {})
+            email = str(account.get("email") or "").strip().lower()
+            tab = find_sso_tab(cdp_endpoint, email) if cdp_endpoint and email else None
+            assignment["tab_exists"] = tab is not None
+            assignment["tab"] = tab
         return {
             "accounts": self._sso_account_rows(accounts),
+            "scope": "meeting" if meeting_url else "global",
+            "meeting_url": self._meet_assignment_key(meeting_url) if meeting_url else "",
             "role_account_map": role_account_map,
-            "role_assignments": self._meet_role_assignments(accounts, role_account_map),
+            "global_role_account_map": global_role_account_map,
+            "role_overrides": role_overrides,
+            "meeting_role_account_maps": meeting_role_account_maps,
+            "inherited_roles": [
+                role for role in role_account_map
+                if meeting_url and role not in role_overrides
+            ],
+            "role_assignments": role_assignments,
             "role_arguments": " ".join(f'"{part}"' if " " in part else part for part in command),
         }
 
-    def set_meet_role_assignments(self, role_account_map: dict[str, Any] | None) -> dict[str, Any]:
+    def set_meet_role_assignments(
+        self,
+        role_account_map: dict[str, Any] | None,
+        meeting_url: str = "",
+    ) -> dict[str, Any]:
         profile_path = self._meet_profile_path()
         sso_state = self.list_meet_sso_accounts()
         accounts = {
@@ -499,27 +607,142 @@ class WsCollabService:
             for row in sso_state.get("accounts") or []
             if row.get("id")
         }
-        signed_in_ids = {
-            account_id
-            for account_id, account in accounts.items()
-            if account.get("signed_in") is True
-        }
-        cleaned: dict[str, str] = {}
-        for role, account_id in (role_account_map or {}).items():
-            role_name = str(role or "").strip().lower()
-            value = str(account_id or "").strip()
-            if role_name not in MEET_ROLES:
-                raise ValidationError(f"unknown Meet role: {role_name!r}")
-            if value and value not in accounts:
+        supplied = role_account_map or {}
+        unknown_roles = sorted(set(supplied) - set(MEET_ROLES))
+        if unknown_roles:
+            raise ValidationError(f"unknown Meet role: {str(unknown_roles[0])!r}")
+        selected: dict[str, str] = {}
+        for role_name in MEET_ROLES:
+            value = str(supplied.get(role_name) or "").strip()
+            if value and value != "__default__" and value not in accounts:
                 raise ValidationError(f"unknown SSO account for {role_name}: {value}")
-            if value and value not in signed_in_ids:
-                raise ValidationError(f"SSO account for {role_name} is not currently signed in: {value}")
-            if value:
-                cleaned[role_name] = value
-        if len(cleaned.values()) != len(set(cleaned.values())):
-            raise ValidationError("Meet role assignments must use distinct signed-in accounts")
+            if value == "__default__" and not meeting_url:
+                raise ValidationError("(default) is only valid for a meeting-specific role")
+            selected[role_name] = value
+        if meeting_url:
+            key = self._meet_assignment_key(meeting_url)
+            state = self._meet_profile_state(profile_path)
+            maps = state.get("meeting_role_account_maps", {})
+            maps = dict(maps) if isinstance(maps, dict) else {}
+            raw_overrides = maps.get(key, {})
+            overrides = {
+                role: account_id
+                for role, account_id in (raw_overrides.items() if isinstance(raw_overrides, dict) else [])
+                if role in MEET_ROLES and account_id in accounts
+            }
+            for role_name in MEET_ROLES:
+                if role_name not in supplied:
+                    continue
+                account_id = selected[role_name]
+                if not account_id or account_id == "__default__":
+                    overrides.pop(role_name, None)
+                else:
+                    overrides[role_name] = account_id
+            effective = self._meet_role_account_map(accounts, profile_path)
+            effective.update(overrides)
+            if overrides:
+                maps[key] = overrides
+            else:
+                maps.pop(key, None)
+            self._set_meet_profile_state(
+                profile_path,
+                accounts=accounts,
+                meeting_role_account_maps=maps,
+            )
+            return self.get_meet_role_assignments(key)
+        cleaned = {role: account_id for role, account_id in selected.items() if account_id}
         self._set_meet_profile_state(profile_path, accounts=accounts, role_account_map=cleaned)
         return self.get_meet_role_assignments()
+
+    def clear_meet_role_assignments(self, meeting_url: str) -> dict[str, Any]:
+        profile_path = self._meet_profile_path()
+        key = self._meet_assignment_key(meeting_url)
+        state = self._meet_profile_state(profile_path)
+        maps = state.get("meeting_role_account_maps", {})
+        maps = dict(maps) if isinstance(maps, dict) else {}
+        maps.pop(key, None)
+        self._set_meet_profile_state(profile_path, meeting_role_account_maps=maps)
+        return self.get_meet_role_assignments(key)
+
+    def start_meet_bridge(self, meeting_url: str = "", *, new: bool = False) -> dict[str, Any]:
+        health = self._meet_bridge_health(timeout=0.75)
+        process = getattr(self, "_meet_bridge_process", None)
+        process_running = process is not None and process.poll() is None
+        port_open = not health and not process_running and self._meet_bridge_port_open()
+        if health or process_running or port_open:
+            return {
+                "ok": True,
+                "started": False,
+                "already_running": True,
+                "meeting_url": (health or {}).get("meetingUrl"),
+            }
+        target = self._meet_assignment_key(meeting_url) if meeting_url else ""
+        settings = self.get_meet_role_assignments(target)
+        assignments = {
+            str(row.get("role") or ""): row
+            for row in settings.get("role_assignments") or []
+        }
+        missing = [
+            role.upper()
+            for role in ("host", "companion")
+            if not assignments.get(role, {}).get("account_id")
+        ]
+        unresolved = [
+            role.upper()
+            for role in ("host", "companion")
+            if assignments.get(role, {}).get("account_id")
+            and (
+                assignments.get(role, {}).get("authuser") is None
+                or not assignments.get(role, {}).get("email")
+            )
+        ]
+        if missing:
+            raise ValidationError(f"assign an SSO account for: {', '.join(missing)}")
+        if unresolved:
+            raise ValidationError(
+                f"scan the signed-in accounts before starting; unresolved roles: {', '.join(unresolved)}"
+            )
+        argv = [
+            sys.executable,
+            "-m",
+            "ws_collab.meet_bridge",
+            "--profile",
+            str(self._meet_profile_path()),
+            "--browser-backend",
+            str(self.meet_browser_settings.get("browser_backend") or "windows"),
+            "--companion",
+        ]
+        if target:
+            argv.extend(["--meet", target])
+        elif new:
+            argv.append("--new")
+        for role in ("host", "companion"):
+            assignment = assignments[role]
+            argv.extend([
+                "--role-authuser",
+                f"{role}={int(assignment['authuser'])}",
+                "--role-email",
+                f"{role}={str(assignment['email']).strip().lower()}",
+            ])
+        log_path = Path(self.config.state_dir) / "meet_bridge.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("ab") as log:
+            self._meet_bridge_process = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+        return {
+            "ok": True,
+            "started": True,
+            "already_running": False,
+            "pid": self._meet_bridge_process.pid,
+            "meeting_url": target or None,
+            "new": bool(new and not target),
+            "log_path": str(log_path),
+        }
 
     def _meet_sso_in_use_warning(self, path: Path) -> str | None:
         health = self._meet_bridge_health()
@@ -546,6 +769,49 @@ class WsCollabService:
                 return json.loads(response.read().decode("utf-8"))
         except Exception:
             return None
+
+    def meet_bridge_health(self) -> dict[str, Any]:
+        health = self._meet_bridge_health(timeout=15.0)
+        if health is None:
+            raise NotFoundError("Meet bridge worker is offline")
+        return health
+
+    def meet_bridge_captions(self, since: float | str = 0.0) -> dict[str, Any]:
+        import urllib.parse
+        import urllib.request
+
+        try:
+            timestamp = float(since)
+        except (TypeError, ValueError) as error:
+            raise ValidationError("since must be a number") from error
+        query = urllib.parse.urlencode({"since": timestamp})
+        try:
+            with urllib.request.urlopen(  # noqa: S310
+                f"http://127.0.0.1:48699/captions?{query}",
+                timeout=2.0,
+            ) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError) as error:
+            raise NotFoundError("Meet bridge worker is offline") from error
+
+    def meet_bridge_command(self, command: str) -> dict[str, Any]:
+        value = str(command or "").strip()
+        if not value:
+            raise ValidationError("command is required")
+        result = self._meet_bridge_command(value, timeout=2.0)
+        if result is not None:
+            return result
+        join = re.fullmatch(r"/join\s+(.+)", value)
+        if join:
+            started = self.start_meet_bridge(join.group(1).strip())
+        elif value == "/new":
+            started = self.start_meet_bridge(new=True)
+        else:
+            raise NotFoundError("Meet bridge worker is offline")
+        verdict = "bridge already running" if started.get("already_running") else "bridge starting"
+        if started.get("pid"):
+            verdict += f" (pid {started['pid']})"
+        return {**started, "verdict": verdict}
 
     def _meet_bridge_can_reuse_sso(self, health: dict[str, Any] | None, path: Path) -> bool:
         if not health:
@@ -582,8 +848,8 @@ class WsCollabService:
             verdict = str((result or {}).get("verdict") or "")
             if result and result.get("ok") and verdict.startswith("sso:"):
                 return {"ok": True, "account_id": account_id or None, "path": str(path), "reused_bridge_window": True, "warning": warning}
-        cdp_endpoint = f"http://127.0.0.1:{DEFAULT_POPUP_PORT}"
-        if cdp_alive(cdp_endpoint) and browser_profile_root(cdp_endpoint) == path.resolve():
+        cdp_endpoint = self._meet_browser_cdp_for_profile(path)
+        if cdp_endpoint is not None:
             info = open_url(cdp_endpoint, target_url)
             if info and info.get("webSocketDebuggerUrl"):
                 tab = CdpTab(info["webSocketDebuggerUrl"])
@@ -609,6 +875,48 @@ class WsCollabService:
         ]
         process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return {"ok": True, "account_id": account_id or None, "path": str(path), "pid": process.pid, "reused_bridge_window": False, "warning": warning}
+
+    def foreground_meet_sso_account(self, account_id: str) -> dict[str, Any]:
+        account_id = str(account_id or "").strip()
+        profile_path = self._meet_profile_path()
+        accounts = self._sso_accounts(self._meet_bridge_health_for_settings(), profile_path=profile_path)
+        account = accounts.get(account_id)
+        if account is None:
+            raise ValidationError(f"unknown SSO account: {account_id}")
+        email = str(account.get("email") or "").strip().lower()
+        if not email:
+            return {
+                "ok": False,
+                "account_id": account_id,
+                "tab_exists": False,
+                "verdict": f"no email is known for {account_id}",
+            }
+        cdp_endpoint = self._meet_browser_cdp_for_profile(profile_path)
+        if cdp_endpoint is None:
+            return {
+                "ok": False,
+                "account_id": account_id,
+                "email": email,
+                "tab_exists": False,
+                "verdict": "the configured browser profile is not open",
+            }
+        tab = foreground_sso_tab(cdp_endpoint, email)
+        if tab is None:
+            return {
+                "ok": False,
+                "account_id": account_id,
+                "email": email,
+                "tab_exists": False,
+                "verdict": f"no existing browser page was found for {email}",
+            }
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "email": email,
+            "tab_exists": True,
+            "tab": tab,
+            "verdict": f"foregrounded existing browser page for {email}",
+        }
 
     def forget_meet_sso_profile(self) -> dict[str, Any]:
         path = self._meet_profile_path()
@@ -2874,6 +3182,12 @@ class WsCollabService:
             "agents": cfg.agents,
             "warnings": self._warnings,
         }
+
+    def get_admin_ui_state(self, page: str) -> dict[str, Any]:
+        return self.admin_ui_state.get_page(page)
+
+    def set_admin_ui_state(self, page: str, state: Any) -> dict[str, Any]:
+        return self.admin_ui_state.set_page(page, state)
 
     # ------------------------------------------------------- docs / ui / files
     # Files whose contents are never served, regardless of role. The writable

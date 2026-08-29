@@ -105,6 +105,40 @@ def test_open_meet_sso_account_reuses_and_foregrounds_bridge_window(
     assert commands == ["/sso 0"]
 
 
+def test_foreground_meet_sso_account_checks_existing_tabs_without_creating_one(
+    client, app_context, admin_headers, monkeypatch, tmp_path
+):
+    from ws_collab import service as service_mod
+
+    profile = tmp_path / "meet_profile"
+    app_context.service.meet_browser_settings.set("profile_path", str(profile))
+    app_context.service._set_meet_profile_state(
+        profile,
+        accounts={"sso_1": {"id": "sso_1", "email": "one@example.test", "authuser": 0}},
+    )
+    monkeypatch.setattr(service_mod.WsCollabService, "_meet_bridge_health", lambda self, timeout=0.5: None)
+    monkeypatch.setattr(
+        service_mod.WsCollabService,
+        "_meet_browser_cdp_for_profile",
+        lambda self, path: "http://127.0.0.1:9223",
+    )
+    monkeypatch.setattr(
+        service_mod,
+        "foreground_sso_tab",
+        lambda endpoint, email: {"id": "tab-1", "title": "Account", "url": "https://example.test"},
+    )
+
+    body = client.post(
+        f"{V1}/meet/sso/foreground",
+        headers=admin_headers,
+        json={"account_id": "sso_1"},
+    ).json()
+
+    assert body["ok"] is True
+    assert body["tab_exists"] is True
+    assert body["tab"]["id"] == "tab-1"
+
+
 def test_forget_meet_sso_profile_refuses_when_bridge_reports_profile_in_use(client, admin_headers, monkeypatch, tmp_path):
     from ws_collab import service as service_mod
 

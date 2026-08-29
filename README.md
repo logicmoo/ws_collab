@@ -57,6 +57,9 @@ written to `collab_state/generated_admin_token.txt` — it is never printed.
 `collab_state/` is the **only** directory WS_COLLAB writes to; everything else can
 be mounted read-only. Relocate it with `WS_COLLAB_STATE_DIR`. See
 [`collab_state/README.md`](collab_state/README.md) for its contents.
+The admin workbench persists each page's controls, preferences, rendered
+snapshot, and latest API snapshots in `collab_state/admin_ui_state.json`;
+credentials and authentication state are excluded.
 
 ## Documentation
 

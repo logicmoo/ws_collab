@@ -26,18 +26,13 @@ const BASE = (() => {
  * mount the prefix ends with /v1, so appending it again would ask for the
  * nonexistent /v1/v1. */
 const V1 = /\/v1$/.test(BASE) ? BASE : BASE + "/v1";
+const ADMIN_UI_STATE_BASE = `${V1}/admin/ui-state`;
 const ROW_H = 22;
 const MAX_BUFFER = 5000;
 
-/* The Google Meet caption bridge (ws_collab.meet_bridge) is its own
- * always-running process, not part of ws_collab's own async server — it
- * drives a real Chrome over the DevTools Protocol, which needs its own
- * blocking loop/threads, and exposes a small unauthenticated HTTP API
- * (health/captions/command) on its own port for any consumer, including
- * this admin UI and the google_meet STT driver.
- * `WS_COLLAB_MEET_BRIDGE_BASE` overrides the default for a non-default
- * --status-port or a bridge reachable elsewhere. */
-const MEET_BRIDGE_BASE = window.WS_COLLAB_MEET_BRIDGE_BASE || "http://127.0.0.1:48699";
+/* The server owns the blocking Chrome/CDP worker and proxies its API so the
+ * workbench never depends on a separately reachable unauthenticated port. */
+const MEET_BRIDGE_BASE = `${V1}/meet/bridge`;
 /* Known driver meetings (host+companion secret-servant rooms this bridge
  * has been pointed at) — shown as placeholder entries even when the bridge
  * isn't currently attached to them (e.g. Google ended one and auto-recreate
@@ -83,6 +78,12 @@ const state = {
   reconnectTimer: null,
   reconnectAt: 0,
   reconnectDelay: 1000,
+  meetAssignmentScope: "",
+  meetKnownUrls: [...DEFAULT_DRIVER_MEETING_URLS, ...DEFAULT_CLIENT_MEETING_URLS],
+  meetGlobalAssignments: null,
+  pageApiSnapshots: {},
+  restoredPageStates: {},
+  pendingPageRestore: {},
   errors: [],
 };
 
@@ -191,6 +192,202 @@ function pushError(message) {
   $("sb-errors").textContent = state.errors[0] || "";
 }
 
+/* ------------------------------------------------------ persistent UI state */
+let pageStateSaveTimer = null;
+
+function isSensitiveStateName(name) {
+  return /(authorization|cookie|credential|password|secret|sessionstorage|token|api[_-]?key)/i.test(name || "");
+}
+
+function preferenceSnapshot() {
+  const preferences = {};
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const key = localStorage.key(index);
+    if (!key || isSensitiveStateName(key)) continue;
+    if (key.startsWith("ws_collab_") || key.startsWith("wsc.")) {
+      preferences[key] = localStorage.getItem(key);
+    }
+  }
+  return preferences;
+}
+
+function controlStateKey(node, index) {
+  if (node.id) return `id:${node.id}`;
+  if (node.dataset && node.dataset.role) {
+    return `role:${node.dataset.role}:${node.dataset.meetingUrl || ""}`;
+  }
+  if (node.dataset && node.dataset.url) return `url:${node.dataset.url}`;
+  if (node.name) return `name:${node.name}`;
+  return `index:${index}`;
+}
+
+function controlSnapshot(section) {
+  return [...section.querySelectorAll("input, select, textarea, details, button[aria-pressed], button[data-state]")]
+    .filter((node) => node.type !== "password" && !isSensitiveStateName(node.id || node.name || ""))
+    .map((node, index) => {
+      const row = { key: controlStateKey(node, index), tag: node.tagName.toLowerCase() };
+      if ("value" in node && node.type !== "file") row.value = node.value;
+      if ("checked" in node) row.checked = !!node.checked;
+      if (node.tagName === "DETAILS") row.open = !!node.open;
+      if (node.hasAttribute("aria-pressed")) row.pressed = node.getAttribute("aria-pressed");
+      if (node.dataset && node.dataset.state) row.data_state = node.dataset.state;
+      return row;
+    });
+}
+
+function scrollSnapshot(section) {
+  const result = {};
+  [...section.querySelectorAll("[id]")].forEach((node) => {
+    if (node.scrollTop || node.scrollLeft) {
+      result[node.id] = { top: node.scrollTop, left: node.scrollLeft };
+    }
+  });
+  return result;
+}
+
+function capturePageState(page) {
+  const section = document.querySelector(`.page[data-page="${page}"]`);
+  if (!section) return {};
+  return {
+    controls: controlSnapshot(section),
+    preferences: preferenceSnapshot(),
+    view: {
+      meet_assignment_scope: page === "meet" ? state.meetAssignmentScope : undefined,
+      scroll: scrollSnapshot(section),
+    },
+    display: { html: section.innerHTML, text: section.innerText },
+    api_snapshots: state.pageApiSnapshots[page] || {},
+    saved_at: new Date().toISOString(),
+  };
+}
+
+function applyControlState(page, saved) {
+  const section = document.querySelector(`.page[data-page="${page}"]`);
+  if (!section || !saved || !Array.isArray(saved.controls)) return;
+  const nodes = [...section.querySelectorAll("input, select, textarea, details, button[aria-pressed], button[data-state]")];
+  const byKey = new Map(nodes.map((node, index) => [controlStateKey(node, index), node]));
+  saved.controls.forEach((row) => {
+    const node = byKey.get(row.key);
+    if (!node || node.type === "password" || isSensitiveStateName(node.id || node.name || "")) return;
+    if (node.dataset && node.dataset.role) return;
+    if (row.value !== undefined && "value" in node && node.type !== "file") {
+      const canApply = node.tagName !== "SELECT" || [...node.options].some((option) => option.value === row.value);
+      if (canApply && node.value !== row.value) node.value = row.value;
+    }
+    if (row.checked !== undefined && "checked" in node && node.checked !== !!row.checked) {
+      node.checked = !!row.checked;
+    }
+    if (row.open !== undefined && node.tagName === "DETAILS" && node.open !== !!row.open) {
+      node.open = !!row.open;
+    }
+    if (row.pressed !== undefined && node.getAttribute("aria-pressed") !== row.pressed) {
+      node.setAttribute("aria-pressed", row.pressed);
+    }
+    if (row.data_state !== undefined && node.dataset && node.dataset.state !== row.data_state) {
+      node.dataset.state = row.data_state;
+    }
+  });
+  Object.entries((saved.view && saved.view.scroll) || {}).forEach(([id, position]) => {
+    const node = document.getElementById(id);
+    if (node && section.contains(node)) {
+      node.scrollTop = Number(position.top || 0);
+      node.scrollLeft = Number(position.left || 0);
+    }
+  });
+}
+
+function stateRequest(path, options = {}) {
+  const headers = Object.assign({ "Authorization": `Bearer ${state.token}` }, options.headers || {});
+  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  return fetch(path, {
+    method: options.method || "GET",
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    keepalive: !!options.keepalive,
+  });
+}
+
+async function restorePageState(page) {
+  if (state.restoredPageStates[page]) {
+    applyControlState(page, state.restoredPageStates[page]);
+    return;
+  }
+  try {
+    const response = await stateRequest(`${ADMIN_UI_STATE_BASE}/${encodeURIComponent(page)}`);
+    if (!response.ok) return;
+    const payload = await response.json();
+    const saved = payload && payload.state;
+    if (!saved) return;
+    state.restoredPageStates[page] = saved;
+    state.pendingPageRestore[page] = true;
+    Object.entries(saved.preferences || {}).forEach(([key, value]) => {
+      if (!isSensitiveStateName(key) && (key.startsWith("ws_collab_") || key.startsWith("wsc."))) {
+        localStorage.setItem(key, value);
+      }
+    });
+    state.pageApiSnapshots[page] = saved.api_snapshots || {};
+    if (page === "meet" && saved.view && saved.view.meet_assignment_scope) {
+      state.meetAssignmentScope = saved.view.meet_assignment_scope;
+    }
+    applyControlState(page, saved);
+  } catch (_error) {
+    // Persistence is auxiliary; a storage error must not block the live page.
+  }
+}
+
+function savePageState(page, keepalive = false) {
+  if (!page) return Promise.resolve();
+  const pageState = capturePageState(page);
+  state.restoredPageStates[page] = pageState;
+  return stateRequest(`${ADMIN_UI_STATE_BASE}/${encodeURIComponent(page)}`, {
+    method: "POST",
+    body: { state: pageState },
+    keepalive,
+  }).catch(() => null);
+}
+
+function schedulePageStateSave() {
+  clearTimeout(pageStateSaveTimer);
+  pageStateSaveTimer = setTimeout(() => savePageState(state.page), 750);
+}
+
+function recordApiSnapshot(path, payload) {
+  if (!path.startsWith(V1) || path.startsWith(ADMIN_UI_STATE_BASE) || payload === undefined) return;
+  let key = path;
+  try { key = new URL(path, location.origin).pathname; } catch (_error) {}
+  const snapshots = state.pageApiSnapshots[state.page] || {};
+  try {
+    snapshots[key] = JSON.parse(JSON.stringify(payload));
+    state.pageApiSnapshots[state.page] = snapshots;
+    schedulePageStateSave();
+  } catch (_error) {
+    // Only JSON-shaped responses can be persisted as page snapshots.
+  }
+}
+
+function installPageStatePersistence() {
+  document.addEventListener("input", schedulePageStateSave);
+  document.addEventListener("change", schedulePageStateSave);
+  document.addEventListener("click", schedulePageStateSave);
+  const observer = new MutationObserver((mutations) => {
+    if (mutations.some((mutation) => mutation.target.closest && mutation.target.closest(".page.active"))) {
+      if (state.pendingPageRestore[state.page]) {
+        applyControlState(state.page, state.restoredPageStates[state.page]);
+        state.pendingPageRestore[state.page] = false;
+      }
+      schedulePageStateSave();
+    }
+  });
+  observer.observe($("app"), {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ["open", "aria-pressed", "data-state"],
+  });
+  window.addEventListener("beforeunload", () => savePageState(state.page, true));
+}
+
 /* --------------------------------------------------------------- API client */
 async function api(path, options = {}) {
   const headers = Object.assign({ "Authorization": `Bearer ${state.token}` }, options.headers || {});
@@ -211,6 +408,7 @@ async function api(path, options = {}) {
     error.payload = payload;
     throw error;
   }
+  recordApiSnapshot(path, payload);
   return payload;
 }
 
@@ -1006,8 +1204,11 @@ async function loadInto(target, path) {
 }
 
 /* ------------------------------------------------------------------- pages */
-function showPage(page) {
+async function showPage(page) {
+  const previousPage = state.page;
+  if (previousPage && previousPage !== page) await savePageState(previousPage);
   state.page = page;
+  await restorePageState(page);
   document.querySelectorAll(".page").forEach((n) => n.classList.toggle("active", n.dataset.page === page));
   document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.page === page));
   const pageTitles = { browser: "SSO / Browser" };
@@ -1020,6 +1221,10 @@ function showPage(page) {
     meet: loadMeetWithPolling, stt: loadStt, meetbridge: loadMeetBridge, processes: loadProcesses, browser: loadBrowserSettings,
   };
   if (loaders[page]) loaders[page]();
+  else {
+    applyControlState(page, state.restoredPageStates[page]);
+    state.pendingPageRestore[page] = false;
+  }
   Object.values(state.views).forEach((v) => v.draw());
 }
 
@@ -1623,13 +1828,14 @@ async function loadDevices() {
   }
 }
 
-/* ---- google meet bridge (ws_collab.meet_bridge — its own process) */
+/* ---- server-managed Google Meet bridge */
 async function postMeetCommand(command) {
   const resultEl = $("meet-command-result");
   resultEl.textContent = `${command} — sending…`;
   try {
     const result = await api(`${MEET_BRIDGE_BASE}/command`, { method: "POST", body: { command } });
     resultEl.textContent = `${command} → ${result.verdict}`;
+    if (result.started) setTimeout(loadMeet, 2000);
   } catch (error) {
     resultEl.textContent = `${command} → error: ${error.message}`;
   }
@@ -1646,6 +1852,7 @@ async function postMeetBridgeCommand(command) {
   try {
     const result = await api(`${MEET_BRIDGE_BASE}/command`, { method: "POST", body: { command } });
     resultEl.textContent = `${command} → ${result.verdict}`;
+    if (result.started) setTimeout(loadMeetBridge, 2000);
   } catch (error) {
     resultEl.textContent = `${command} → error: ${error.message}`;
   }
@@ -1804,47 +2011,153 @@ async function loadBrowserSettings(scannedSsoState = null) {
   }
 }
 
+function meetAccountLabel(account) {
+  if (!account) return "Unassigned";
+  const accountName = account.email || account.label || account.id;
+  return accountName === account.id ? account.id : `${accountName} (${account.id})`;
+}
+
+function meetAssignmentKey(url) {
+  try {
+    const parsed = new URL(url);
+    const room = parsed.pathname.split("/").filter(Boolean)[0];
+    return room ? `https://meet.google.com/${room.toLowerCase()}` : url;
+  } catch (_error) {
+    return url;
+  }
+}
+
+function meetRoleOverride(url, role) {
+  const data = state.meetGlobalAssignments || {};
+  const overrides = (data.meeting_role_account_maps || {})[meetAssignmentKey(url)];
+  if (!overrides || typeof overrides !== "object" || !(role in overrides)) return "__default__";
+  return overrides[role] || "__default__";
+}
+
+function meetEffectiveRoleMap(url) {
+  const data = state.meetGlobalAssignments || {};
+  const effective = { ...(data.role_account_map || {}) };
+  const overrides = (data.meeting_role_account_maps || {})[meetAssignmentKey(url)];
+  if (overrides && typeof overrides === "object") {
+    Object.entries(overrides).forEach(([role, accountId]) => {
+      if (accountId) effective[role] = accountId;
+    });
+  }
+  return effective;
+}
+
+function meetSsoCombo(url, role) {
+  const data = state.meetGlobalAssignments;
+  if (!data) return "\u2014";
+  const accounts = data.accounts || [];
+  const byId = Object.fromEntries(accounts.map((account) => [account.id, account]));
+  const defaultAccount = byId[(data.role_account_map || {})[role]];
+  const select = el("select");
+  select.dataset.role = role;
+  select.dataset.meetingUrl = meetAssignmentKey(url);
+  select.appendChild(new Option(`(default) ${meetAccountLabel(defaultAccount)}`, "__default__"));
+  accounts.forEach((account) => select.appendChild(new Option(meetAccountLabel(account), account.id)));
+  select.value = meetRoleOverride(url, role);
+  select.title = `Select the ${role.toUpperCase()} SSO for this meeting; its live authuser slot is resolved at runtime.`;
+  select.onclick = (event) => event.stopPropagation();
+  select.onchange = async () => {
+    const previous = meetRoleOverride(url, role);
+    const changes = { [role]: select.value };
+    select.disabled = true;
+    try {
+      await api(`${V1}/meet/role-assignments`, {
+        method: "POST",
+        body: { role_account_map: changes, meeting_url: url },
+      });
+      state.meetGlobalAssignments = await api(`${V1}/meet/role-assignments`);
+      if (state.meetAssignmentScope === meetAssignmentKey(url)) loadMeetRoleAssignments();
+    } catch (error) {
+      select.value = previous;
+      pushError(`Could not assign ${role.toUpperCase()} SSO: ${error.message}`);
+    } finally {
+      select.disabled = false;
+    }
+  };
+  return select;
+}
+
 async function loadMeetRoleAssignments() {
   const body = $("meet-role-settings");
   if (!body) return;
   try {
-    const data = await api(`${V1}/meet/role-assignments`);
+    const meetingUrl = state.meetAssignmentScope;
+    const query = meetingUrl ? `?meeting_url=${encodeURIComponent(meetingUrl)}` : "";
+    const data = await api(`${V1}/meet/role-assignments${query}`);
+    if (!meetingUrl) state.meetGlobalAssignments = data;
+    else if (!state.meetGlobalAssignments) {
+      state.meetGlobalAssignments = { ...data, role_account_map: data.global_role_account_map || {} };
+    }
     const accounts = data.accounts || [];
     const selections = {};
     const rows = (data.role_assignments || []).map((row) => {
       const select = el("select");
-      select.appendChild(new Option("Unassigned", ""));
+      select.dataset.role = row.role;
+      select.dataset.meetingUrl = meetingUrl;
+      if (meetingUrl) {
+        const byId = Object.fromEntries(accounts.map((account) => [account.id, account]));
+        const defaultAccount = byId[(data.global_role_account_map || {})[row.role]];
+        select.appendChild(new Option(`(default) ${meetAccountLabel(defaultAccount)}`, "__default__"));
+      } else {
+        select.appendChild(new Option("Unassigned", ""));
+      }
       accounts.forEach((account) => {
-        const label = [
-          account.id,
-          account.email || account.label || "unknown",
-          account.authuser != null ? `(authuser ${account.authuser})` : "(authuser unknown)",
-        ].join(" - ");
-        select.appendChild(new Option(label, account.id));
+        select.appendChild(new Option(meetAccountLabel(account), account.id));
       });
-      select.value = row.account_id || "";
+      select.value = meetingUrl
+        ? (data.role_overrides && data.role_overrides[row.role]) || "__default__"
+        : row.account_id || "";
       selections[row.role] = select;
+      const actions = el("span", "meet-row-actions");
+      actions.append(actionButton("Foreground", "mini", async () => {
+        const accountId = select.value === "__default__" ? row.account_id : select.value;
+        const roleLabel = (row.role || "role").toUpperCase();
+        if (!accountId) {
+          result.textContent = `${roleLabel}: no SSO account is assigned`;
+          return;
+        }
+        result.textContent = `${roleLabel}: checking for an existing browser page...`;
+        try {
+          const foregrounded = await api(`${V1}/meet/sso/foreground`, {
+            method: "POST",
+            body: { account_id: accountId },
+          });
+          result.textContent = `${roleLabel}: ${foregrounded.verdict}`;
+        } catch (error) {
+          result.textContent = `${roleLabel}: foreground error: ${error.message}`;
+        }
+      }));
       return [
         (row.role || "-").toUpperCase(),
         select,
         row.email || row.label || "unassigned",
         row.authuser == null ? "-" : String(row.authuser),
+        row.account_id ? (row.tab_exists ? "Exists" : "None") : "Unassigned",
+        actions,
       ];
     });
     const result = el("span", "mono hint");
     const save = actionButton("Save role assignments", "primary", async () => {
       try {
-        await api(`${V1}/meet/role-assignments`, {
+        const saved = await api(`${V1}/meet/role-assignments`, {
           method: "POST",
           body: {
             role_account_map: Object.fromEntries(
               Object.entries(selections)
-                .map(([role, select]) => [role, select.value])
-                .filter(([, value]) => value),
+                .map(([role, select]) => [role, select.value]),
             ),
+            meeting_url: meetingUrl,
           },
         });
-        result.textContent = "saved for the next bridge launch";
+        if (!meetingUrl) state.meetGlobalAssignments = saved;
+        else state.meetGlobalAssignments = await api(`${V1}/meet/role-assignments`);
+        result.textContent = meetingUrl
+          ? "saved for this meeting"
+          : "saved as global defaults for unconfigured meetings";
         loadMeetRoleAssignments();
       } catch (error) {
         result.textContent = `error: ${error.message}`;
@@ -1852,9 +2165,43 @@ async function loadMeetRoleAssignments() {
     });
     const toolbar = el("div", "toolbar");
     toolbar.append(save, result);
+    if (meetingUrl) {
+      toolbar.insertBefore(actionButton("Use global defaults", "mini", async () => {
+        try {
+          await api(`${V1}/meet/role-assignments?meeting_url=${encodeURIComponent(meetingUrl)}`, {
+            method: "DELETE",
+          });
+          state.meetGlobalAssignments = await api(`${V1}/meet/role-assignments`);
+          result.textContent = "meeting override removed";
+          loadMeetRoleAssignments();
+        } catch (error) {
+          result.textContent = `error: ${error.message}`;
+        }
+      }), result);
+    }
+    const scopeRow = el("div", "field");
+    scopeRow.appendChild(el("label", null, "Assignment scope"));
+    const scopeSelect = el("select");
+    scopeSelect.appendChild(new Option("Global defaults", ""));
+    [...new Set(state.meetKnownUrls)].forEach((url) => {
+      scopeSelect.appendChild(new Option(`${driverName(url)} - ${url}`, url));
+    });
+    scopeSelect.value = meetingUrl;
+    scopeSelect.onchange = () => {
+      state.meetAssignmentScope = scopeSelect.value;
+      loadMeetRoleAssignments();
+    };
+    scopeRow.appendChild(scopeSelect);
+    const scopeHint = meetingUrl
+      ? ((data.inherited_roles || []).length
+        ? `This meeting inherits ${data.inherited_roles.map((role) => role.toUpperCase()).join(" and ")} from the global defaults.`
+        : "This meeting has its own role assignments.")
+      : "Every meeting without its own override inherits these global defaults.";
     body.replaceChildren(
-      el("div", "hint", "Meet roles select distinct SSO accounts. This mapping belongs to meeting orchestration; browser sign-in remains account-only."),
-      table(["Meet role", "SSO account", "Current label", "Authuser"], rows),
+      el("div", "hint", "Meet roles select SSO accounts. Browser sign-in remains account-only."),
+      scopeRow,
+      el("div", "hint", scopeHint),
+      table(["Meet role", "SSO account", "Current label", "Authuser", "Browser page", "Actions"], rows),
       toolbar,
       el("div", "hint", "Role arguments for the next launch"),
       mono(data.role_arguments || "ws-collab-meet-bridge --companion"),
@@ -1880,7 +2227,7 @@ async function loadProcesses() {
   const body = $("ps-body");
   const statusLine = $("ps-status-line");
   try {
-    const health = await api(`${MEET_BRIDGE_BASE}/health`);
+    const health = await api(`${MEET_BRIDGE_BASE}/status`);
     statusLine.textContent = health.meetingUrl ? `bridge online — ${health.meetingUrl}` : "bridge online — no meeting";
     const rows = (health.processes || []).map((proc) => {
       const actions = el("span", "meet-row-actions");
@@ -1918,9 +2265,9 @@ async function loadProcesses() {
  * meetingState[roomId] — "as of last time we were here" — when the bridge
  * has ever actually been in that room; plain dashes only when it truly
  * never has). Every row shows the meeting URL + connection state, an SSO
- * column (which Chrome profile dir — and therefore which persisted Google
- * login — that identity is configured to use: hostProfile for HOST, each
- * client's own `.profile` otherwise), and Actions: for the CURRENT
+ * column whose combo stores a stable sso_N override for this meeting (or uses
+ * the global default) and resolves its current authuser slot at runtime, and
+ * Actions: for the CURRENT
  * meeting, role-scoped Foreground (raise that identity's browser window)
  * + Disconnect (hang up just that tab) buttons; for a not-current meeting,
  * Join/Rejoin instead (no live tab to foreground/disconnect there). Device
@@ -1959,19 +2306,19 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
     const asOf = roomSnapshot && roomSnapshot.updatedAt
       ? ` (as of ${shortTs(new Date(roomSnapshot.updatedAt * 1000).toISOString())})` : "";
     const rows = [
-      ["HOST", ssoLink(roomSnapshot && roomSnapshot.hostProfile), "not current" + asOf, meetCopyLink(url), "\u2014", "\u2014", rejoin("not current")],
-      ["COMPANION", ssoLink(snapCompanion && snapCompanion.profile), "not current" + asOf, meetCopyLink(url), "\u2014", "\u2014", rejoin("not current")],
+      ["HOST", meetSsoCombo(url, "host"), "not current" + asOf, meetCopyLink(url), "\u2014", "\u2014", rejoin("not current")],
+      ["COMPANION", meetSsoCombo(url, "companion"), "not current" + asOf, meetCopyLink(url), "\u2014", "\u2014", rejoin("not current")],
     ];
     return { rows, note: roomSnapshot
       ? "Not the current meeting — SSO/state is the last known snapshot from when the bridge was last here; Join re-attaches the live driver. This driver slot is also available to relay a different real-world audio source into a Meet room here instead — a Discord Voice Channel, Zoom call, or plain audio call, for example — but that is not built yet; every driver today only probes this machine's Physical Computer mic/speakers."
       : "Not the current meeting — never seen live yet, so no snapshot exists; Join attaches the live driver here. This driver slot is also available to relay a different real-world audio source into a Meet room here instead — a Discord Voice Channel, Zoom call, or plain audio call, for example — but that is not built yet; every driver today only probes this machine's Physical Computer mic/speakers." };
   }
-  const rows = [["HOST", ssoLink(hostProfile), "in-call", meetCopyLink(url), meetDevicesLink(), meetDevicesLink(), actionsFor("host")]];
+  const rows = [["HOST", meetSsoCombo(url, "host"), "in-call", meetCopyLink(url), meetDevicesLink(), meetDevicesLink(), actionsFor("host")]];
   const companion = (clients || []).find((c) => c.role === "companion");
   if (companion) {
-    rows.push(["COMPANION", ssoLink({ label: companion.profile, account: companion.account }), companion.state || "\u2014", meetCopyLink(url), companion.mic || "\u2014", companion.speak || "\u2014", actionsFor("companion")]);
+    rows.push(["COMPANION", meetSsoCombo(url, "companion"), companion.state || "\u2014", meetCopyLink(url), companion.mic || "\u2014", companion.speak || "\u2014", actionsFor("companion")]);
   } else {
-    rows.push(["COMPANION", "\u2014", "not armed (no --companion)", meetCopyLink(url), "\u2014", "\u2014", "\u2014"]);
+    rows.push(["COMPANION", meetSsoCombo(url, "companion"), "not armed (no --companion)", meetCopyLink(url), "\u2014", "\u2014", "\u2014"]);
   }
   // Any OTHER controlled identity beyond host/companion (e.g. a future
   // CLIENT/GUEST sharing this driver) still gets listed, in whatever order
@@ -2328,6 +2675,9 @@ function meetScrollSection(clearKey, label) {
 }
 
 function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, debugRows, bridgeOnline, emitCount, hostProfile, meetingState, recipients) {
+  const known = new Set(state.meetKnownUrls);
+  groups.forEach(({ url }) => { if (url && url !== "(unknown meeting)") known.add(url); });
+  state.meetKnownUrls = [...known];
   groups = groups.filter(({ kind }) => getMeetKindFilter(kind || "driver"));
   const priorOpen = new Map();
   container.querySelectorAll(".meet-tree-meeting").forEach((d) => {
@@ -2369,6 +2719,14 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     });
     connectBtn.title = "Connect the live driver to this meeting (same action as the Connector agents row buttons).";
     summary.appendChild(connectBtn);
+    const accountsBtn = actionButton("Accounts", "mini", (e) => {
+      e.stopPropagation();
+      state.meetAssignmentScope = url;
+      loadMeetRoleAssignments();
+      $("meet-role-settings").scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    accountsBtn.title = "Set HOST and COMPANION account overrides for this meeting.";
+    summary.appendChild(accountsBtn);
     meeting.appendChild(summary);
 
     const us = meetUsRows(isCurrent, clients, url, hostProfile, (meetingState || {})[meetRoomId(url)], kind);
@@ -2539,7 +2897,7 @@ async function loadMeet() {
     state.meetCaptureListening = false;
   }
   try {
-    health = await api(`${MEET_BRIDGE_BASE}/health`);
+    health = await api(`${MEET_BRIDGE_BASE}/status`);
   } catch (error) {
     statusLine.textContent = `bridge offline (${error.message}) — start it from the Processes page or ` +
       `run "ws-collab-meet-bridge" (or "python -m ws_collab.meet_bridge")`;
@@ -2629,9 +2987,9 @@ function meetPollOnce() {
   });
 }
 
-function loadMeetWithPolling() {
+async function loadMeetWithPolling() {
   if (meetPolling) return;
-  loadMeetRoleAssignments();
+  await loadMeetRoleAssignments();
   meetPolling = true;
   meetPollOnce();
 }
@@ -2680,7 +3038,7 @@ function mbAppendCaptions(rows) {
 
 function mbPollOnce() {
   const dot = $("meetbridge-nav-dot");
-  api(`${MEET_BRIDGE_BASE}/health`).then((health) => {
+  api(`${MEET_BRIDGE_BASE}/status`).then((health) => {
     if (dot) { dot.classList.toggle("ok", !!health.ok); dot.classList.toggle("danger", !health.ok); }
     $("mb-status-line").textContent = health.meetingUrl ? `bridge online — ${health.meetingUrl}` : "bridge online — no meeting";
     mbRenderCard(health, false);
@@ -3662,6 +4020,7 @@ async function boot() {
   }
   initViews();
   wireEvents();
+  installPageStatePersistence();
   connectWs();
   setTimeout(() => { if (!state.wsReady) startRestFallback(); }, 2500);
   await backfill(TRANSCRIPT_STREAMS, state.views.transcript);

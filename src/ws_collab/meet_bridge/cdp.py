@@ -371,6 +371,51 @@ def browser_profile_root(cdp_endpoint: str, *, timeout: float = 3.0) -> Path | N
     return None
 
 
+def find_sso_tab(cdp_endpoint: str, email: str) -> dict[str, Any] | None:
+    """Find an existing page for an account without creating or focusing one."""
+    wanted_email = str(email or "").strip().lower()
+    if not wanted_email:
+        return None
+    for info in list_tabs(cdp_endpoint):
+        if info.get("type") != "page" or not info.get("webSocketDebuggerUrl"):
+            continue
+        tab = CdpTab(info["webSocketDebuggerUrl"])
+        try:
+            account = read_google_account(tab)
+            if str((account or {}).get("email") or "").strip().lower() != wanted_email:
+                continue
+            return {
+                "id": info.get("id"),
+                "title": info.get("title"),
+                "url": info.get("url"),
+                "email": wanted_email,
+            }
+        except Exception:
+            continue
+        finally:
+            tab.close()
+    return None
+
+
+def foreground_sso_tab(cdp_endpoint: str, email: str) -> dict[str, Any] | None:
+    """Foreground an existing account page without creating a tab."""
+    found = find_sso_tab(cdp_endpoint, email)
+    if found is None:
+        return None
+    info = next(
+        (tab for tab in list_tabs(cdp_endpoint) if str(tab.get("id") or "") == str(found.get("id") or "")),
+        None,
+    )
+    if not info or not info.get("webSocketDebuggerUrl"):
+        return None
+    tab = CdpTab(info["webSocketDebuggerUrl"])
+    try:
+        tab.bring_to_front()
+    finally:
+        tab.close()
+    return found
+
+
 def launch_browser(args: Any) -> tuple[str, subprocess.Popen[bytes] | None]:
     """Pop up the bridge's own browser so the operator can pick their Google
     account (SSO); returns the CDP endpoint once it is answering."""
