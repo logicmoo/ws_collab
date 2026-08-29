@@ -94,6 +94,7 @@ from .cdp import (
     cdp_alive,
     close_tab,
     companion_profile_path,
+    ensure_default_profile_migrated,
     find_browser,
     find_meet_tab,
     launch_browser,
@@ -153,6 +154,7 @@ def message_text(message: dict[str, Any]) -> str:
 
 
 def main() -> None:
+    migrated_default = ensure_default_profile_migrated()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--cdp", default=os.environ.get("MEET_BRIDGE_CDP", DEFAULT_CDP), help="Chrome DevTools endpoint for attach mode (default %(default)s)")
     parser.add_argument("--meet", default=None, help="Google Meet URL -- pops up the bridge's own browser for SSO sign-in and joins there")
@@ -167,7 +169,7 @@ def main() -> None:
     parser.add_argument("--browser", default=None, help="Path to chrome.exe/msedge.exe for the popup (auto-detected)")
     parser.add_argument("--browser-backend", choices=["windows", "wsl"], default=os.environ.get("MEET_BRIDGE_BROWSER_BACKEND", "windows"), help="How to host the Chrome window(s): 'windows' (default, a normal visible window) or 'wsl' (runs inside WSL2 under a real Xvfb virtual display -- genuinely invisible on the Windows desktop, not just off-screen)")
     parser.add_argument("--wsl-distro", default=os.environ.get("MEET_BRIDGE_WSL_DISTRO"), help="WSL distro name for --browser-backend wsl (default: first distro from `wsl -l -q`)")
-    parser.add_argument("--profile", default=str(DEFAULT_PROFILE), help="Persistent profile dir for the popup browser (keeps your SSO login; default %(default)s)")
+    parser.add_argument("--profile", default=str(migrated_default), help="Persistent profile dir for the popup browser (keeps your SSO login; default %(default)s)")
     parser.add_argument("--port", type=int, default=9223, help="DevTools port for the popup browser (default %(default)s)")
     parser.add_argument("--forget-sso", action="store_true", help="Wipe the popup browser's stored Google login (profile dir) and exit -- use when the SSO session expired or to switch accounts")
     parser.add_argument("--list-tabs", action="store_true", help="List CDP tabs and exit")

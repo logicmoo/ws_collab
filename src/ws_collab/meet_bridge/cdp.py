@@ -24,12 +24,11 @@ from typing import Any
 from websocket import create_connection  # websocket-client
 
 DEFAULT_CDP = "http://127.0.0.1:9222"
-# Reuses the same on-disk cache root ws_collab already uses for downloaded STT
-# models, so all of ws_collab's larger local state lives under one directory
-# by default. Override with WS_COLLAB_MEET_PROFILE_DIR.
+_PLUGIN_ROOT = Path(__file__).resolve().parents[3]
+_OLD_DEFAULT_PROFILE = Path.home() / ".cache" / "ws_collab_models" / "meet_bridge_profile"
 DEFAULT_PROFILE = Path(
     os.environ.get("WS_COLLAB_MEET_PROFILE_DIR")
-    or (Path.home() / ".cache" / "ws_collab_models" / "meet_bridge_profile")
+    or (_PLUGIN_ROOT / "collab_state" / "meet_bridge_profile")
 )
 
 BROWSER_CANDIDATES = [
@@ -90,6 +89,25 @@ def _find_wsl_browser(distro: str) -> str:
 
 def companion_profile_path(profile: Path) -> Path:
     return profile.with_name(profile.name + "_companion")
+
+
+def ensure_default_profile_migrated(profile: Path | None = None) -> Path:
+    target = Path(profile or DEFAULT_PROFILE).expanduser()
+    if os.environ.get("WS_COLLAB_MEET_PROFILE_DIR"):
+        return target
+    old = _OLD_DEFAULT_PROFILE.expanduser()
+    if target.exists() or not old.exists():
+        return target
+    try:
+        shutil.copytree(old, target)
+        old_companion = companion_profile_path(old)
+        target_companion = companion_profile_path(target)
+        if old_companion.exists() and not target_companion.exists():
+            shutil.copytree(old_companion, target_companion)
+        print(f"[bridge] migrated existing Chrome profile from {old} to {target}")
+    except Exception:
+        pass
+    return target
 
 
 def build_launch(
