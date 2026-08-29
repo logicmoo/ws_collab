@@ -111,6 +111,16 @@ def build_launch(
             "--no-first-run",
             "--no-default-browser-check",
             "--use-fake-ui-for-media-stream",
+            # This process gets terminated abruptly (Stop-Process/taskkill,
+            # not a normal window close) whenever the bridge itself is
+            # restarted or an operator hits Disconnect/Kill-process -- that
+            # marks the profile's exit_type as "Crashed", and the NEXT
+            # launch of that same profile pops a "Restore pages?" bubble
+            # that covers part of the Meet UI (annoying, and it's chrome's
+            # own native UI, not something CDP Runtime.evaluate can see or
+            # dismiss). Suppress it outright rather than treating every
+            # planned restart as if it were an unexpected crash.
+            "--disable-session-crashed-bubble",
             *extra_args,
             url,
         ]
@@ -129,6 +139,7 @@ def build_launch(
         "--no-default-browser-check",
         "--use-fake-ui-for-media-stream",
         "--no-sandbox",
+        "--disable-session-crashed-bubble",
         *extra_args,
         url,
     ]
