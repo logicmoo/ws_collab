@@ -160,6 +160,7 @@ def main() -> None:
     parser.add_argument("--attach-only", action="store_true", help="Never pop a browser: only attach to an existing meet tab on --cdp")
     parser.add_argument("--companion", action="store_true", help="ALSO keep a second signed-in account (own SSO profile, one-time sign-in) sitting MUTED in the meeting so Google sees 2 participants and won't end/nag the servant meeting.")
     parser.add_argument("--companion-port", type=int, default=None, help="DevTools port for the companion browser (default --port + 1)")
+    parser.add_argument("--companion-listen-device", default="", help="When set, leave companion incoming audio audible so the operator can route that browser's output to a virtual cable for secondary STT capture.")
     parser.add_argument("--status-port", type=int, default=48699, help="Local health/status HTTP port -- what ws_collab's google_meet STT driver and admin UI read (0 disables; default %(default)s)")
     parser.add_argument("--self-name", default="You", help="Name captions attribute to the bridge account's own mic (Meet shows 'You'; default %(default)s)")
     parser.add_argument("--no-autojoin", action="store_true", help="Do not auto-click Join/mic/captions -- drive the Meet window manually")
@@ -666,7 +667,11 @@ def main() -> None:
                     " : 'elsewhere'"))
                 if state == "in-call" and not operator_joined:
                     operator_joined = True
-                    log("[companion] you're in -- taking over: staying muted, deaf, and present.", role="companion")
+                    log(
+                        "[companion] you're in -- taking over: "
+                        + ("incoming audio intentionally left audible for companion-listen-device capture." if args.companion_listen_device else "staying muted, deaf, and present."),
+                        role="companion",
+                    )
                 if state == "signin" and not operator_joined:
                     if not told_waiting:
                         told_waiting = True
@@ -720,10 +725,10 @@ def main() -> None:
                     verdict = companion_tab.evaluate(autojoin_js("muted"))
                     if verdict in ("join-clicked", "stayed-in-call", "muted", "admitted"):
                         log(f"[companion] {verdict}", role="companion")
-                # The companion is deaf as well as mute: silence every media
-                # element so its tab never replays the meeting into the room
-                # (the live mic would re-capture it as an echo). Always on.
-                companion_tab.evaluate('document.querySelectorAll("audio,video").forEach((m) => { m.muted = true; m.volume = 0; })')
+                if args.companion_listen_device:
+                    companion_tab.evaluate('document.querySelectorAll("audio,video").forEach((m) => { m.muted = false; m.volume = 1; })')
+                else:
+                    companion_tab.evaluate('document.querySelectorAll("audio,video").forEach((m) => { m.muted = true; m.volume = 0; })')
             except Exception as error:  # noqa: BLE001
                 companion_tab = None
                 holder["companion_tab"] = None

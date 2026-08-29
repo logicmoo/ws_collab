@@ -591,6 +591,21 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         await _require(request, "operator", mutating=True)
         return guarded(service.stop_capture)
 
+    @router.get(f"{mount}/audio/secondary-capture")
+    async def secondary_capture_state(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return service.secondary_capture_state()
+
+    @router.post(f"{mount}/audio/secondary-capture/start")
+    async def secondary_capture_start(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.start_secondary_capture, body.get("device_id", ""))
+
+    @router.post(f"{mount}/audio/secondary-capture/stop")
+    async def secondary_capture_stop(request: Request) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.stop_secondary_capture)
+
     @router.post(f"{mount}/audio/echo-policy")
     async def set_echo_policy(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)

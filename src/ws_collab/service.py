@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .audio.capture import CaptureService
+from .audio.secondary_capture import SecondaryCaptureService
 from .audio.devices import DeviceRegistry
 from .audio.routing import RoutingManager
 from .audio.segment import AudioSegment
@@ -161,6 +162,7 @@ class WsCollabService:
         self.capture = CaptureService(
             config, self.devices, self.publish, self.process_segment, is_tts_speaking=lambda: self.tts.is_speaking
         )
+        self.secondary_capture = SecondaryCaptureService(config, self.devices, self.publish, self.process_segment)
         # Restore the operator's persisted capture-device choice so a restart
         # resumes on the same input instead of the config/system default.
         saved_capture_device = self.sound_settings.get("capture_device")
@@ -2517,6 +2519,15 @@ class WsCollabService:
 
     def capture_state(self) -> dict[str, Any]:
         return self.capture.state()
+
+    def start_secondary_capture(self, device_id: str) -> dict[str, Any]:
+        return self.secondary_capture.start(device_id=device_id)
+
+    def stop_secondary_capture(self) -> dict[str, Any]:
+        return self.secondary_capture.stop()
+
+    def secondary_capture_state(self) -> dict[str, Any]:
+        return self.secondary_capture.state()
 
     def set_echo_policy(self, policy: str) -> dict[str, Any]:
         """Change how captured audio is reconciled against our own TTS, live.

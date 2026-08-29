@@ -104,6 +104,13 @@ function adoptStreams(capabilities) {
   populateStreamMenu();
 }
 
+function ssoLabel(profile, account) {
+  if (account && account.signedIn && account.email) return account.email;
+  if (!profile) return "\u2014";
+  if (typeof profile === "string") return profile;
+  return profile.label || (profile.known === false ? "unknown" : "\u2014");
+}
+
 /* The "JSONL Streams" nav item expands into one entry per durable stream, each
  * showing its entry count and going bold when it has unread events. */
 function populateStreamMenu() {
@@ -1323,8 +1330,8 @@ function groupDevicesByIdentity(rows) {
 
 async function loadDevices() {
   try {
-    const [devices, capture, routing] = await Promise.all([
-      api(`${V1}/audio/devices`), api(`${V1}/audio/capture`), api(`${V1}/audio/routing`),
+    const [devices, capture, routing, secondary] = await Promise.all([
+      api(`${V1}/audio/devices`), api(`${V1}/audio/capture`), api(`${V1}/audio/routing`), api(`${V1}/audio/secondary-capture`),
     ]);
 
     const capPanel = panel("Capture state");
@@ -1342,6 +1349,37 @@ async function loadDevices() {
       error: capture.error || "—",
     }));
     $("dv-capture").replaceChildren(capPanel.root);
+
+    const secondaryPanel = panel("Secondary capture — Meet companion incoming audio");
+    const secondaryControls = el("div", "toolbar");
+    const captureDevicesForSecondary = (devices.devices || []).filter((d) => ["input", "loopback", "virtual"].includes(d.direction) && d.available);
+    const secondarySelect = el("select");
+    captureDevicesForSecondary.forEach((d) => secondarySelect.appendChild(new Option(`${d.name} · ${d.host_api} [${d.direction}]`, d.id)));
+    if (secondary.device_id) secondarySelect.value = secondary.device_id;
+    secondaryControls.append(
+      secondarySelect,
+      actionButton("Start secondary capture", "", async () => {
+        try { await api(`${V1}/audio/secondary-capture/start`, { method: "POST", body: { device_id: secondarySelect.value } }); } catch (error) { pushError(error.message); }
+        loadDevices();
+      }),
+      actionButton("Stop secondary capture", "", async () => {
+        try { await api(`${V1}/audio/secondary-capture/stop`, { method: "POST", body: {} }); } catch (error) { pushError(error.message); }
+        loadDevices();
+      }),
+    );
+    secondaryPanel.content.append(secondaryControls, kv({
+      listening: secondary.listening,
+      device: secondary.device_name || secondary.device_id || "—",
+      backend: secondary.backend,
+      live_capture: secondary.live_capture,
+      meter: secondary.meter_level,
+      peak: secondary.peak_level,
+      clipping: secondary.clipping,
+      captured: secondary.captured,
+      dropped_frames: secondary.dropped_frames,
+      error: secondary.error || "—",
+    }));
+    $("dv-secondary-capture").replaceChildren(secondaryPanel.root);
 
     const all = devices.devices || [];
     const decorated = all.map((d) => {
@@ -1651,7 +1689,7 @@ async function loadMeetSso() {
         (profile.role || "—").toUpperCase(),
         profile.path || "—",
         badge(profile.exists ? "yes" : "no", profile.exists ? "ok" : "warn"),
-        profile.account || "unknown -- no live window to check",
+        ssoLabel({ label: profile.path }, { signedIn: !!(profile.account && profile.account.includes("@")), email: profile.account && profile.account.includes("@") ? profile.account : null }),
         actions,
       ];
     });
@@ -1732,7 +1770,7 @@ async function loadBrowserSettings() {
         (row.role || "—").toUpperCase(),
         row.path || "—",
         badge(row.exists ? "yes" : "no", row.exists ? "ok" : "warn"),
-        row.account || "unknown -- no live window to check",
+        row.account || row.path || "unknown -- no live window to check",
       ]),
     );
     paintPreview();
@@ -1820,15 +1858,9 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
     );
     return wrap;
   };
-  // hostProfile arrives as {path, known, label}; a client's own .profile is
-  // just a plain path string (or absent) — accept either shape uniformly.
-  const ssoLabel = (profile) => {
-    if (!profile) return "\u2014";
-    if (typeof profile === "string") return profile;
-    return profile.label || (profile.known === false ? "unknown" : "\u2014");
-  };
   const ssoLink = (profile) => {
-    const link = el("a", null, ssoLabel(profile));
+    const account = typeof profile === "object" ? profile.account : null;
+    const link = el("a", null, ssoLabel(profile, account));
     link.href = "#sso";
     return link;
   };
@@ -1854,7 +1886,7 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
   const rows = [["HOST", ssoLink(hostProfile), "in-call", meetCopyLink(url), meetDevicesLink(), meetDevicesLink(), actionsFor("host")]];
   const companion = (clients || []).find((c) => c.role === "companion");
   if (companion) {
-    rows.push(["COMPANION", ssoLink(companion.profile), companion.state || "\u2014", meetCopyLink(url), companion.mic || "\u2014", companion.speak || "\u2014", actionsFor("companion")]);
+    rows.push(["COMPANION", ssoLink({ label: companion.profile, account: companion.account }), companion.state || "\u2014", meetCopyLink(url), companion.mic || "\u2014", companion.speak || "\u2014", actionsFor("companion")]);
   } else {
     rows.push(["COMPANION", "\u2014", "not armed (no --companion)", meetCopyLink(url), "\u2014", "\u2014", "\u2014"]);
   }
@@ -1864,7 +1896,7 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
   // "not implemented yet" server-side until that identity is real, rather
   // than silently no-op-ing or erroring obscurely.
   (clients || []).filter((c) => c.role !== "companion").forEach((c) => rows.push([
-    (c.role || "").toUpperCase(), ssoLink(c.profile), c.state || "\u2014", meetCopyLink(url), c.mic || "\u2014", c.speak || "\u2014", actionsFor(c.role),
+    (c.role || "").toUpperCase(), ssoLink({ label: c.profile, account: c.account }), c.state || "\u2014", meetCopyLink(url), c.mic || "\u2014", c.speak || "\u2014", actionsFor(c.role),
   ]));
   return { rows, note: null };
 }
