@@ -54,9 +54,13 @@ const DEFAULT_DRIVER_MEETING_URLS = window.WS_COLLAB_DEFAULT_MEET_URLS || [
 /* Meetings the bridge would just JOIN AS A GUEST (no host+companion
  * relay-in pair of its own) — CLIENT/GUEST mode, documented in
  * docs/GOOGLE_MEET_BRIDGE.md as "designed but not built" server-side.
- * Empty by default (nothing to show until the operator configures one).
+ * Listed here so the operator's intended client meeting stays visible as a
+ * placeholder (an honest "not implemented yet" GUEST_CLIENT row) even
+ * though joining it for real isn't wired up server-side yet.
  * Override with `WS_COLLAB_CLIENT_MEET_URLS` (array). */
-const DEFAULT_CLIENT_MEETING_URLS = window.WS_COLLAB_CLIENT_MEET_URLS || [];
+const DEFAULT_CLIENT_MEETING_URLS = window.WS_COLLAB_CLIENT_MEET_URLS || [
+  "https://meet.google.com/qmj-bkbk-mik",
+];
 
 const state = {
   token: sessionStorage.getItem("ws_collab_token") || "",
