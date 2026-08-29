@@ -1757,7 +1757,7 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
       ? "Not the current meeting — SSO/state is the last known snapshot from when the bridge was last here; Join re-attaches the live driver. This driver slot is also available to relay a different real-world audio source into a Meet room here instead — a Discord Voice Channel, Zoom call, or plain audio call, for example — but that is not built yet; every driver today only probes this machine's Physical Computer mic/speakers."
       : "Not the current meeting — never seen live yet, so no snapshot exists; Join attaches the live driver here. This driver slot is also available to relay a different real-world audio source into a Meet room here instead — a Discord Voice Channel, Zoom call, or plain audio call, for example — but that is not built yet; every driver today only probes this machine's Physical Computer mic/speakers." };
   }
-  const rows = [["HOST", ssoLink(hostProfile), "in-call", meetCopyLink(url), "real microphone (untouched)", "real speakers (untouched)", actionsFor("host")]];
+  const rows = [["HOST", ssoLink(hostProfile), "in-call", meetCopyLink(url), meetDevicesLink(), meetDevicesLink(), actionsFor("host")]];
   const companion = (clients || []).find((c) => c.role === "companion");
   if (companion) {
     rows.push(["COMPANION", ssoLink(companion.profile), companion.state || "\u2014", meetCopyLink(url), companion.mic || "\u2014", companion.speak || "\u2014", actionsFor("companion")]);
@@ -1976,6 +1976,12 @@ function meetCopyLink(url) {
   return link;
 }
 
+function meetDevicesLink() {
+  const link = el("a", null, "COMPUTER");
+  link.href = "#devices";
+  return link;
+}
+
 /* One streaming section: a small toolbar (Clear + an Autoscroll on/off
  * toggle, default ON per the operator's request) above a fixed-height
  * (~10 rows) scrollable box the operator can still drag taller (native CSS
@@ -2072,7 +2078,7 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     link.href = url; link.target = "_blank"; link.rel = "noopener";
     link.onclick = (e) => e.stopPropagation();
     summary.appendChild(link);
-    summary.appendChild(mono(isCurrent ? (isClient ? "  · current" : "  · (PHYSICAL COMPUTER)") : "  · (AVAILABLE)"));
+    summary.appendChild(mono(isCurrent ? (isClient ? "  · current" : "  · (COMPUTER)") : "  · (AVAILABLE)"));
     summary.appendChild(badge(isClient ? "CLIENT" : "DRIVER", isClient ? "warn" : ""));
     summary.appendChild(badge(probeLocation(isCurrent, bridgeOnline), isCurrent && bridgeOnline ? "ok" : ""));
     summary.appendChild(document.createTextNode(" "));
