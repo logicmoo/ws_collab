@@ -2053,6 +2053,25 @@ function applyMeetRowCount(label) {
  * durable preference the way the autoscroll toggle is. */
 const meetClearedAt = new Map();
 function meetClearCutoff(key) { return meetClearedAt.get(key) || 0; }
+const MEET_SCROLL_LABELS = ["Emit", "Phrases", "Transcribe"];
+
+function clearAllMeetSections() {
+  const now = Date.now() / 1000;
+  document.querySelectorAll(".meet-tree-meeting[data-url]").forEach((meeting) => {
+    const url = meeting.dataset.url;
+    if (!url) return;
+    MEET_SCROLL_LABELS.forEach((label) => meetClearedAt.set(`${url}::${label}`, now));
+  });
+  loadMeet();
+}
+
+function setAllMeetRowCounts(value) {
+  const rows = Math.max(2, parseInt(value, 10) || 10);
+  MEET_SCROLL_LABELS.forEach((label) => {
+    setMeetRowCount(label, rows);
+    applyMeetRowCount(label);
+  });
+}
 
 function meetCopyLink(url) {
   const room = meetRoomId(url) || url;
@@ -3352,6 +3371,13 @@ function wireEvents() {
     .forEach((btn) => wireCatFilter(btn, loadDevices));
   $("dv-search").addEventListener("input", loadDevices);
   $("meet-refresh").onclick = loadMeet;
+  $("meet-clear-all").onclick = clearAllMeetSections;
+  $("meet-exact-all").onchange = () => {
+    const input = $("meet-exact-all");
+    const rows = Math.max(2, parseInt(input.value, 10) || 10);
+    input.value = String(rows);
+    setAllMeetRowCounts(rows);
+  };
   $("meet-join-btn").onclick = () => {
     const url = $("meet-join-url").value.trim();
     if (!url) { pushError("Enter a meeting URL to join."); return; }
