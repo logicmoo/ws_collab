@@ -793,12 +793,19 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             body.get("browser_backend", "windows"),
             bool(body.get("shared_window", False)),
             body.get("profile_path", ""),
+            body.get("profile_mode", "separate"),
+            body.get("role_account_map"),
         )
 
     @router.post(f"{mount}/meet/sso/open")
     async def meet_sso_open(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
-        return guarded(service.open_meet_sso_profile, body.get("role", ""))
+        return guarded(
+            service.open_meet_sso_profile,
+            body.get("role", ""),
+            body.get("account_id", ""),
+            bool(body.get("add_account", False)),
+        )
 
     @router.post(f"{mount}/meet/sso/forget")
     async def meet_sso_forget(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:

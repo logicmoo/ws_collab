@@ -78,6 +78,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .audio_out import (
     list_audio_devices,
@@ -123,11 +124,61 @@ DEFAULT_OUTBOX = "google-meet"
 # HOST+COMPANION driver/servant meeting or (once built) a CLIENT/GUEST
 # meeting the bridge just sits in: both are keyed the same way, uniformly.
 _ROOM_RE = re.compile(r"meet\.google\.com/([a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4})", re.IGNORECASE)
+SHARED_ROLE_ORDER = ("host", "companion", "guest")
 
 
 def room_id(url: str | None) -> str | None:
     match = _ROOM_RE.search(url or "")
     return match.group(1).lower() if match else None
+
+
+def _default_authuser_for_role(role: str) -> int | None:
+    role = str(role or "").strip().lower()
+    try:
+        return SHARED_ROLE_ORDER.index(role)
+    except ValueError:
+        return None
+
+
+def parse_role_authusers(values: list[str] | None) -> dict[str, int]:
+    resolved: dict[str, int] = {}
+    for raw in values or []:
+        text = str(raw or "").strip()
+        if "=" not in text:
+            raise SystemExit(f"--role-authuser expects ROLE=N, got: {text!r}")
+        role, authuser_text = text.split("=", 1)
+        role_name = role.strip().lower()
+        if not role_name:
+            raise SystemExit(f"--role-authuser expects ROLE=N, got: {text!r}")
+        try:
+            authuser = int(authuser_text)
+        except ValueError as error:
+            raise SystemExit(f"--role-authuser expects a non-negative integer authuser, got: {text!r}") from error
+        if authuser < 0:
+            raise SystemExit(f"--role-authuser expects a non-negative integer authuser, got: {text!r}")
+        resolved[role_name] = authuser
+    return resolved
+
+
+def authuser_from_url(url: str | None) -> int | None:
+    try:
+        params = dict(parse_qsl(urlsplit(str(url or "")).query, keep_blank_values=True))
+    except Exception:
+        return None
+    try:
+        value = params.get("authuser")
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def with_authuser(url: str, authuser: int | None) -> str:
+    if authuser is None:
+        return url
+    parts = urlsplit(url)
+    params = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "authuser"]
+    params.append(("authuser", str(authuser)))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(params), parts.fragment))
 
 
 def _terminate_process(process: subprocess.Popen[Any] | None) -> bool:
@@ -170,7 +221,9 @@ def main() -> None:
     parser.add_argument("--browser-backend", choices=["windows", "wsl"], default=os.environ.get("MEET_BRIDGE_BROWSER_BACKEND", "windows"), help="How to host the Chrome window(s): 'windows' (default, a normal visible window) or 'wsl' (runs inside WSL2 under a real Xvfb virtual display -- genuinely invisible on the Windows desktop, not just off-screen)")
     parser.add_argument("--wsl-distro", default=os.environ.get("MEET_BRIDGE_WSL_DISTRO"), help="WSL distro name for --browser-backend wsl (default: first distro from `wsl -l -q`)")
     parser.add_argument("--profile", default=str(migrated_default), help="Persistent profile dir for the popup browser (keeps your SSO login; default %(default)s)")
+    parser.add_argument("--profile-mode", choices=["shared", "separate"], default="separate", help="Browser/profile topology: 'separate' (default, distinct HOST and COMPANION profiles/processes) or 'shared' (one shared Chrome profile/process with one Meet tab per authuser role)")
     parser.add_argument("--port", type=int, default=9223, help="DevTools port for the popup browser (default %(default)s)")
+    parser.add_argument("--role-authuser", action="append", default=None, help="Shared-profile only: map a role to an authuser slot, e.g. --role-authuser host=0 --role-authuser companion=1 (future guest/client slots can be added the same way)")
     parser.add_argument("--forget-sso", action="store_true", help="Wipe the popup browser's stored Google login (profile dir) and exit -- use when the SSO session expired or to switch accounts")
     parser.add_argument("--list-tabs", action="store_true", help="List CDP tabs and exit")
     parser.add_argument("--mailbox-base", default=os.environ.get("WS_COLLAB_MAILBOX_BASE", DEFAULT_MAILBOX_BASE), help="ws_collab REST base URL for mailbox IN/OUT (default %(default)s)")
@@ -186,6 +239,72 @@ def main() -> None:
     parser.add_argument("--tts-output-device", default=os.environ.get("MEET_BRIDGE_TTS_OUTPUT_DEVICE"), help="Name (substring) of a real playback device to route /say speech to, e.g. a virtual cable's 'Input' side -- omit to keep using the in-page WebAudio synthetic mic (env MEET_BRIDGE_TTS_OUTPUT_DEVICE)")
     parser.add_argument("--mic-select-device", default=os.environ.get("MEET_BRIDGE_MIC_SELECT_DEVICE"), help="Name (substring) of the device Meet's own Audio Settings mic dropdown should select, e.g. a virtual cable's 'Output' side -- omit to leave Meet's mic selection alone (env MEET_BRIDGE_MIC_SELECT_DEVICE)")
     args = parser.parse_args()
+    args.role_authusers = parse_role_authusers(args.role_authuser)
+    shared_profile_mode = args.profile_mode == "shared"
+
+    def role_authuser(role: str) -> int | None:
+        wanted = str(role or "").strip().lower()
+        if not shared_profile_mode:
+            return None
+        return args.role_authusers.get(wanted, _default_authuser_for_role(wanted))
+
+    def role_target_url(url: str, role: str) -> str:
+        return with_authuser(url, role_authuser(role)) if shared_profile_mode else url
+
+    def find_controlled_meet_tab(
+        cdp: str,
+        role: str = "host",
+        *,
+        require_room: bool = False,
+        wanted_room: str | None = None,
+        exclude_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        target_room = room_id(wanted_room)
+        for tab in list_tabs(cdp):
+            url = str(tab.get("url") or "")
+            if tab.get("type") != "page" or "meet.google.com" not in url:
+                continue
+            if exclude_id and str(tab.get("id") or "") == str(exclude_id):
+                continue
+            if require_room and room_id(url) is None:
+                continue
+            if target_room and room_id(url) != target_room:
+                continue
+            if shared_profile_mode:
+                wanted_authuser = role_authuser(role)
+                if wanted_authuser is not None and authuser_from_url(url) != wanted_authuser:
+                    continue
+            return tab
+        return None
+
+    def wait_for_controlled_meet_tab(
+        cdp: str,
+        role: str = "host",
+        *,
+        timeout: float = 900.0,
+        require_room: bool = False,
+        wanted_room: str | None = None,
+    ) -> dict[str, Any]:
+        told = False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                tab = find_controlled_meet_tab(cdp, role, require_room=require_room, wanted_room=wanted_room)
+            except Exception:
+                tab = None
+            if tab:
+                return tab
+            if not told:
+                told = True
+                print("[bridge] waiting for a meet.google.com tab -- sign in and open the meeting in the popped-up window...")
+            time.sleep(1.5)
+        raise SystemExit("Timed out waiting for a Google Meet tab (15 min).")
+
+    if shared_profile_mode and args.companion:
+        host_authuser = role_authuser("host")
+        companion_authuser = role_authuser("companion")
+        if host_authuser is not None and companion_authuser is not None and host_authuser == companion_authuser:
+            raise SystemExit("--profile-mode shared requires distinct authuser slots for host and companion; override with --role-authuser")
 
     if args.list_audio_devices:
         list_audio_devices()
@@ -216,6 +335,10 @@ def main() -> None:
     # (persistent SSO profile). Default with no --meet/--new: reuse a meeting
     # tab if one is open, otherwise CREATE the servant meeting.
     cdp_endpoint = args.cdp
+    args.launch_url = role_target_url(
+        args.meet or ("https://meet.google.com/new" if args.new else "https://accounts.google.com/"),
+        "host",
+    )
     if not args.attach_only:
         cdp_endpoint, host_process = launch_browser(args)
     else:
@@ -232,7 +355,7 @@ def main() -> None:
 
     created_servant = False
     if args.attach_only:
-        tab_info = find_meet_tab(cdp_endpoint)
+        tab_info = find_controlled_meet_tab(cdp_endpoint, "host")
         if not tab_info:
             raise SystemExit(
                 f"No meet.google.com tab found via {cdp_endpoint}.\n"
@@ -240,15 +363,15 @@ def main() -> None:
                 "start Chrome with --remote-debugging-port=9222, join the Meet, then rerun."
             )
     else:
-        tab_info = find_meet_tab(cdp_endpoint)
+        tab_info = find_controlled_meet_tab(cdp_endpoint, "host")
         if args.new or not tab_info:
             if tab_info is None and not args.meet:
-                open_url(cdp_endpoint, "https://meet.google.com/new")
+                open_url(cdp_endpoint, role_target_url("https://meet.google.com/new", "host"))
                 created_servant = not args.new  # implicit servant meeting
-            tab_info = wait_for_meet_tab(cdp_endpoint, require_room=True)
+            tab_info = wait_for_controlled_meet_tab(cdp_endpoint, "host", require_room=True)
             created_servant = created_servant or args.new
         elif args.meet:
-            tab_info = wait_for_meet_tab(cdp_endpoint)
+            tab_info = wait_for_controlled_meet_tab(cdp_endpoint, "host")
 
     holder: dict[str, Any] = {"tab": CdpTab(tab_info["webSocketDebuggerUrl"]), "url": str(tab_info.get("url") or "").split("?")[0], "tab_id": tab_info.get("id")}
     meeting_url = str(tab_info.get("url") or "").split("?")[0]
@@ -328,6 +451,46 @@ def main() -> None:
     tracker = CaptionTracker(args.settle)
     stop = threading.Event()
 
+    def refresh_sso_accounts(force: bool = False) -> list[dict[str, Any]]:
+        if not shared_profile_mode:
+            holder["sso_accounts"] = []
+            return []
+        last_scan = float(holder.get("sso_accounts_scanned_at") or 0.0)
+        cached = holder.get("sso_accounts")
+        if not force and cached is not None and time.time() - last_scan < 10.0:
+            return list(cached)
+        accounts: list[dict[str, Any]] = []
+        authuser = 0
+        while not stop.is_set():
+            info = open_url(cdp_endpoint, with_authuser("https://accounts.google.com/", authuser))
+            if not info or not info.get("webSocketDebuggerUrl"):
+                break
+            probe = CdpTab(info["webSocketDebuggerUrl"])
+            try:
+                deadline = time.time() + 10.0
+                account = None
+                while time.time() < deadline and not stop.is_set():
+                    account = whoami(probe)
+                    if isinstance(account, dict):
+                        break
+                    time.sleep(0.3)
+                if not isinstance(account, dict) or not account.get("signedIn"):
+                    break
+                account_row = dict(account)
+                account_row["authuser"] = authuser
+                accounts.append(account_row)
+            finally:
+                try:
+                    probe.close()
+                except Exception:
+                    pass
+                if info.get("id"):
+                    close_tab(cdp_endpoint, str(info.get("id")))
+            authuser += 1
+        holder["sso_accounts"] = accounts
+        holder["sso_accounts_scanned_at"] = time.time()
+        return list(accounts)
+
     def _host_profile_info() -> dict[str, Any]:
         """Which Chrome profile dir (and therefore which persisted Google SSO
         login) the HOST tab is using."""
@@ -342,7 +505,7 @@ def main() -> None:
         account = holder.get("host_account") or whoami(holder.get("tab")) or {"label": "unknown -- no live window to check", "signedIn": False, "email": None}
         if holder.get("tab") is not None:
             holder["host_account"] = account
-        return {"path": path, "known": True, "label": path, "account": account}
+        return {"path": path, "known": True, "label": path, "account": account, "authuser": role_authuser("host")}
 
     # ---- STT-subsystem integration: /health + /captions for consumers ------
     # `captionCount` = distinct stored rows (add/edit collapses to one per
@@ -351,7 +514,19 @@ def main() -> None:
     holder["host_process"] = host_process
     holder["host_profile"] = str(Path(args.profile).expanduser()) if not args.attach_only else None
     holder["companion_process"] = None
-    status: dict[str, Any] = {"ok": True, "service": "ws_collab_meet_bridge", "meetingUrl": holder.get("url"), "lastCaptionAt": None, "captionCount": 0, "emitCount": 0, "outbox": args.outbox, "recipients": recipients, "hostProfile": _host_profile_info(), "browserBackend": args.browser_backend}
+    status: dict[str, Any] = {
+        "ok": True,
+        "service": "ws_collab_meet_bridge",
+        "meetingUrl": holder.get("url"),
+        "lastCaptionAt": None,
+        "captionCount": 0,
+        "emitCount": 0,
+        "outbox": args.outbox,
+        "recipients": recipients,
+        "hostProfile": _host_profile_info(),
+        "browserBackend": args.browser_backend,
+        "profileMode": args.profile_mode,
+    }
     captions_log: list[dict[str, Any]] = []  # ring buffer for the ws_collab STT driver
     captions_index: dict[str, int] = {}  # row key -> index into captions_log, for in-place ADD/EDIT
     captions_lock = threading.Lock()
@@ -391,6 +566,11 @@ def main() -> None:
         instead)."""
         clients: list[dict[str, Any]] = []
         if args.companion:
+            companion_account = holder.get("companion_account")
+            if holder.get("companion_tab") is not None:
+                companion_account = whoami(holder.get("companion_tab")) or companion_account
+                if companion_account:
+                    holder["companion_account"] = companion_account
             mic = args.mic_select_device or "(WebAudio synthetic mic patch)"
             if args.mic_select_device and not holder.get("companion_mic_confirmed"):
                 mic += " -- attempting, not yet confirmed by Meet"
@@ -405,7 +585,8 @@ def main() -> None:
                 # profile dir -- always known (the bridge always launches
                 # this one itself, no attach-only equivalent for companion).
                 "profile": holder.get("companion_profile"),
-                "account": holder.get("companion_account") or {"label": "unknown -- no live window to check", "signedIn": False, "email": None},
+                "account": companion_account or {"label": "unknown -- no live window to check", "signedIn": False, "email": None},
+                "authuser": role_authuser("companion"),
             })
         return clients
 
@@ -444,7 +625,7 @@ def main() -> None:
         host_proc = holder.get("host_process")
         if host_proc is not None or not args.attach_only:
             rows.append(_process_info("host", host_proc, port=args.port, profile=holder.get("host_profile"), backend=args.browser_backend))
-        if args.companion:
+        if args.companion and not shared_profile_mode:
             rows.append(_process_info(
                 "companion",
                 holder.get("companion_process"),
@@ -501,8 +682,14 @@ def main() -> None:
                     with debug_lock:
                         debug_rows = list(debug_log[-50:])
                     _snapshot_current_meeting_state()
+                    host_profile = _host_profile_info()
+                    status["hostProfile"] = host_profile
                     body = json.dumps({
-                        **status, "meetingUrl": holder.get("url"), "clients": _controlled_clients(),
+                        **status,
+                        "meetingUrl": holder.get("url"),
+                        "hostProfile": host_profile,
+                        "clients": _controlled_clients(),
+                        "ssoAccounts": refresh_sso_accounts(force=False),
                         "debug": debug_rows, "meetingState": meeting_state, "processes": _tracked_processes(),
                     }).encode("utf-8")
                 self.send_response(200)
@@ -578,9 +765,9 @@ def main() -> None:
     speech_lock = threading.Lock()
 
     def companion_loop() -> None:
-        companion_port = args.companion_port or (args.port + 1)
-        companion_cdp = f"http://127.0.0.1:{companion_port}"
-        companion_profile = companion_profile_path(Path(args.profile).expanduser())
+        companion_port = args.port if shared_profile_mode else (args.companion_port or (args.port + 1))
+        companion_cdp = cdp_endpoint if shared_profile_mode else f"http://127.0.0.1:{companion_port}"
+        companion_profile = Path(args.profile).expanduser() if shared_profile_mode else companion_profile_path(Path(args.profile).expanduser())
         # Stashed on `holder` (not just this closure's locals) so
         # _controlled_clients() (SSO/profile display) and disconnect_browsers()
         # (needs the tab id to hang up over CDP) can reach them from outside
@@ -608,6 +795,12 @@ def main() -> None:
                 continue
             try:
                 if not cdp_alive(companion_cdp):
+                    if shared_profile_mode:
+                        if not told_waiting:
+                            told_waiting = True
+                            print("[companion] waiting for the shared browser process to expose its DevTools port...")
+                        stop.wait(3)
+                        continue
                     companion_profile.mkdir(parents=True, exist_ok=True)
                     holder["companion_process"] = subprocess.Popen(
                         build_launch(
@@ -628,20 +821,29 @@ def main() -> None:
                     while time.time() < deadline and not cdp_alive(companion_cdp) and not stop.is_set():
                         time.sleep(0.5)
                     companion_tab = None
-                info = find_meet_tab(companion_cdp)
+                info = find_controlled_meet_tab(companion_cdp, "companion", wanted_room=target if operator_joined else None)
                 if not info:
+                    opened = None
                     if operator_joined:
                         # The meeting moved after the operator was established:
                         # following it IS wanted automation.
-                        open_url(companion_cdp, target)
+                        opened = open_url(companion_cdp, role_target_url(target, "companion"))
                         companion_tab = None
                         holder["companion_tab"] = None
                         holder["companion_tab_id"] = None
+                    elif shared_profile_mode:
+                        opened = open_url(companion_cdp, role_target_url(target, "companion"))
+                        if not told_waiting:
+                            told_waiting = True
+                            print("[companion] shared-profile tab opened -- sign in with the companion account if needed; I wait for the first in-call sighting before taking over.")
                     elif not told_waiting:
                         told_waiting = True
                         print("[companion] waiting for YOU to open/join the meeting in the second window (no automation)...")
-                    stop.wait(3)
-                    continue
+                    if opened and opened.get("webSocketDebuggerUrl"):
+                        info = opened
+                    else:
+                        stop.wait(3)
+                        continue
                 if companion_tab is None:
                     companion_tab = CdpTab(info["webSocketDebuggerUrl"])
                     holder["companion_tab"] = companion_tab
@@ -685,7 +887,7 @@ def main() -> None:
                     # sign-in page) but not looking at our room -- e.g. still
                     # on the post-leave-call home screen. Safe to steer there
                     # regardless of operator_joined: no OAuth flow to disturb.
-                    companion_tab.evaluate("location.href = %s" % json.dumps(target))
+                    companion_tab.evaluate("location.href = %s" % json.dumps(role_target_url(target, "companion")))
                     mic_ready = False
                     reloaded_for_mic = False
                     mic_selected = False
@@ -702,7 +904,7 @@ def main() -> None:
                     stop.wait(3)
                     continue
                 if operator_joined and target.split("?")[0] not in str(info.get("url") or ""):
-                    companion_tab.evaluate("location.href = %s" % json.dumps(target))
+                    companion_tab.evaluate("location.href = %s" % json.dumps(role_target_url(target, "companion")))
                     mic_ready = False
                     reloaded_for_mic = False
                     mic_selected = False
@@ -741,7 +943,14 @@ def main() -> None:
 
     if args.companion:
         threading.Thread(target=companion_loop, daemon=True).start()
-        print("[companion] armed: a muted second account will sit in the meeting so Google keeps it alive")
+        print(
+            "[companion] armed: "
+            + (
+                "a muted second authuser tab in the shared browser will sit in the meeting so Google keeps it alive"
+                if shared_profile_mode
+                else "a muted second account will sit in the meeting so Google keeps it alive"
+            )
+        )
 
     def say_into_meeting(text: str) -> None:
         """/say <text>: SAPI-speak through the companion's synthetic mic.
@@ -791,17 +1000,19 @@ def main() -> None:
     def switch_to(target_url: str | None) -> None:
         """Leave for another meeting: /join <url> or /new (fresh servant room)."""
         old_id = holder.get("tab_id")
-        open_url(cdp_endpoint, target_url or "https://meet.google.com/new")
-        room = re.compile(r"meet\.google\.com/[a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4}(\?|$|/)", re.IGNORECASE)
+        host_target = role_target_url(target_url or "https://meet.google.com/new", "host")
+        open_url(cdp_endpoint, host_target)
         deadline = time.time() + 600
         info = None
         while time.time() < deadline and not stop.is_set():
             try:
-                candidates = [entry for entry in list_tabs(cdp_endpoint)
-                              if entry.get("type") == "page"
-                              and "meet.google.com" in str(entry.get("url", ""))
-                              and entry.get("id") != old_id]
-                info = next((entry for entry in candidates if room.search(str(entry.get("url") or ""))), None)
+                info = find_controlled_meet_tab(
+                    cdp_endpoint,
+                    "host",
+                    require_room=True,
+                    exclude_id=str(old_id) if old_id else None,
+                    wanted_room=target_url,
+                )
             except Exception:
                 info = None
             if info:
@@ -881,9 +1092,19 @@ def main() -> None:
         wanted = (role or "").strip().lower() or None
         if wanted == "guest":
             return "sso failed: guest/client tabs are not implemented yet"
+        if wanted == "add-account":
+            info = open_url(cdp_endpoint, "https://accounts.google.com/AccountChooser?continue=https://accounts.google.com/")
+            if info and info.get("webSocketDebuggerUrl") and args.browser_backend != "wsl":
+                try:
+                    CdpTab(info["webSocketDebuggerUrl"]).bring_to_front()
+                except Exception:
+                    pass
+            refresh_sso_accounts(force=True)
+            log("[bridge] sso:add-account", role="bridge")
+            return "sso:add-account"
         if wanted not in ("host", "companion"):
             return f"sso failed: unknown role {wanted!r}"
-        target_url = "https://accounts.google.com/"
+        target_url = role_target_url("https://accounts.google.com/", wanted)
         if wanted == "host":
             tab = holder.get("tab")
             if tab is None:
@@ -895,11 +1116,19 @@ def main() -> None:
         else:
             tab = holder.get("companion_tab")
             if tab is None:
-                return "sso failed: companion has no live tab"
+                opened = open_url(cdp_endpoint if shared_profile_mode else holder.get("companion_cdp"), target_url)
+                if not (opened and opened.get("webSocketDebuggerUrl")):
+                    return "sso failed: companion has no live tab"
+                holder["companion_tab"] = CdpTab(opened["webSocketDebuggerUrl"])
+                holder["companion_tab_id"] = opened.get("id")
+                holder["companion_cdp"] = cdp_endpoint if shared_profile_mode else holder.get("companion_cdp")
+                holder["companion_profile"] = str(Path(args.profile).expanduser()) if shared_profile_mode else holder.get("companion_profile")
+                tab = holder["companion_tab"]
             try:
                 tab.evaluate(f"location.href = {json.dumps(target_url)}")
             except Exception as error:  # noqa: BLE001
                 return f"sso failed: companion navigation failed ({error})"
+        refresh_sso_accounts(force=True)
         focus_verdict = foreground_browsers(wanted)
         verdict = f"sso:{wanted}"
         if "failed:" in focus_verdict:
@@ -1027,6 +1256,11 @@ def main() -> None:
             parts = command.split(None, 1)
             role = parts[1].strip() if len(parts) > 1 else None
             return kill_process(role)
+        if lowered.startswith("/sso-scan"):
+            accounts = refresh_sso_accounts(force=True)
+            verdict = f"sso-scan:{len(accounts)}"
+            log(f"[bridge] {verdict}", role="bridge")
+            return verdict
         if lowered.startswith("/sso"):
             parts = command.split(None, 1)
             role = parts[1].strip() if len(parts) > 1 else None
@@ -1087,13 +1321,15 @@ def main() -> None:
             except Exception as error:  # noqa: BLE001
                 print(f"[bridge] tab lost ({error}); reattaching?", file=sys.stderr)
                 time.sleep(2.0)
-                info = find_meet_tab(cdp_endpoint)
+                info = find_controlled_meet_tab(cdp_endpoint, "host", wanted_room=holder.get("url"))
                 if info:
                     try:
                         tab.close()
                     except Exception:
                         pass
                     holder["tab"] = CdpTab(info["webSocketDebuggerUrl"])
+                    holder["tab_id"] = info.get("id")
+                    holder["url"] = str(info.get("url") or "").split("?")[0]
                     lost_since = None
                 elif not args.attach_only:
                     lost_since = lost_since or time.time()

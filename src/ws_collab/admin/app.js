@@ -1010,20 +1010,21 @@ function showPage(page) {
   state.page = page;
   document.querySelectorAll(".page").forEach((n) => n.classList.toggle("active", n.dataset.page === page));
   document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.page === page));
-  $("top-title").textContent = page.charAt(0).toUpperCase() + page.slice(1);
+  const pageTitles = { browser: "SSO / Browser" };
+  $("top-title").textContent = pageTitles[page] || (page.charAt(0).toUpperCase() + page.slice(1));
   // Keep the URL in sync so any page can be deep-linked and reloaded in place.
   if (location.hash.slice(1) !== page) history.replaceState(null, "", `#${page}`);
   const loaders = {
     workers: loadWorkers, alerts: loadAlerts, devices: loadDevices, voices: loadVoices,
     accuracy: loadAccuracy, cursors: loadCursors, prompt: loadPrompt, system: loadSystem,
-    meet: loadMeetWithPolling, stt: loadStt, meetbridge: loadMeetBridge, processes: loadProcesses, sso: loadSsoPage, browser: loadBrowserSettings,
+    meet: loadMeetWithPolling, stt: loadStt, meetbridge: loadMeetBridge, processes: loadProcesses, browser: loadBrowserSettings,
   };
   if (loaders[page]) loaders[page]();
   Object.values(state.views).forEach((v) => v.draw());
 }
 
 function pageFromHash() {
-  const requested = location.hash.slice(1);
+  const requested = location.hash.slice(1) === "sso" ? "browser" : location.hash.slice(1);
   return document.querySelector(`.nav-item[data-page="${requested}"]`) ? requested : "transcript";
 }
 
@@ -1651,52 +1652,20 @@ async function postMeetBridgeCommand(command) {
   loadMeetBridge();
 }
 
-function loadSsoPage() {
-  $("mb-sso-result").textContent = "";
-  loadMeetSso();
-}
-
 async function postMeetSso(path, body, confirmText) {
   if (confirmText && !confirm(confirmText)) return;
-  const resultEl = $("mb-sso-result");
-  resultEl.textContent = `${path} — sending…`;
+  const resultEl = $("br-result");
+  const label = body.add_account ? "add-account" : body.account_id || body.role || "profile";
+  resultEl.textContent = `${path} - sending...`;
   try {
     const result = await api(`${V1}${path}`, { method: "POST", body });
     resultEl.textContent = result.warning
-      ? `${body.role} → ok (${result.warning})`
-      : `${body.role} → ok`;
+      ? `${label} - ok (${result.warning})`
+      : `${label} - ok`;
   } catch (error) {
-    resultEl.textContent = `${body.role} → error: ${error.message}`;
+    resultEl.textContent = `${label} - error: ${error.message}`;
   }
-  loadMeetSso();
-}
-
-async function loadMeetSso() {
-  const body = $("mb-sso-body");
-  try {
-    const data = await api(`${V1}/meet/sso/profiles`);
-    const rows = (data.profiles || []).map((profile) => {
-      const actions = el("span", "meet-row-actions");
-      actions.append(
-        actionButton("Sign in / refresh", "mini", () => postMeetSso("/meet/sso/open", { role: profile.role })),
-        actionButton("Forget", "mini danger", () => postMeetSso(
-          "/meet/sso/forget",
-          { role: profile.role },
-          `Forget the saved Google sign-in profile for ${profile.role}? This deletes the profile directory on disk.`,
-        )),
-      );
-      return [
-        (profile.role || "—").toUpperCase(),
-        profile.path || "—",
-        badge(profile.exists ? "yes" : "no", profile.exists ? "ok" : "warn"),
-        ssoLabel({ label: profile.path }, { signedIn: !!(profile.account && profile.account.includes("@")), email: profile.account && profile.account.includes("@") ? profile.account : null }),
-        actions,
-      ];
-    });
-    body.replaceChildren(table(["Role", "Path", "Exists", "Account", "Actions"], rows));
-  } catch (error) {
-    body.replaceChildren(el("div", "hint", `error loading Meet SSO profiles: ${error.message}`));
-  }
+  loadBrowserSettings();
 }
 
 async function loadBrowserSettings() {
@@ -1704,9 +1673,15 @@ async function loadBrowserSettings() {
   const result = $("br-result");
   try {
     const data = await api(`${V1}/meet/browser-settings`);
+    const accounts = data.accounts || [];
+    const accountById = new Map(accounts.map((account) => [account.id, account]));
+    const sharedDefaults = { host: 0, companion: 1, guest: 2 };
     const backend = el("select");
     ["windows", "wsl"].forEach((value) => backend.appendChild(new Option(value, value)));
     backend.value = data.browser_backend || "windows";
+    const profileMode = el("select");
+    ["separate", "shared"].forEach((value) => profileMode.appendChild(new Option(value, value)));
+    profileMode.value = data.profile_mode || "separate";
     const shared = el("input");
     shared.type = "checkbox";
     shared.checked = !!data.shared_window;
@@ -1715,6 +1690,16 @@ async function loadBrowserSettings() {
     profile.style.width = "100%";
     profile.value = data.profile_path || "";
     const preview = el("div", "mono");
+    const roleSelections = {};
+    const settingsPanel = panel("Meet bridge next-launch preferences");
+    const separatePanel = panel("Separate-profile sign-in");
+    const sharedPanel = panel("Shared-profile Google accounts");
+    const previewPanel = panel("Next launch command preview");
+    const paintMode = () => {
+      const sharedMode = profileMode.value === "shared";
+      separatePanel.root.style.display = sharedMode ? "none" : "";
+      sharedPanel.root.style.display = sharedMode ? "" : "none";
+    };
     const paintPreview = () => {
       const cmd = [
         "ws-collab-meet-bridge",
@@ -1724,19 +1709,133 @@ async function loadBrowserSettings() {
         backend.value,
         "--companion",
       ];
+      if (profileMode.value === "shared") {
+        cmd.push("--profile-mode", "shared");
+        Object.entries(roleSelections).forEach(([role, select]) => {
+          const account = accountById.get(select.value);
+          const authuser = account && Number.isInteger(account.authuser) ? account.authuser : sharedDefaults[role];
+          if (role === "host" || role === "companion" || select.value) cmd.push("--role-authuser", `${role}=${authuser}`);
+        });
+      }
+      const rendered = cmd.map((part) => (part.includes(" ") ? `"${part}"` : part)).join(" ");
       preview.replaceChildren(
-        mono(cmd.map((part) => (part.includes(" ") ? `"${part}"` : part)).join(" ")),
+        mono(rendered),
         el("span", null, " "),
-        copyTextLink("copy", cmd.map((part) => (part.includes(" ") ? `"${part}"` : part)).join(" "), "Copy next-launch command"),
+        copyTextLink("copy", rendered, "Copy next-launch command"),
       );
     };
     backend.onchange = paintPreview;
+    profileMode.onchange = () => { paintMode(); paintPreview(); };
     profile.oninput = paintPreview;
+    shared.onchange = paintPreview;
+    const sharedWrap = el("label", "inline");
+    sharedWrap.append(shared, document.createTextNode(" Shared window preference (currently has no effect for HOST+COMPANION; they require separate signed-in Chrome profiles. This only matters for a future identity that could join without its own persistent login, such as an unbuilt guest mode.)"));
+    settingsPanel.content.append(
+      el("div", "hint", "These settings affect the next time you run ws-collab-meet-bridge. They do not live-reconfigure an already-running bridge."),
+      table(
+        ["Setting", "Value"],
+        [
+          ["Profile mode", profileMode],
+          ["Browser backend", backend],
+          ["Profile path", profile],
+          ["Companion profile path", mono(data.companion_profile_path || "-")],
+          ["Shared window", sharedWrap],
+        ],
+      ),
+    );
+
+    separatePanel.content.append(
+      el("div", "hint", "Separate mode keeps HOST and COMPANION on different Chrome profiles/processes, unchanged from today."),
+      table(
+        ["Role", "Path", "Exists", "Account", "Actions"],
+        (data.profiles || []).map((row) => {
+          const actions = el("span", "meet-row-actions");
+          actions.append(
+            actionButton("Sign in / refresh", "mini", () => postMeetSso("/meet/sso/open", { role: row.role })),
+            actionButton("Forget", "mini danger", () => postMeetSso(
+              "/meet/sso/forget",
+              { role: row.role },
+              `Forget the saved Google sign-in profile for ${row.role}? This deletes the profile directory on disk.`,
+            )),
+          );
+          return [
+            (row.role || "-").toUpperCase(),
+            row.path || "-",
+            badge(row.exists ? "yes" : "no", row.exists ? "ok" : "warn"),
+            row.account || row.path || "unknown -- no live window to check",
+            actions,
+          ];
+        }),
+      ),
+    );
+
+    const roleRows = (data.role_assignments || []).map((row) => {
+      const select = el("select");
+      select.appendChild(new Option("Unassigned", ""));
+      accounts.forEach((account) => {
+        const label = [
+          account.id,
+          account.email || account.label || "unknown",
+          account.authuser != null ? `(authuser ${account.authuser})` : "(authuser unknown)",
+        ].join(" - ");
+        select.appendChild(new Option(label, account.id));
+      });
+      select.value = row.account_id || "";
+      select.onchange = paintPreview;
+      roleSelections[row.role] = select;
+      return [
+        (row.role || "-").toUpperCase(),
+        select,
+        row.email || row.label || "unassigned",
+        row.authuser == null ? "-" : String(row.authuser),
+      ];
+    });
+    const sharedActions = el("div", "toolbar");
+    sharedActions.append(
+      actionButton("Sign in another account", "primary", () => postMeetSso("/meet/sso/open", { add_account: true })),
+      actionButton("Forget shared profile", "danger", () => postMeetSso(
+        "/meet/sso/forget",
+        { role: "host" },
+        "Forget the shared Google sign-in profile? This deletes the shared profile directory on disk.",
+      )),
+    );
+    sharedPanel.content.append(
+      el("div", "hint", "Shared mode uses one Chrome profile/process. HOST, COMPANION, and future roles are assigned to signed-in Google accounts via authuser slots."),
+      sharedActions,
+      table(["Role", "Assigned account", "Current label", "Authuser"], roleRows),
+      table(
+        ["Local ID", "Email", "Authuser", "Assigned roles", "Actions"],
+        accounts.length
+          ? accounts.map((account) => {
+              const actions = el("span", "meet-row-actions");
+              actions.append(actionButton("Open", "mini", () => postMeetSso("/meet/sso/open", { account_id: account.id })));
+              return [
+                account.id || "-",
+                account.email || account.label || "unknown",
+                account.authuser == null ? "-" : String(account.authuser),
+                (account.assigned_roles || []).map((role) => role.toUpperCase()).join(", ") || "-",
+                actions,
+              ];
+            })
+          : [["-", "No signed-in shared-profile accounts are known yet. Use 'Sign in another account', then refresh.", "-", "-", "-"]],
+      ),
+    );
+
     $("br-save").onclick = async () => {
       try {
         const saved = await api(`${V1}/meet/browser-settings`, {
           method: "POST",
-          body: { browser_backend: backend.value, shared_window: shared.checked, profile_path: profile.value },
+          body: {
+            browser_backend: backend.value,
+            shared_window: shared.checked,
+            profile_path: profile.value,
+            profile_mode: profileMode.value,
+            role_account_map: Object.fromEntries(
+              Object.entries(roleSelections)
+                .map(([role, select]) => [role, select.value])
+                .filter(([, value]) => value),
+            ),
+          },
         });
         result.textContent = "saved";
         profile.value = saved.profile_path || profile.value;
@@ -1746,36 +1845,11 @@ async function loadBrowserSettings() {
         result.textContent = `error: ${error.message}`;
       }
     };
-    const sharedWrap = el("label", "inline");
-    sharedWrap.append(shared, document.createTextNode(" Shared window preference (currently has no effect for HOST+COMPANION; they require separate signed-in Chrome profiles. This only matters for a future identity that could join without its own persistent login, such as an unbuilt guest mode.)"));
-    const settingsTable = table(
-      ["Setting", "Value"],
-      [
-        ["Browser backend", backend],
-        ["Host profile path", (() => {
-          const wrap = el("div");
-          const jump = el("a", null, "Manage SSO sign-in →");
-          jump.href = "#sso";
-          jump.style.marginLeft = "8px";
-          wrap.append(profile, jump);
-          return wrap;
-        })()],
-        ["Companion profile path", mono(data.companion_profile_path || "—")],
-        ["Shared window", sharedWrap],
-      ],
-    );
-    const profilesTable = table(
-      ["Role", "Path", "Exists", "Account"],
-      (data.profiles || []).map((row) => [
-        (row.role || "—").toUpperCase(),
-        row.path || "—",
-        badge(row.exists ? "yes" : "no", row.exists ? "ok" : "warn"),
-        row.account || row.path || "unknown -- no live window to check",
-      ]),
-    );
+
+    previewPanel.content.appendChild(preview);
     paintPreview();
-    body.replaceChildren(settingsTable, panel("Next launch command preview").root, profilesTable);
-    body.querySelector(".panel:last-child .panel-content").replaceChildren(preview);
+    paintMode();
+    body.replaceChildren(settingsPanel.root, separatePanel.root, sharedPanel.root, previewPanel.root);
   } catch (error) {
     body.replaceChildren(el("div", "hint", `error loading browser settings: ${error.message}`));
   }
@@ -1861,7 +1935,7 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
   const ssoLink = (profile) => {
     const account = typeof profile === "object" ? profile.account : null;
     const link = el("a", null, ssoLabel(profile, account));
-    link.href = "#sso";
+    link.href = "#browser";
     return link;
   };
   if (kind === "client") {
@@ -3476,7 +3550,6 @@ function wireEvents() {
     postMeetCommand(`/say ${text}`);
   };
   $("mb-refresh").onclick = loadMeetBridge;
-  $("sso-refresh").onclick = loadSsoPage;
   $("br-refresh").onclick = loadBrowserSettings;
   $("ps-refresh").onclick = loadProcesses;
   $("mb-join-btn").onclick = () => {

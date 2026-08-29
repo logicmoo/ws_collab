@@ -30,3 +30,5 @@ Thumbs.db
 
 # Editor/backup artifacts
 *.bak
+
+.pytest_tmp/

@@ -257,14 +257,14 @@ def find_browser(explicit: str | None) -> str:
     raise SystemExit("No Chrome/Edge found -- pass --browser <path to chrome.exe>")
 
 
-def open_url(cdp_endpoint: str, target: str) -> None:
+def open_url(cdp_endpoint: str, target: str) -> dict[str, Any] | None:
     try:
-        _http_touch(f"{cdp_endpoint}/json/new?{target}", method="PUT")
+        return _http_json(f"{cdp_endpoint}/json/new?{target}", method="PUT")
     except Exception:
         try:
-            _http_touch(f"{cdp_endpoint}/json/new?{target}", method="GET")
+            return _http_json(f"{cdp_endpoint}/json/new?{target}", method="GET")
         except Exception:
-            pass
+            return None
 
 
 def close_tab(cdp_endpoint: str, tab_id: str) -> None:
@@ -284,7 +284,7 @@ def launch_browser(args: Any) -> tuple[str, subprocess.Popen[bytes] | None]:
     profile = Path(args.profile).expanduser()
     profile.mkdir(parents=True, exist_ok=True)
     if not cdp_alive(cdp):
-        url = args.meet or ("https://meet.google.com/new" if args.new else "https://accounts.google.com/")
+        url = getattr(args, "launch_url", None) or args.meet or ("https://meet.google.com/new" if args.new else "https://accounts.google.com/")
         argv = build_launch(
             getattr(args, "browser_backend", "windows"),
             port,
