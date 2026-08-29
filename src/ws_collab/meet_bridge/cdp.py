@@ -79,6 +79,12 @@ class CdpTab:
         )
         return ((result or {}).get("result") or {}).get("value")
 
+    def bring_to_front(self) -> None:
+        """Activate this tab AND raise its browser window -- the CDP method
+        built for exactly this (unlike Runtime.evaluate tricks, which can't
+        reliably raise a window the OS considers unfocused)."""
+        self.call("Page.bringToFront")
+
     def close(self) -> None:
         try:
             self.ws.close()

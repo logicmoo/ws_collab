@@ -125,6 +125,12 @@ class TtsEngine:
         self._paused_agents: set[str] = set()
         self._recent: dict[str, float] = {}
         self._dedupe_window_s = dedupe_window_s
+        # Per-agent "last actually spoken" record (text + when playback
+        # STARTED, not just enqueue time) -- separate from `_recent`, which
+        # is only a short dedupe window and gets pruned within seconds.
+        # Surfaced by list_voices() for the admin UI's per-agent summaries
+        # (e.g. the Google Meet page's Virtual agents table).
+        self._last_spoken: dict[str, dict[str, Any]] = {}
 
     # ---------------------------------------------------------------- lifecycle
     async def start(self) -> None:
@@ -279,6 +285,15 @@ class TtsEngine:
                 "backend": self._backend.name,
             }
 
+    def last_spoken(self, agent_id: str) -> dict[str, Any] | None:
+        """The most recent {text, voice_id, at} this agent actually had
+        played (playback START time, not enqueue time) -- None if this
+        agent has never spoken since the process started (not persisted
+        across restarts, same as the rest of the engine's live state)."""
+        with self._lock:
+            record = self._last_spoken.get(agent_id)
+            return dict(record) if record else None
+
     def active_expected_texts(self) -> list[dict[str, Any]]:
         """Live playbacks so the echo layer can recognise the system's own speech."""
 
@@ -322,6 +337,7 @@ class TtsEngine:
             return False
         with self._lock:
             self._current = item
+            self._last_spoken[item.agent_id] = {"text": item.text, "voice_id": item.voice_id, "at": time.time()}
         self._publish(
             stream=STREAM_TTS, type=TTS_STARTED,
             data={**item.public(), "backend": self._backend.name},

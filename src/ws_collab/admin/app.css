@@ -550,17 +550,71 @@ button.row-enabled-toggle[data-enabled="false"] { border-color: var(--status-dan
 .meet-section-toggle input[type="checkbox"] { cursor: pointer; }
 .meet-section-toggle.all { color: var(--text-primary); border-right: 1px solid var(--border-subtle); padding-right: 14px; }
 
-/* the reassembled "Transcribe" readout under Captions */
+/* the reassembled "Transcribe" readout under Captions -- height/scroll are
+   owned by the surrounding .meet-scroll-box now, not this element itself. */
 .meet-tree-meeting pre.mono {
   white-space: pre-wrap;
   word-break: break-word;
   background: var(--bg-panel-raised);
   border-radius: 4px;
   padding: 8px 10px;
-  max-height: 240px;
-  overflow-y: auto;
   margin: 0;
 }
+
+/* ---- streaming sections (Emit / Phrases / Transcribe): small toolbar +
+   a fixed-height (~10 rows), scrollable, vertically drag-resizable box --- */
+/* button.mini is intentionally NOT scoped to .meet-scroll-toolbar -- the
+   Connectors table's per-row Foreground/Disconnect actions (.meet-row-actions)
+   reuse the exact same small/dense button style. */
+button.mini {
+  font: 600 9px ui-monospace, monospace;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+button.mini:hover { color: var(--text-primary); border-color: var(--text-muted); }
+button.mini.toggle.on { border-color: var(--accent-teal); color: var(--accent-teal); }
+button.mini.danger { border-color: var(--status-danger); color: var(--status-danger); }
+button.mini.danger:hover { color: var(--status-danger); border-color: var(--status-danger); background: rgba(255, 79, 135, 0.1); }
+.meet-row-actions { display: inline-flex; gap: 6px; }
+.meet-scroll-wrap { margin-top: 6px; }
+.meet-scroll-toolbar {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.meet-scroll-toolbar .mini-label {
+  font: 600 9px ui-monospace, monospace;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  align-self: center;
+  margin-left: 4px;
+}
+.meet-scroll-toolbar input.mini-input {
+  width: 3.4em;
+  font: 600 9px ui-monospace, monospace;
+  padding: 2px 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-primary);
+}
+.meet-scroll-box {
+  height: 250px;
+  min-height: 80px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  resize: vertical;
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  background: var(--bg-panel-raised);
+}
+.meet-scroll-box table { margin: 0; }
+.meet-scroll-box pre.mono { height: 100%; box-sizing: border-box; }
 
 
 /* -------------------------------------------------------------- event list */

@@ -2065,9 +2065,43 @@ class WsCollabService:
     def list_voices(self) -> dict[str, Any]:
         return {
             "voices": self.voices.list_voices(),
-            "profiles": self.voices.list_profiles(),
+            "profiles": self._voice_profiles_with_activity(),
             "clones": self.voices.list_clones(),
         }
+
+    def _voice_profiles_with_activity(self) -> list[dict[str, Any]]:
+        """Enriches each raw voice profile with real, already-tracked
+        activity signals from OTHER subsystems -- never fabricated:
+        last_spoken_text/at (TtsEngine.last_spoken -- actual playback, not
+        just enqueue), last_seen_at + worker_state (WorkerMonitor, keyed by
+        agent_id == worker_id, the harness's own presence/heartbeat
+        concept), and a derived `status` combining both with the engine's
+        live mute/speaking state. Used by the admin UI's Virtual agents
+        tables (Agent Voices page, and the Google Meet page's summary)."""
+        tts_state = self.tts.state()
+        muted_agents = set(tts_state.get("muted_agents") or [])
+        speaking_agent = ((tts_state.get("current") or {}) or {}).get("agent_id")
+        profiles = self.voices.list_profiles()
+        for profile in profiles:
+            agent_id = profile.get("agent_id")
+            spoken = self.tts.last_spoken(agent_id) if agent_id else None
+            profile["last_spoken_text"] = spoken["text"] if spoken else None
+            profile["last_spoken_at"] = spoken["at"] if spoken else None
+            worker = self.workers.snapshot(agent_id) if agent_id else {}
+            profile["last_seen_at"] = worker.get("last_status_at")
+            profile["worker_state"] = worker.get("state")
+            if not profile.get("voice_id"):
+                status = "unassigned"
+            elif agent_id in muted_agents:
+                status = "muted"
+            elif agent_id and agent_id == speaking_agent:
+                status = "speaking"
+            elif worker.get("state") and worker["state"] != "ok":
+                status = worker["state"]
+            else:
+                status = "idle"
+            profile["status"] = status
+        return profiles
 
     def clone_voice(self, base_voice_id: str, name: str, *, rate: float = 1.0, pitch: float = 0.0,
                     volume: float = 1.0, style: str = "", operator: str = "operator") -> dict[str, Any]:

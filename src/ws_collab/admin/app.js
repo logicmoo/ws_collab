@@ -43,11 +43,20 @@ const MEET_BRIDGE_BASE = window.WS_COLLAB_MEET_BRIDGE_BASE || "http://127.0.0.1:
  * isn't currently attached to them (e.g. Google ended one and auto-recreate
  * moved on, or it just hasn't switched there yet), so they stay visible
  * instead of the page going blank the moment they're not the live one.
- * Override with `WS_COLLAB_DEFAULT_MEET_URLS` (array). */
+ * Just the one real, currently-live servant room — a second placeholder
+ * ("vfi-zywr-ezz") used to live here too but was never actually joined,
+ * which was exactly why "Connectors" appeared to report 4 rows instead of
+ * 2 (each non-current entry always renders 2 placeholder HOST+COMPANION
+ * rows). Override with `WS_COLLAB_DEFAULT_MEET_URLS` (array). */
 const DEFAULT_DRIVER_MEETING_URLS = window.WS_COLLAB_DEFAULT_MEET_URLS || [
   "https://meet.google.com/bgb-xqts-xjt",
-  "https://meet.google.com/vfi-zywr-ezz",
 ];
+/* Meetings the bridge would just JOIN AS A GUEST (no host+companion
+ * relay-in pair of its own) — CLIENT/GUEST mode, documented in
+ * docs/GOOGLE_MEET_BRIDGE.md as "designed but not built" server-side.
+ * Empty by default (nothing to show until the operator configures one).
+ * Override with `WS_COLLAB_CLIENT_MEET_URLS` (array). */
+const DEFAULT_CLIENT_MEETING_URLS = window.WS_COLLAB_CLIENT_MEET_URLS || [];
 
 const state = {
   token: sessionStorage.getItem("ws_collab_token") || "",
@@ -996,7 +1005,7 @@ function showPage(page) {
   const loaders = {
     workers: loadWorkers, alerts: loadAlerts, devices: loadDevices, voices: loadVoices,
     accuracy: loadAccuracy, cursors: loadCursors, prompt: loadPrompt, system: loadSystem,
-    meet: loadMeet, stt: loadStt, meetbridge: loadMeetBridge,
+    meet: loadMeetWithPolling, stt: loadStt, meetbridge: loadMeetBridge,
   };
   if (loaders[page]) loaders[page]();
   Object.values(state.views).forEach((v) => v.draw());
@@ -1604,51 +1613,130 @@ async function postMeetBridgeCommand(command) {
  * listed first (never automated, so its device is just "real"); COMPANION
  * always follows — every driver is structurally a HOST+COMPANION pair, so
  * both rows are always shown, even for a not-current/placeholder driver
- * meeting where there's no live per-client data to show yet. Every row
- * always shows the meeting URL + live connection state, plus a Join/Rejoin
- * button (re-issues /join at this url — the same recovery path used for
- * "already in this call elsewhere" duplicate-tab situations). Device
- * detail is only meaningful for the CURRENT meeting — the bridge doesn't
- * retain per-participant device history for meetings it has left. Whether
- * a mic is "physical" or not is already obvious from its Mic text ("real
+ * meeting where there's no LIVE per-client data (falls back to
+ * meetingState[roomId] — "as of last time we were here" — when the bridge
+ * has ever actually been in that room; plain dashes only when it truly
+ * never has). Every row shows the meeting URL + connection state, an SSO
+ * column (which Chrome profile dir — and therefore which persisted Google
+ * login — that identity is configured to use: hostProfile for HOST, each
+ * client's own `.profile` otherwise), and Actions: for the CURRENT
+ * meeting, role-scoped Foreground (raise that identity's browser window)
+ * + Disconnect (hang up just that tab) buttons; for a not-current meeting,
+ * Join/Rejoin instead (no live tab to foreground/disconnect there). Device
+ * detail (Mic/Speak) is only meaningful for the CURRENT meeting — the
+ * bridge doesn't retain live per-participant device state for meetings
+ * it's left, only the coarser profile/state snapshot. Whether a mic is
+ * "physical" or not is already obvious from its Mic text ("real
  * microphone" vs. a device name) — no separate checkbox needed for that. */
-function meetUsRows(isCurrent, clients, url) {
+function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
   const rejoin = (state) => actionButton(state === "in-call" ? "Rejoin" : "Join", "", () => postMeetCommand(`/join ${url}`));
-  if (!isCurrent) {
-    const rows = [
-      ["HOST", "not current", url, "\u2014", "\u2014", rejoin("not current")],
-      ["COMPANION", "not current", url, "\u2014", "\u2014", rejoin("not current")],
-    ];
-    return { rows, note: "Not the current meeting — participant/device detail is only tracked live; Join re-attaches the driver here." };
+  const actionsFor = (role) => {
+    const wrap = el("span", "meet-row-actions");
+    wrap.append(
+      actionButton("Foreground", "mini", () => postMeetCommand(`/foreground ${role}`)),
+      actionButton("Disconnect", "mini danger", () => postMeetCommand(`/disconnect ${role}`)),
+    );
+    return wrap;
+  };
+  // hostProfile arrives as {path, known, label}; a client's own .profile is
+  // just a plain path string (or absent) — accept either shape uniformly.
+  const ssoLabel = (profile) => {
+    if (!profile) return "\u2014";
+    if (typeof profile === "string") return profile;
+    return profile.label || (profile.known === false ? "unknown" : "\u2014");
+  };
+  if (kind === "client") {
+    const ssoVal = isCurrent ? null : (roomSnapshot && roomSnapshot.hostProfile);
+    const action = isCurrent ? actionsFor("guest") : rejoin("not current");
+    const rows = [["GUEST_CLIENT", ssoLabel(ssoVal), isCurrent ? "not implemented yet" : "not current", url, "\u2014", "\u2014", action]];
+    return { rows, note: "CLIENT/GUEST mode is designed but not built server-side yet — Foreground/Disconnect will honestly report “not implemented yet”; there is no live guest tab to join/leave." };
   }
-  const rows = [["HOST", "in-call", url, "real microphone (untouched)", "real speakers (untouched)", rejoin("in-call")]];
+  if (!isCurrent) {
+    const snapClients = (roomSnapshot && roomSnapshot.clients) || [];
+    const snapCompanion = snapClients.find((c) => c.role === "companion");
+    const asOf = roomSnapshot && roomSnapshot.updatedAt
+      ? ` (as of ${shortTs(new Date(roomSnapshot.updatedAt * 1000).toISOString())})` : "";
+    const rows = [
+      ["HOST", ssoLabel(roomSnapshot && roomSnapshot.hostProfile), "not current" + asOf, url, "\u2014", "\u2014", rejoin("not current")],
+      ["COMPANION", ssoLabel(snapCompanion && snapCompanion.profile), "not current" + asOf, url, "\u2014", "\u2014", rejoin("not current")],
+    ];
+    return { rows, note: roomSnapshot
+      ? "Not the current meeting — SSO/state is the last known snapshot from when the bridge was last here; Join re-attaches the live driver. This driver slot is also available to relay a different real-world audio source into a Meet room here instead — a Discord Voice Channel, Zoom call, or plain audio call, for example — but that is not built yet; every driver today only probes this machine's Physical Computer mic/speakers."
+      : "Not the current meeting — never seen live yet, so no snapshot exists; Join attaches the live driver here. This driver slot is also available to relay a different real-world audio source into a Meet room here instead — a Discord Voice Channel, Zoom call, or plain audio call, for example — but that is not built yet; every driver today only probes this machine's Physical Computer mic/speakers." };
+  }
+  const rows = [["HOST", ssoLabel(hostProfile), "in-call", url, "real microphone (untouched)", "real speakers (untouched)", actionsFor("host")]];
   const companion = (clients || []).find((c) => c.role === "companion");
   if (companion) {
-    rows.push(["COMPANION", companion.state || "\u2014", url, companion.mic || "\u2014", companion.speak || "\u2014", rejoin(companion.state)]);
+    rows.push(["COMPANION", ssoLabel(companion.profile), companion.state || "\u2014", url, companion.mic || "\u2014", companion.speak || "\u2014", actionsFor("companion")]);
   } else {
-    rows.push(["COMPANION", "not armed (no --companion)", url, "\u2014", "\u2014", "\u2014"]);
+    rows.push(["COMPANION", "\u2014", "not armed (no --companion)", url, "\u2014", "\u2014", "\u2014"]);
   }
   // Any OTHER controlled identity beyond host/companion (e.g. a future
-  // CLIENT sharing this driver) still gets listed, in whatever order the
-  // bridge reported it.
+  // CLIENT/GUEST sharing this driver) still gets listed, in whatever order
+  // the bridge reported it. Foreground/Disconnect honestly report
+  // "not implemented yet" server-side until that identity is real, rather
+  // than silently no-op-ing or erroring obscurely.
   (clients || []).filter((c) => c.role !== "companion").forEach((c) => rows.push([
-    (c.role || "").toUpperCase(), c.state || "\u2014", url, c.mic || "\u2014", c.speak || "\u2014", rejoin(c.state),
+    (c.role || "").toUpperCase(), ssoLabel(c.profile), c.state || "\u2014", url, c.mic || "\u2014", c.speak || "\u2014", actionsFor(c.role),
   ]));
   return { rows, note: null };
 }
 
 /* ws_collab's own agent voices (the Agent Voices page) are a SEPARATE TTS
  * path from the bridge's own SAPI call in say_into_meeting() — an agent's
- * speech only reaches a Meet call today if something explicitly relays it
- * through /say (or the google-meet mailbox), never automatically. Listed
- * honestly here (real profiles from `${V1}/voices`), not implying a live
- * wire that doesn't exist yet. */
-function meetVirtualAgentRows(agentProfiles) {
-  return (agentProfiles || []).map((p) => [
-    p.agent_id, p.voice_id || "(unset)",
-    p.speaking_permission === false ? "muted" : "allowed",
-    "not auto-wired \u2014 reaches this meeting only via /say",
-  ]);
+ * speech only reaches a Meet call today if something explicitly relayed it
+ * through /say (or the google-meet mailbox), never automatically. This
+ * table is read-only, informational (real profiles from `${V1}/voices`,
+ * enriched server-side with actual TtsEngine/WorkerMonitor activity, never
+ * fabricated) -- editing happens on the Agent Voices page, which is where
+ * the Agent link goes. Listens/Speaks/Enabled are read-only checkboxes,
+ * not toggles, for the same reason. */
+function readOnlyCheck(on, title) {
+  const box = el("input");
+  box.type = "checkbox";
+  box.checked = !!on;
+  box.disabled = true;
+  if (title) box.title = title;
+  return box;
+}
+function meetStatusBadgeKind(status) {
+  if (status === "speaking") return "ok";
+  if (status === "muted" || status === "unassigned") return "warn";
+  if (status && status !== "idle" && status !== "ok") return "danger";
+  return "";
+}
+function meetVirtualAgentRows(agentProfiles, companionSpeak, recipients) {
+  // Speaks: when relayed, it goes out through whatever /say itself uses --
+  // the companion's synthetic mic patch, or a real virtual-cable device
+  // when --tts-output-device is configured -- the exact same `speak`
+  // string already shown on the companion's Connectors row.
+  const speakTitle = companionSpeak
+    ? `Reaches this meeting only via /say, out through ${companionSpeak}`
+    : "Reaches this meeting only via /say \u2014 not auto-wired";
+  // Listens: there is no per-agent subscription concept yet -- captions
+  // are forwarded bridge-wide to a fixed set of mailboxes. Honest bridge-
+  // wide signal (same value every row) rather than a fabricated per-agent one.
+  const listensOn = (recipients || []).length > 0;
+  const listensTitle = listensOn
+    ? `Bridge-wide: finished captions are forwarded to ${(recipients || []).join(", ")} (not modeled per-agent yet)`
+    : "No caption recipients configured on the bridge";
+  const fmtWhen = (at) => (at ? shortTs(new Date(at * 1000).toISOString()) : "\u2014");
+  return (agentProfiles || []).map((p) => {
+    const link = el("a", null, p.agent_id);
+    link.href = "#voices";
+    link.title = "Open Agent Voices to edit this profile";
+    return [
+      link,
+      p.voice_id || "(unset)",
+      readOnlyCheck(listensOn, listensTitle),
+      readOnlyCheck(p.speaking_permission !== false, speakTitle),
+      readOnlyCheck(!!p.voice_id, p.voice_id ? "Has a voice assigned" : "No voice assigned yet \u2014 see Agent Voices"),
+      fmtWhen(p.last_seen_at),
+      fmtWhen(p.last_spoken_at),
+      p.last_spoken_text || "\u2014",
+      badge(p.status || "\u2014", meetStatusBadgeKind(p.status)),
+    ];
+  });
 }
 
 /* Persisted "show this section type" preference, keyed by section label —
@@ -1690,10 +1778,24 @@ function meetSectionToggle(label, count, defaultOn, contentNodes) {
 /* Driver naming convention: "google-meet-stt-<room-id>" — the room id is
  * the 3-4-3 code Meet assigns (e.g. "vfi-zywr-ezz"). This is the name the
  * team uses for a HOST+COMPANION pair bound to one meeting, so it doubles
- * as a stable identity for a driver even while the URL itself is opaque. */
-function driverName(url) {
+ * as a stable identity for a driver even while the URL itself is opaque.
+ * meetRoomId() is the same extraction on its own — used to key/look up
+ * meetingState (the bridge's live per-room snapshot dict) by room id. */
+function meetRoomId(url) {
   const match = /meet\.google\.com\/([a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4})/i.exec(url || "");
-  return match ? `google-meet-stt-${match[1]}` : "google-meet-stt-(unknown)";
+  return match ? match[1].toLowerCase() : null;
+}
+function driverName(url) {
+  const room = meetRoomId(url);
+  return room ? `google-meet-stt-${room}` : "google-meet-stt-(unknown)";
+}
+
+/* Badge color for the debug table's per-line Source column -- purely
+ * cosmetic grouping (host/companion/bridge), no behavior depends on it. */
+function meetRoleBadgeKind(role) {
+  if (role === "host") return "ok";
+  if (role === "companion") return "";
+  return "warn";
 }
 
 /* What real-world audio source a DRIVER meeting probes — "Physical
@@ -1712,7 +1814,114 @@ function probeLocation(isCurrent, bridgeOnline) {
   return "(not connected)";
 }
 
-function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, debugRows, bridgeOnline, emitCount) {
+/* Persisted per-section-type autoscroll preference (localStorage, default
+ * ON) -- mirrors getMeetSectionOpen/setMeetSectionOpen's convention, but for
+ * "follow new content" rather than "show this section at all". */
+function getMeetAutoscroll(label) {
+  const raw = localStorage.getItem(`ws_collab_meet_autoscroll_${label}`);
+  return raw === null ? true : raw === "1";
+}
+function setMeetAutoscroll(label, on) {
+  localStorage.setItem(`ws_collab_meet_autoscroll_${label}`, on ? "1" : "0");
+}
+
+/* Persisted per-section-type visible-row count (localStorage, default 10).
+ * Drives the box's height directly (rows * row-height); the operator can
+ * still drag it taller/shorter afterward (native CSS resize: vertical) --
+ * that manual override is intentionally overwritten the next time this
+ * number is changed, since "set it to N rows" is an explicit request. */
+const MEET_ROW_H = 24; // matches the app-wide dense-table row height elsewhere
+function getMeetRowCount(label) {
+  const raw = parseInt(localStorage.getItem(`ws_collab_meet_rows_${label}`), 10);
+  return Number.isFinite(raw) && raw >= 2 ? raw : 10;
+}
+function setMeetRowCount(label, rows) {
+  localStorage.setItem(`ws_collab_meet_rows_${label}`, String(rows));
+}
+function meetBoxHeightPx(rows) { return MEET_ROW_H + rows * MEET_ROW_H; }
+/* Applies the persisted row count to EVERY currently-rendered box of this
+ * section type at once (there is one box per meeting group, all sharing
+ * one preference) -- a live DOM query rather than a captured array, since
+ * a fresh array only exists per render and any toolbar (any meeting) may
+ * be the one the operator adjusts. Growing a box just makes the page
+ * taller/scroll further, exactly like any other panel content -- nothing
+ * special is needed for that beyond the height change itself. */
+function applyMeetRowCount(label) {
+  const rows = getMeetRowCount(label);
+  const px = meetBoxHeightPx(rows);
+  document.querySelectorAll(`.meet-scroll-box[data-section-label="${label}"]`).forEach((box) => {
+    box.style.height = `${px}px`;
+    if (getMeetAutoscroll(label)) box.scrollTop = box.scrollHeight;
+  });
+}
+
+/* In-memory "cleared at" cutoffs -- Clear blanks ONE meeting's ONE section
+ * until genuinely new data arrives after the click, by filtering out
+ * anything at or before that moment; keyed by `${meetingUrl}::${label}` so
+ * clearing "Emit" doesn't also clear "Phrases"/"Transcribe", and clearing
+ * one meeting's box doesn't affect another's. Deliberately NOT persisted
+ * (a page reload un-clears) -- this is a transient view action, not a
+ * durable preference the way the autoscroll toggle is. */
+const meetClearedAt = new Map();
+function meetClearCutoff(key) { return meetClearedAt.get(key) || 0; }
+
+/* One streaming section: a small toolbar (Clear + an Autoscroll on/off
+ * toggle, default ON per the operator's request) above a fixed-height
+ * (~10 rows) scrollable box the operator can still drag taller (native CSS
+ * `resize: vertical`). Returns {wrap, box}: `wrap` (toolbar + box together)
+ * is what the global show/hide checkbox (meetSectionToggle) should track;
+ * `box` is where rows/text actually go and whose scrollTop autoscroll
+ * manages -- kept separate so hiding a section doesn't orphan its toolbar. */
+function meetScrollSection(clearKey, label) {
+  const wrap = el("div", "meet-scroll-wrap");
+  const toolbar = el("div", "meet-scroll-toolbar");
+  const clearBtn = actionButton("Clear", "mini", () => {
+    meetClearedAt.set(clearKey, Date.now() / 1000);
+    loadMeet();
+  });
+  const autoBtn = actionButton("", "mini toggle");
+  const paintAuto = (on) => {
+    autoBtn.textContent = on ? "Autoscroll: ON" : "Autoscroll: OFF";
+    autoBtn.classList.toggle("on", on);
+  };
+  paintAuto(getMeetAutoscroll(label));
+  autoBtn.onclick = () => {
+    const next = !getMeetAutoscroll(label);
+    setMeetAutoscroll(label, next);
+    paintAuto(next);
+    if (next) box.scrollTop = box.scrollHeight;
+  };
+  // Visible-row-count input -- same global-per-type convention as
+  // Autoscroll (one shared preference, a toolbar instance per meeting).
+  // Applied to every currently-rendered box of this type at once via
+  // applyMeetRowCount(), not just this one, so changing it in any one
+  // meeting's toolbar keeps every meeting's same-type box in sync.
+  const rowsLabel = el("span", "mini-label", "rows");
+  const rowsInput = el("input", "mini-input");
+  rowsInput.type = "number";
+  rowsInput.min = "2";
+  rowsInput.step = "1";
+  rowsInput.value = String(getMeetRowCount(label));
+  rowsInput.title = "Visible rows before the box starts scrolling internally (still resizable by dragging the corner).";
+  rowsInput.onchange = () => {
+    const n = Math.max(2, parseInt(rowsInput.value, 10) || 10);
+    rowsInput.value = String(n);
+    setMeetRowCount(label, n);
+    applyMeetRowCount(label);
+  };
+  toolbar.append(clearBtn, autoBtn, rowsLabel, rowsInput);
+  const box = el("div", "meet-scroll-box");
+  box.dataset.sectionLabel = label;
+  box.style.height = `${meetBoxHeightPx(getMeetRowCount(label))}px`;
+  wrap.append(toolbar, box);
+  return { wrap, box };
+}
+
+function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, debugRows, bridgeOnline, emitCount, hostProfile, meetingState, recipients) {
+  const priorOpen = new Map();
+  container.querySelectorAll(".meet-tree-meeting").forEach((d) => {
+    if (d.dataset.url) priorOpen.set(d.dataset.url, d.open);
+  });
   container.replaceChildren();
   if (!groups.length) {
     container.appendChild(el("div", "hint", "No captions seen yet — captions appear here once the bridge is in a meeting and someone speaks."));
@@ -1722,13 +1931,16 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
   // global checkbox (built after this loop) can show/hide that type
   // everywhere at once instead of repeating 7 checkboxes per meeting.
   const usBodies = [], agentsBodies = [], presenceBodies = [], debugBodies = [], emitBodies = [], phrasesBodies = [], transcribeBodies = [];
+  const emitBoxes = [], phrasesBoxes = [], transcribeBoxes = [];
   let totalAgentRows = 0, totalDebugRows = 0, totalTranscriptLines = 0, totalConnectorRows = 0, totalPhraseRows = 0;
   const meetingEls = [];
 
-  groups.forEach(({ url, captions }) => {
+  groups.forEach(({ url, captions, kind }) => {
     const isCurrent = url === currentUrl;
+    const isClient = kind === "client";
     const meeting = el("details");
-    meeting.open = isCurrent;
+    meeting.dataset.url = url;
+    meeting.open = priorOpen.has(url) ? priorOpen.get(url) : isCurrent;
     meeting.className = "meet-tree-meeting";
     const summary = el("summary");
     summary.appendChild(mono(`${driverName(url)}  `));
@@ -1736,7 +1948,8 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     link.href = url; link.target = "_blank"; link.rel = "noopener";
     link.onclick = (e) => e.stopPropagation();
     summary.appendChild(link);
-    summary.appendChild(mono(isCurrent ? "  · current" : "  · past"));
+    summary.appendChild(mono(isCurrent ? (isClient ? "  · current" : "  · (PHYSICAL COMPUTER)") : "  · (AVAILABLE)"));
+    summary.appendChild(badge(isClient ? "CLIENT" : "DRIVER", isClient ? "warn" : ""));
     summary.appendChild(badge(probeLocation(isCurrent, bridgeOnline), isCurrent && bridgeOnline ? "ok" : ""));
     summary.appendChild(document.createTextNode(" "));
     const connectBtn = actionButton(isCurrent && bridgeOnline ? "Rejoin" : "Connect", "primary", (e) => {
@@ -1747,16 +1960,17 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     summary.appendChild(connectBtn);
     meeting.appendChild(summary);
 
-    const us = meetUsRows(isCurrent, clients, url);
+    const us = meetUsRows(isCurrent, clients, url, hostProfile, (meetingState || {})[meetRoomId(url)], kind);
     const usBody = el("div");
-    usBody.appendChild(table(["Who", "State", "Meeting", "Mic", "Speak", "Action"], us.rows));
+    usBody.appendChild(table(["Who", "SSO", "State", "Meeting", "Mic", "Speak", "Actions"], us.rows));
     if (us.note) usBody.appendChild(el("div", "hint", us.note));
     totalConnectorRows += us.rows.length;
 
     const agentsBody = el("div");
-    const agentRows = meetVirtualAgentRows(agentProfiles);
+    const liveCompanion = isCurrent ? (clients || []).find((c) => c.role === "companion") : null;
+    const agentRows = meetVirtualAgentRows(agentProfiles, liveCompanion && liveCompanion.speak, isCurrent ? recipients : null);
     agentsBody.appendChild(agentRows.length
-      ? table(["Agent", "Voice", "Permission", "Reaches this meeting?"], agentRows)
+      ? table(["Agent", "Voice", "Listens", "Speaks", "Enabled", "Last Seen", "Last Spoke", "Text", "Status"], agentRows)
       : el("div", "hint", "No ws_collab agent voice profiles configured yet (see Agent Voices)."));
 
     const presenceBody = el("div", "hint",
@@ -1767,7 +1981,7 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     const debugBody = el("div");
     const rows = isCurrent ? (debugRows || []) : [];
     debugBody.appendChild(rows.length
-      ? table(["Time", "Message"], rows.map((d) => [shortTs(d.iso) || d.iso || "", d.text || ""]))
+      ? table(["Time", "Source", "Message"], rows.map((d) => [shortTs(d.iso) || d.iso || "", badge((d.role || "bridge").toUpperCase(), meetRoleBadgeKind(d.role)), d.text || ""]))
       : el("div", "hint", isCurrent
         ? "No debug messages yet — autojoin verdicts, mic-select attempts, and /say results appear here."
         : "Debug messages are only kept for the current meeting."));
@@ -1779,12 +1993,14 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     // key (if any) it continues from. This is the direct, honest view of
     // the raw stream — the best way to confirm an emit actually went out
     // and what it currently says, with nothing reassembled or hidden.
-    const emitBody = el("div");
     const sortedByKey = captions.slice().sort((a, b) => (a.at || 0) - (b.at || 0));
-    emitBody.appendChild(table(["Key", "Time", "Speaker", "Text", "Final", "Replaces"], sortedByKey.map((c) => [
+    const emitCutoff = meetClearCutoff(`${url}::Emit`);
+    const emitRowsShown = sortedByKey.filter((c) => (c.at || 0) > emitCutoff);
+    const { wrap: emitBody, box: emitBox } = meetScrollSection(`${url}::Emit`, "Emit");
+    emitBox.appendChild(emitRowsShown.length ? table(["Key", "Time", "Speaker", "Text", "Final", "Replaces"], emitRowsShown.map((c) => [
       mono((c.key || "").slice(-10)), shortTs(c.iso) || c.iso || "", c.speaker || "", c.text || "",
       c.final ? "yes" : "growing…", c.replaces ? mono(c.replaces.slice(-10)) : "—",
-    ])));
+    ])) : el("div", "hint", "Cleared — new emits appear here as they happen."));
 
     // Phrases: JUST the settled sentences (final=true) out of the same raw
     // stream — every "Hello there." that will never be edited again, none
@@ -1793,12 +2009,14 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     // growing row per monologue, and every completed sentence peeled off
     // of it becomes one phrase here, in order.
     const phraseRows = sortedByKey.filter((c) => c.final);
-    const phrasesBody = el("div");
-    phrasesBody.appendChild(phraseRows.length
-      ? table(["Key", "Time", "Speaker", "Text"], phraseRows.map((c) => [
+    const phrasesCutoff = meetClearCutoff(`${url}::Phrases`);
+    const phraseRowsShown = phraseRows.filter((c) => (c.at || 0) > phrasesCutoff);
+    const { wrap: phrasesBody, box: phrasesBox } = meetScrollSection(`${url}::Phrases`, "Phrases");
+    phrasesBox.appendChild(phraseRowsShown.length
+      ? table(["Key", "Time", "Speaker", "Text"], phraseRowsShown.map((c) => [
         mono((c.key || "").slice(-10)), shortTs(c.iso) || c.iso || "", c.speaker || "", c.text || "",
       ]))
-      : el("div", "hint", "No completed phrases yet — a phrase appears here the instant a sentence finishes."));
+      : el("div", "hint", phraseRows.length ? "Cleared — new phrases appear here as sentences finish." : "No completed phrases yet — a phrase appears here the instant a sentence finishes."));
 
     // Transcribe: the SAME raw data, reassembled into one readable
     // transcript (creation order, each key's current text) — a concrete
@@ -1809,9 +2027,11 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     // that's what "reassembled" means — one still-growing row can already
     // contain many settled sentences, a different number than the raw
     // emit-event count shown by "Emit" above.
-    const transcribeBody = el("div");
-    const transcriptLines = sortedByKey.map((c) => `${c.speaker || "Speaker"}: ${c.text || ""}`);
-    transcribeBody.appendChild(el("pre", "mono", transcriptLines.join("\n") || "(nothing said yet)"));
+    const transcribeCutoff = meetClearCutoff(`${url}::Transcribe`);
+    const transcribeRowsShown = sortedByKey.filter((c) => (c.at || 0) > transcribeCutoff);
+    const { wrap: transcribeBody, box: transcribeBox } = meetScrollSection(`${url}::Transcribe`, "Transcribe");
+    const transcriptLines = transcribeRowsShown.map((c) => `${c.speaker || "Speaker"}: ${c.text || ""}`);
+    transcribeBox.appendChild(el("pre", "mono", transcriptLines.join("\n") || (sortedByKey.length ? "(cleared — new lines appear here as they're said)" : "(nothing said yet)")));
     const sentenceCount = sortedByKey.reduce((sum, c) =>
       sum + (c.text || "").split(/(?<=[.!?])\s+/).filter((s) => s.trim()).length, 0);
 
@@ -1831,6 +2051,9 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     emitBodies.push(emitBody);
     phrasesBodies.push(phrasesBody);
     transcribeBodies.push(transcribeBody);
+    emitBoxes.push(emitBox);
+    phrasesBoxes.push(phrasesBox);
+    transcribeBoxes.push(transcribeBox);
     totalAgentRows += agentRows.length;
     totalDebugRows += isCurrent ? rows.length : 0;
     totalTranscriptLines += sentenceCount;
@@ -1850,6 +2073,16 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
   toggleRow.appendChild(meetSectionToggle("Transcribe", totalTranscriptLines, true, transcribeBodies));
   container.appendChild(toggleRow);
   meetingEls.forEach((meeting) => container.appendChild(meeting));
+  // Now that everything is actually in the document (scrollHeight needs
+  // layout), default each of these three streaming sections to showing its
+  // latest content -- gated per section-TYPE by the Autoscroll toggle
+  // (default ON); the operator can still scroll up or drag-resize taller
+  // regardless. A refresh (this function rebuilds the DOM from scratch
+  // each time) snaps back to the bottom again when autoscroll is on,
+  // matching "auto-scroll" intent.
+  if (getMeetAutoscroll("Emit")) emitBoxes.forEach((box) => { box.scrollTop = box.scrollHeight; });
+  if (getMeetAutoscroll("Phrases")) phrasesBoxes.forEach((box) => { box.scrollTop = box.scrollHeight; });
+  if (getMeetAutoscroll("Transcribe")) transcribeBoxes.forEach((box) => { box.scrollTop = box.scrollHeight; });
 }
 
 async function loadMeet() {
@@ -1866,14 +2099,21 @@ async function loadMeet() {
     // Still show the known default driver meetings as placeholders (all
     // correctly "not current" while the bridge itself is down) so the
     // intended meetings stay visible instead of the section going blank.
-    renderMeetTree($("meet-driver-tree"), DEFAULT_DRIVER_MEETING_URLS.map((url) => ({ url, captions: [] })), null, [], [], [], false, 0);
+    renderMeetTree($("meet-driver-tree"), [
+      ...DEFAULT_DRIVER_MEETING_URLS.map((url) => ({ url, captions: [], kind: "driver" })),
+      ...DEFAULT_CLIENT_MEETING_URLS.map((url) => ({ url, captions: [], kind: "client" })),
+    ], null, [], [], [], false, 0, null, {}, []);
     return;
   }
   if (dot) { dot.classList.toggle("ok", !!health.ok); dot.classList.toggle("danger", !health.ok); }
   statusLine.textContent = health.meetingUrl ? `bridge online — ${health.meetingUrl}` : "bridge online — no meeting";
+  const hostProfileLabel = health.hostProfile
+    ? (health.hostProfile.label || (health.hostProfile.known === false ? "unknown" : "\u2014"))
+    : "\u2014";
   const cardLines = [
     `service       ${health.service || "ws_collab_meet_bridge"}`,
     `meeting       ${health.meetingUrl || "\u2014"}`,
+    `chrome profile (host)   ${hostProfileLabel}`,
     `captions      ${health.captionCount ?? 0} total, last at ${health.lastCaptionAt || "\u2014"}`,
     `outbox        ${health.outbox || "\u2014"}`,
     `transcripts   \u2192 ${(health.recipients || []).join(", ") || "\u2014"}`,
@@ -1907,11 +2147,13 @@ async function loadMeet() {
   // isn't currently attached to (e.g. it moved to a different one, or
   // hasn't switched there yet) — Join re-attaches the live driver there.
   DEFAULT_DRIVER_MEETING_URLS.forEach((url) => { if (!byMeeting.has(url)) byMeeting.set(url, []); });
+  DEFAULT_CLIENT_MEETING_URLS.forEach((url) => { if (!byMeeting.has(url)) byMeeting.set(url, []); });
+  const clientUrlSet = new Set(DEFAULT_CLIENT_MEETING_URLS);
   // Current meeting first, then whatever else the ring buffer still
   // remembers (most-recently-active-in-buffer order).
   const order = [health.meetingUrl, ...[...byMeeting.keys()].filter((u) => u !== health.meetingUrl)].filter(Boolean);
-  const groups = order.filter((u) => byMeeting.has(u)).map((u) => ({ url: u, captions: byMeeting.get(u) }));
-  renderMeetTree($("meet-driver-tree"), groups, health.meetingUrl, health.clients, agentProfiles, health.debug, !!health.ok, health.emitCount);
+  const groups = order.filter((u) => byMeeting.has(u)).map((u) => ({ url: u, captions: byMeeting.get(u), kind: clientUrlSet.has(u) ? "client" : "driver" }));
+  renderMeetTree($("meet-driver-tree"), groups, health.meetingUrl, health.clients, agentProfiles, health.debug, !!health.ok, health.emitCount, health.hostProfile, health.meetingState, health.recipients);
 }
 
 /* ---- meet bridge (simple transcript-viewer page, separate from the deep
@@ -1919,6 +2161,29 @@ async function loadMeet() {
 let mbSince = 0;
 let mbPolling = false;
 let mbCaptionCount = 0;
+let meetPolling = false;
+
+function meetPollOnce() {
+  const active = document.activeElement;
+  const meetPage = document.querySelector('.page[data-page="meet"]');
+  const typingInMeet = active
+    && /^(INPUT|TEXTAREA)$/.test(active.tagName)
+    && meetPage
+    && meetPage.contains(active);
+  const run = typingInMeet ? Promise.resolve() : loadMeet();
+  run.finally(() => {
+    // Slower than the simple Meet Bridge page because this does a heavier full
+    // tree rebuild, and it intentionally skips ticks while the operator is typing.
+    if (state.page === "meet") setTimeout(meetPollOnce, 3000);
+    else meetPolling = false;
+  });
+}
+
+function loadMeetWithPolling() {
+  if (meetPolling) return;
+  meetPolling = true;
+  meetPollOnce();
+}
 
 function mbRenderCard(health, offline) {
   const body = $("mb-card-body");

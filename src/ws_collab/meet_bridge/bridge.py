@@ -115,6 +115,17 @@ DEFAULT_RECIPIENTS = ["conversation"]
 DEFAULT_SENDER_PREFIX = "meet-"
 DEFAULT_OUTBOX = "google-meet"
 
+# Meet's own room-id shape ("xxx-yyyy-zzz") -- the stable identity used to key
+# per-room state (meeting_state below) regardless of whether that room is a
+# HOST+COMPANION driver/servant meeting or (once built) a CLIENT/GUEST
+# meeting the bridge just sits in: both are keyed the same way, uniformly.
+_ROOM_RE = re.compile(r"meet\.google\.com/([a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4})", re.IGNORECASE)
+
+
+def room_id(url: str | None) -> str | None:
+    match = _ROOM_RE.search(url or "")
+    return match.group(1).lower() if match else None
+
 
 def message_text(message: dict[str, Any]) -> str:
     for key in ("text", "message", "body", "content"):
@@ -293,14 +304,36 @@ def main() -> None:
     tracker = CaptionTracker(args.settle)
     stop = threading.Event()
 
+    def _host_profile_info() -> dict[str, Any]:
+        """Which Chrome profile dir (and therefore which persisted Google SSO
+        login) the HOST tab is using. Certain when the bridge launched its
+        own popup browser (--profile pins one specific persistent profile
+        dir); with --attach-only we connected to a Chrome the operator
+        already had running and never chose -- or even saw -- its
+        --user-data-dir, so say that plainly instead of guessing. Surfaced
+        at the top of the admin UI's "Google Meet" page, next to the Bridge
+        panel, plus reused per-row in the connector table."""
+        if args.attach_only:
+            return {"path": None, "known": False, "label": "unknown (attached externally via --cdp; profile not chosen by this bridge)"}
+        path = str(Path(args.profile).expanduser())
+        return {"path": path, "known": True, "label": path}
+
     # ---- STT-subsystem integration: /health + /captions for consumers ------
     # `captionCount` = distinct stored rows (add/edit collapses to one per
     # key); `emitCount` = total raw emit() calls ever made (every add AND
     # every edit counted separately).
-    status: dict[str, Any] = {"ok": True, "service": "ws_collab_meet_bridge", "meetingUrl": holder.get("url"), "lastCaptionAt": None, "captionCount": 0, "emitCount": 0, "outbox": args.outbox, "recipients": recipients}
+    status: dict[str, Any] = {"ok": True, "service": "ws_collab_meet_bridge", "meetingUrl": holder.get("url"), "lastCaptionAt": None, "captionCount": 0, "emitCount": 0, "outbox": args.outbox, "recipients": recipients, "hostProfile": _host_profile_info()}
     captions_log: list[dict[str, Any]] = []  # ring buffer for the ws_collab STT driver
     captions_index: dict[str, int] = {}  # row key -> index into captions_log, for in-place ADD/EDIT
     captions_lock = threading.Lock()
+    # Live per-room snapshot, keyed by room id (e.g. "bgb-xqts-xjt") -- one
+    # entry per DRIVER meeting this bridge has ever been in, holding
+    # "as of last time we were there" host/companion profile+state. Never
+    # pruned (bounded implicitly: only a handful of driver rooms exist).
+    # A future CLIENT/GUEST meeting (the bridge just sitting in someone
+    # else's call, not one of its own servant meetings) would be keyed and
+    # snapshotted the exact same way -- no separate structure needed.
+    meeting_state: dict[str, dict[str, Any]] = {}
 
     # ---- debug/status ring buffer -- "other things" the admin UI can show
     # beside captions: autojoin verdicts, mic-select attempts, dialog
@@ -308,16 +341,25 @@ def main() -> None:
     debug_log: list[dict[str, Any]] = []
     debug_lock = threading.Lock()
 
-    def log(text: str, *, err: bool = False) -> None:
+    def log(text: str, *, err: bool = False, role: str = "bridge") -> None:
+        """`role` is which controlled identity this line is about --
+        "host", "companion", or "bridge" for cross-cutting/whole-process
+        events (join/new-meeting, autojoin, caption-DOM parsing -- all of
+        which act on the HOST tab, but aren't really "about" the host
+        identity the way a mic-select/mute/\"/say\" line is). Surfaced to the
+        admin UI's debug table as a Source column so it's clear at a glance
+        which browser window a given line came from."""
         print(text, file=sys.stderr if err else None)
         with debug_lock:
-            debug_log.append({"at": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S"), "text": text})
+            debug_log.append({"at": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S"), "text": text, "role": role})
             del debug_log[:-200]
 
     def _controlled_clients() -> list[dict[str, Any]]:
         """Every participant the bridge actively drives, and which device
         stands in for their mic/speaker -- HOST is real hardware and is
-        never automated, so it is deliberately not listed here."""
+        never automated, so it is deliberately not listed here (its own
+        profile/SSO info is on the top-level status as "hostProfile"
+        instead)."""
         clients: list[dict[str, Any]] = []
         if args.companion:
             mic = args.mic_select_device or "(WebAudio synthetic mic patch)"
@@ -330,8 +372,30 @@ def main() -> None:
                 "state": "in-call" if holder.get("companion_tab") else "not-yet-joined",
                 "mic": mic,
                 "speak": speak,
+                # Set by companion_loop() the moment it computes its own
+                # profile dir -- always known (the bridge always launches
+                # this one itself, no attach-only equivalent for companion).
+                "profile": holder.get("companion_profile"),
             })
         return clients
+
+    def _snapshot_current_meeting_state() -> None:
+        """Record host/companion profile+state for whichever room we're
+        CURRENTLY in, keyed by its room id -- called every main-loop tick
+        (cheap: a couple of dict/list builds) plus right after switch_to()
+        so a fresh join is reflected immediately rather than waiting for
+        the next poll. This is what lets meeting_state[room] answer "what
+        was HOST/COMPANION doing here?" even after the bridge has since
+        moved to a different meeting."""
+        room = room_id(holder.get("url"))
+        if not room:
+            return
+        meeting_state[room] = {
+            "url": holder.get("url"),
+            "updatedAt": time.time(),
+            "hostProfile": _host_profile_info(),
+            "clients": _controlled_clients(),
+        }
 
     def _health_server() -> None:
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -360,9 +424,10 @@ def main() -> None:
                 else:
                     with debug_lock:
                         debug_rows = list(debug_log[-50:])
+                    _snapshot_current_meeting_state()
                     body = json.dumps({
                         **status, "meetingUrl": holder.get("url"), "clients": _controlled_clients(),
-                        "debug": debug_rows,
+                        "debug": debug_rows, "meetingState": meeting_state,
                     }).encode("utf-8")
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
@@ -441,6 +506,12 @@ def main() -> None:
         companion_cdp = f"http://127.0.0.1:{companion_port}"
         companion_profile = Path(args.profile).expanduser()
         companion_profile = companion_profile.with_name(companion_profile.name + "_companion")
+        # Stashed on `holder` (not just this closure's locals) so
+        # _controlled_clients() (SSO/profile display) and disconnect_browsers()
+        # (needs the tab id to hang up over CDP) can reach them from outside
+        # this thread without recomputing/duplicating the derivation above.
+        holder["companion_cdp"] = companion_cdp
+        holder["companion_profile"] = str(companion_profile)
         told_sso = False
         told_waiting = False
         companion_tab: CdpTab | None = None
@@ -491,6 +562,7 @@ def main() -> None:
                         open_url(companion_cdp, target)
                         companion_tab = None
                         holder["companion_tab"] = None
+                        holder["companion_tab_id"] = None
                     elif not told_waiting:
                         told_waiting = True
                         print("[companion] waiting for YOU to open/join the meeting in the second window (no automation)...")
@@ -499,6 +571,7 @@ def main() -> None:
                 if companion_tab is None:
                     companion_tab = CdpTab(info["webSocketDebuggerUrl"])
                     holder["companion_tab"] = companion_tab
+                    holder["companion_tab_id"] = info.get("id")
                     mic_ready = False
                     reloaded_for_mic = False
                     mic_selected = False
@@ -522,7 +595,7 @@ def main() -> None:
                     " : 'elsewhere'"))
                 if state == "in-call" and not operator_joined:
                     operator_joined = True
-                    log("[companion] you're in -- taking over: staying muted, deaf, and present.")
+                    log("[companion] you're in -- taking over: staying muted, deaf, and present.", role="companion")
                 if state == "signin" and not operator_joined:
                     if not told_waiting:
                         told_waiting = True
@@ -564,18 +637,18 @@ def main() -> None:
                 if state == "in-call" and args.mic_select_device and not mic_selected:
                     try:
                         mic_verdict = companion_tab.evaluate(SELECT_MIC_DEVICE_JS % json.dumps(args.mic_select_device.lower()))
-                        log(f"[companion] mic-select: {mic_verdict}")
+                        log(f"[companion] mic-select: {mic_verdict}", role="companion")
                         if isinstance(mic_verdict, str) and mic_verdict.startswith("mic-selected:"):
                             mic_selected = True
                             holder["companion_mic_confirmed"] = True
                     except Exception as error:  # noqa: BLE001
-                        log(f"[companion] mic-select failed: {error}", err=True)
+                        log(f"[companion] mic-select failed: {error}", err=True, role="companion")
                 # While say_into_meeting() owns the mic, don't fight it with
                 # a mute click.
                 if time.time() >= float(holder.get("speaking_until") or 0):
                     verdict = companion_tab.evaluate(autojoin_js("muted"))
                     if verdict in ("join-clicked", "stayed-in-call", "muted", "admitted"):
-                        log(f"[companion] {verdict}")
+                        log(f"[companion] {verdict}", role="companion")
                 # The companion is deaf as well as mute: silence every media
                 # element so its tab never replays the meeting into the room
                 # (the live mic would re-capture it as an echo). Always on.
@@ -583,7 +656,8 @@ def main() -> None:
             except Exception as error:  # noqa: BLE001
                 companion_tab = None
                 holder["companion_tab"] = None
-                log(f"[companion] {error}", err=True)
+                holder["companion_tab_id"] = None
+                log(f"[companion] {error}", err=True, role="companion")
                 stop.wait(3)
             stop.wait(3)
 
@@ -597,7 +671,10 @@ def main() -> None:
         Never touches the real host mic -- this only works once --companion
         is running, has joined, and its getUserMedia patch has landed (or,
         with --tts-output-device configured, once Meet's mic dropdown is
-        pointed at a virtual cable's recording side).
+        pointed at a virtual cable's recording side). Also doubles as the
+        captioning self-test: speak known text through the companion and
+        verify Google's own captions (Emit/Phrases/Transcribe) come back
+        matching it.
         """
         tab = holder.get("companion_tab")
         if not tab:
@@ -617,21 +694,21 @@ def main() -> None:
 
                     play_wav_bytes_to_device(_base64.b64decode(b64), tts_output_device_index)
                     verdict = f"spoke-via-device-{tts_output_device_index}"
-                    log(f"[say] {unmute_verdict}/{verdict}: {text[:80]}")
+                    log(f"[say] {unmute_verdict}/{verdict}: {text[:80]}", role="companion")
                     stop.wait(duration + 0.2)
                 else:
                     verdict = tab.evaluate(SPEAK_INTO_MEETING_JS % json.dumps(b64), await_promise=True, timeout=30)
-                    log(f"[say] {unmute_verdict}/{verdict}: {text[:80]}")
+                    log(f"[say] {unmute_verdict}/{verdict}: {text[:80]}", role="companion")
                     if isinstance(verdict, str) and verdict.startswith("speaking"):
                         stop.wait(duration + 0.2)
             except Exception as error:  # noqa: BLE001
-                log(f"[say] failed: {error}", err=True)
+                log(f"[say] failed: {error}", err=True, role="companion")
             finally:
                 holder["speaking_until"] = 0.0
                 try:
                     tab.evaluate(autojoin_js("muted"))
                 except Exception as error:  # noqa: BLE001
-                    log(f"[say] re-mute failed: {error}", err=True)
+                    log(f"[say] re-mute failed: {error}", err=True, role="companion")
 
     def switch_to(target_url: str | None) -> None:
         """Leave for another meeting: /join <url> or /new (fresh servant room)."""
@@ -667,16 +744,120 @@ def main() -> None:
         if old_id:
             # Hang up the previous meeting so we are not in two calls at once.
             close_tab(cdp_endpoint, old_id)
-        log(f"[bridge] now bridging: {holder['url']}")
+        log(f"[bridge] now bridging: {holder['url']}", role="host")
+        _snapshot_current_meeting_state()
         announce(f"Meet bridge moved -- now in: {holder['url']}", {"source": "google-meet-bridge", "meetingUrl": holder["url"]})
 
+    def foreground_browsers(role: str | None = None) -> str:
+        """/foreground [host|companion]: raise the browser window(s) this
+        process is actually driving. With no role, raises every window it
+        controls (HOST always, COMPANION if --companion is armed and has
+        joined). 'guest' is accepted -- the connector table already
+        anticipates a future GUEST/CLIENT identity -- but reports honestly
+        that it isn't implemented yet rather than silently doing nothing.
+        Reports exactly which window(s) it reached; a tab that has gone
+        away (closed, crashed, never joined) is a normal, expected outcome
+        to report, not an exception to hide."""
+        wanted = (role or "").strip().lower() or None
+        if wanted == "guest":
+            return "foreground failed: guest/client tabs are not implemented yet"
+        if wanted not in (None, "host", "companion"):
+            return f"foreground failed: unknown role {wanted!r}"
+        raised: list[str] = []
+        failed: list[str] = []
+        if wanted in (None, "host"):
+            tab = holder.get("tab")
+            if tab is not None:
+                try:
+                    tab.bring_to_front()
+                    raised.append("host")
+                except Exception as error:  # noqa: BLE001
+                    failed.append(f"host ({error})")
+            else:
+                failed.append("host (no tab)")
+        if wanted in (None, "companion"):
+            companion_tab = holder.get("companion_tab")
+            if companion_tab is not None:
+                try:
+                    companion_tab.bring_to_front()
+                    raised.append("companion")
+                except Exception as error:  # noqa: BLE001
+                    failed.append(f"companion ({error})")
+            elif args.companion:
+                failed.append("companion (not joined yet)")
+            elif wanted == "companion":
+                failed.append("companion (armed with --companion first)")
+        verdict = f"foregrounded:{'+'.join(raised) or 'none'}"
+        if failed:
+            verdict += f" (failed: {', '.join(failed)})"
+        log(f"[bridge] {verdict}", role=(wanted or "bridge"))
+        return verdict
+
+    def disconnect_browsers(role: str | None = None) -> str:
+        """/disconnect [host|companion] (+ alias /hangup): hang up by
+        closing the browser tab(s) this process controls, over CDP -- the
+        same "/json/close" mechanism switch_to() already uses to hang up a
+        meeting we're leaving. HOST recovers on its own afterwards: the
+        main caption-poll loop already treats a lost tab as a normal event
+        (reattaches if the operator rejoins that window, or after 20s spins
+        up a fresh servant meeting when not --attach-only) -- exactly like a
+        real dropped call, no special-case recovery needed here. COMPANION
+        simply stops being tracked; companion_loop() relaunches it next
+        tick if --companion is still armed. 'guest' is honestly not
+        implemented, matching foreground_browsers()."""
+        wanted = (role or "").strip().lower() or None
+        if wanted == "guest":
+            return "disconnect failed: guest/client tabs are not implemented yet"
+        if wanted not in (None, "host", "companion"):
+            return f"disconnect failed: unknown role {wanted!r}"
+        closed: list[str] = []
+        failed: list[str] = []
+        if wanted in (None, "host"):
+            tab = holder.get("tab")
+            tab_id = holder.get("tab_id")
+            if tab is not None and tab_id:
+                close_tab(cdp_endpoint, tab_id)
+                try:
+                    tab.close()
+                except Exception:
+                    pass
+                holder["tab"] = None
+                holder["tab_id"] = None
+                holder["url"] = None
+                closed.append("host")
+            else:
+                failed.append("host (no tab)")
+        if wanted in (None, "companion"):
+            companion_tab = holder.get("companion_tab")
+            companion_tab_id = holder.get("companion_tab_id")
+            companion_cdp = holder.get("companion_cdp")
+            if companion_tab is not None and companion_tab_id and companion_cdp:
+                close_tab(companion_cdp, companion_tab_id)
+                try:
+                    companion_tab.close()
+                except Exception:
+                    pass
+                holder["companion_tab"] = None
+                holder["companion_tab_id"] = None
+                closed.append("companion")
+            elif args.companion:
+                failed.append("companion (not joined yet)")
+            elif wanted == "companion":
+                failed.append("companion (armed with --companion first)")
+        verdict = f"disconnected:{'+'.join(closed) or 'none'}"
+        if failed:
+            verdict += f" (failed: {', '.join(failed)})"
+        log(f"[bridge] {verdict}", role=(wanted or "bridge"))
+        return verdict
+
     def handle_command(command: str) -> str | None:
-        """Recognize /join <url>, /new (+ aliases /meet /servant), and /say
-        <text>; return a short verdict string if `command` was one of those
-        and has been acted on, or None if it isn't a recognized control
-        command. Shared by the mailbox-driven out_loop and the bridge's own
-        HTTP /command endpoint (used by the ws_collab admin UI) so both
-        paths behave identically.
+        """Recognize /join <url>, /new (+ aliases /meet /servant), /say
+        <text>, /foreground [host|companion] (+ alias /focus), and
+        /disconnect [host|companion] (+ alias /hangup); return a short
+        verdict string if `command` was one of those and has been acted on,
+        or None if it isn't a recognized control command. Shared by the
+        mailbox-driven out_loop and the bridge's own HTTP /command endpoint
+        (used by the ws_collab admin UI) so both paths behave identically.
         """
         lowered = command.lower()
         if lowered.startswith("/join"):
@@ -694,6 +875,14 @@ def main() -> None:
                 threading.Thread(target=say_into_meeting, args=(spoken,), daemon=True).start()
                 return "speaking"
             return "say-empty"
+        if lowered.startswith("/foreground") or lowered.startswith("/focus"):
+            parts = command.split(None, 1)
+            role = parts[1].strip() if len(parts) > 1 else None
+            return foreground_browsers(role)
+        if lowered.startswith("/disconnect") or lowered.startswith("/hangup"):
+            parts = command.split(None, 1)
+            role = parts[1].strip() if len(parts) > 1 else None
+            return disconnect_browsers(role)
         return None
 
     def out_loop() -> None:
@@ -772,7 +961,7 @@ def main() -> None:
                 for r in payload.get("rows") or []:
                     if r.get("speaker") == "Speaker" and r.get("key") not in fallback_logged_keys:
                         fallback_logged_keys.add(r["key"])
-                        log(f"[captions] speaker-split fallback used: {r.get('text', '')[:100]!r}")
+                        log(f"[captions] speaker-split fallback used: {r.get('text', '')[:100]!r}", role="host")
                 tracker.update(payload.get("rows") or [], payload.get("liveKeys") or [], emit)
                 note = payload.get("note") or ""
             else:
@@ -789,10 +978,10 @@ def main() -> None:
                 try:
                     verdict = tab.evaluate(autojoin_js("keep"))
                     if verdict not in ("in-call", "waiting-prejoin") and verdict != last_autojoin_verdict:
-                        log(f"[bridge] autojoin: {verdict}")
+                        log(f"[bridge] autojoin: {verdict}", role="host")
                     last_autojoin_verdict = verdict
                 except Exception as error:  # noqa: BLE001
-                    log(f"[bridge] autojoin failed: {error}", err=True)
+                    log(f"[bridge] autojoin failed: {error}", err=True, role="host")
             time.sleep(args.poll)
     except KeyboardInterrupt:
         pass
