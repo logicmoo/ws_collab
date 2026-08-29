@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 import urllib.request
@@ -38,6 +39,102 @@ BROWSER_CANDIDATES = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
 ]
+WSL_BROWSER_CANDIDATES = ["google-chrome", "google-chrome-stable", "chromium-browser", "chromium"]
+
+
+def _decode_wsl_text(raw: bytes) -> str:
+    cleaned = raw.replace(b"\x00", b"")
+    try:
+        return cleaned.decode("utf-8")
+    except UnicodeDecodeError:
+        return cleaned.decode("utf-8", errors="ignore")
+
+
+def _first_wsl_distro(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    wsl = shutil.which("wsl.exe")
+    if not wsl:
+        raise SystemExit("--browser-backend wsl requires wsl.exe on PATH")
+    found = subprocess.run([wsl, "-l", "-q"], capture_output=True, check=False)
+    lines = [line.strip().lstrip("\ufeff") for line in _decode_wsl_text(found.stdout).splitlines()]
+    distro = next((line for line in lines if line), "")
+    if not distro:
+        raise SystemExit("--browser-backend wsl found no installed WSL distros; install one or pass --wsl-distro")
+    return distro
+
+
+def _windows_to_wsl_path(path: Path) -> str:
+    text = str(path)
+    match = re.match(r"^([A-Za-z]):\\(.*)$", text)
+    if not match:
+        raise SystemExit(f"WSL browser backend needs a drive-backed Windows profile path, got: {text}")
+    drive, rest = match.groups()
+    return f"/mnt/{drive.lower()}/{rest.replace('\\', '/')}"
+
+
+def _find_wsl_browser(distro: str) -> str:
+    wsl = shutil.which("wsl.exe")
+    if not wsl:
+        raise SystemExit("--browser-backend wsl requires wsl.exe on PATH")
+    probe = " || ".join([f"command -v {name}" for name in WSL_BROWSER_CANDIDATES]) + " || true"
+    found = subprocess.run([wsl, "-d", distro, "--", "bash", "-lc", probe], capture_output=True, check=False)
+    lines = [line.strip() for line in _decode_wsl_text(found.stdout).splitlines() if line.strip()]
+    if lines:
+        return lines[0]
+    raise SystemExit(
+        "--browser-backend wsl could not find Chrome/Chromium inside WSL "
+        f"distro {distro!r}; install one of: {', '.join(WSL_BROWSER_CANDIDATES)}"
+    )
+
+
+def build_launch(
+    backend: str,
+    port: int,
+    profile: Path,
+    url: str,
+    *,
+    browser: str | None = None,
+    wsl_distro: str | None = None,
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    extra_args = list(extra_args or [])
+    if backend == "windows":
+        return [
+            find_browser(browser),
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--use-fake-ui-for-media-stream",
+            *extra_args,
+            url,
+        ]
+    if backend != "wsl":
+        raise SystemExit(f"Unknown browser backend: {backend}")
+    distro = _first_wsl_distro(wsl_distro)
+    browser_name = _find_wsl_browser(distro)
+    display_num = 90 + (port % 100)
+    wsl_profile = _windows_to_wsl_path(profile)
+    chrome_args = [
+        browser_name,
+        f"--remote-debugging-port={port}",
+        "--remote-debugging-address=0.0.0.0",
+        f"--user-data-dir={wsl_profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--use-fake-ui-for-media-stream",
+        "--no-sandbox",
+        *extra_args,
+        url,
+    ]
+    chrome_cmd = " ".join(subprocess.list2cmdline([arg]) for arg in chrome_args)
+    script = (
+        f"mkdir -p {subprocess.list2cmdline([wsl_profile])} && "
+        f"(Xvfb :{display_num} -screen 0 1920x1080x24 >/tmp/xvfb-{display_num}.log 2>&1 &) ; "
+        f"export DISPLAY=:{display_num}; exec {chrome_cmd}"
+    )
+    return [shutil.which("wsl.exe") or "wsl.exe", "-d", distro, "--", "bash", "-lc", script]
 
 
 def _http_json(url: str, *, method: str = "GET", timeout: float = 5.0) -> Any:
@@ -154,23 +251,19 @@ def launch_browser(args: Any) -> str:
     profile = Path(args.profile).expanduser()
     profile.mkdir(parents=True, exist_ok=True)
     if not cdp_alive(cdp):
-        browser = find_browser(args.browser)
         url = args.meet or ("https://meet.google.com/new" if args.new else "https://accounts.google.com/")
-        subprocess.Popen(
-            [
-                browser,
-                f"--remote-debugging-port={port}",
-                f"--user-data-dir={profile}",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--use-fake-ui-for-media-stream",
-                "--autoplay-policy=no-user-gesture-required",
-                "--new-window",
-                url,
-            ],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        argv = build_launch(
+            getattr(args, "browser_backend", "windows"),
+            port,
+            profile,
+            url,
+            browser=args.browser,
+            wsl_distro=getattr(args, "wsl_distro", None),
+            extra_args=["--autoplay-policy=no-user-gesture-required", "--new-window"],
         )
-        print(f"[bridge] browser window opened ({Path(browser).name}, profile {profile})")
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        label = Path(find_browser(args.browser)).name if getattr(args, "browser_backend", "windows") == "windows" else "WSL Chrome/Chromium"
+        print(f"[bridge] browser window opened ({label}, profile {profile})")
         print("[bridge] pick your Google account in that window (SSO persists for next time)...")
         deadline = time.time() + 60
         while time.time() < deadline and not cdp_alive(cdp):

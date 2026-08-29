@@ -42,6 +42,41 @@ First run: a Chrome window pops up with its own persistent profile -- pick
 your Google account once (the SSO login persists across runs; `--forget-sso`
 wipes it to switch accounts).
 
+## Browser backend
+
+By default the bridge launches a normal visible **Windows** Chrome/Edge window.
+You can keep that unchanged, or switch the browser hosting backend:
+
+```
+ws-collab-meet-bridge --browser-backend windows   # default
+ws-collab-meet-bridge --browser-backend wsl        # run Chrome inside WSL2 + Xvfb
+ws-collab-meet-bridge --browser-backend wsl --wsl-distro Ubuntu-24.04
+```
+
+- `--browser-backend windows` keeps today's behavior: native Windows browser
+  windows, visible on the desktop, foreground-able with `/foreground`.
+- `--browser-backend wsl` launches Chrome/Chromium **inside WSL2** under a real
+  `Xvfb` virtual display, so there is **no Windows OS window at all**. CDP is
+  still reached from the Windows-side Python bridge at `http://127.0.0.1:<port>`.
+- `--wsl-distro` picks which distro to use; otherwise the first distro from
+  `wsl -l -q` is used.
+
+WSL mode expects Chrome/Chromium and `Xvfb` to already be installed inside that
+distro. Modern WSL2 usually forwards the CDP port to Windows loopback
+automatically. If it does not on your machine, try:
+
+```ini
+[wsl2]
+networkingMode=mirrored
+```
+
+in `%USERPROFILE%\.wslconfig`, then run `wsl --shutdown` and start the bridge
+again.
+
+Limitation: in `--browser-backend wsl` mode, `/foreground` can only report that
+the tab exists -- it cannot raise a real Windows OS window, because Xvfb-hosted
+Chrome has no desktop window by design.
+
 ## HTTP API (what ws_collab consumes)
 
 The bridge exposes a small local, unauthenticated HTTP API on its own port
@@ -77,7 +112,8 @@ instead of silently dropped.
 ## Limitations
 
 - Windows-only (Windows SAPI for TTS, MME/DirectSound/WASAPI/WDM-KS device
-  enumeration for the virtual-cable path).
+  enumeration for the virtual-cable path; `--browser-backend wsl` still uses
+  Windows-side TTS/audio, only the browser itself moves into WSL2).
 - A CLIENT/GUEST mode (single account, no host authority, joins meetings
   other people host) is designed but not built.
 - Meet's caption DOM is scraped via stable ARIA semantics, not fixed class

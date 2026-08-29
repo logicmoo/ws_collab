@@ -90,6 +90,7 @@ from .cdp import (
     DEFAULT_CDP,
     DEFAULT_PROFILE,
     CdpTab,
+    build_launch,
     cdp_alive,
     close_tab,
     find_browser,
@@ -147,6 +148,8 @@ def main() -> None:
     parser.add_argument("--self-name", default="You", help="Name captions attribute to the bridge account's own mic (Meet shows 'You'; default %(default)s)")
     parser.add_argument("--no-autojoin", action="store_true", help="Do not auto-click Join/mic/captions -- drive the Meet window manually")
     parser.add_argument("--browser", default=None, help="Path to chrome.exe/msedge.exe for the popup (auto-detected)")
+    parser.add_argument("--browser-backend", choices=["windows", "wsl"], default=os.environ.get("MEET_BRIDGE_BROWSER_BACKEND", "windows"), help="How to host the Chrome window(s): 'windows' (default, a normal visible window) or 'wsl' (runs inside WSL2 under a real Xvfb virtual display -- genuinely invisible on the Windows desktop, not just off-screen)")
+    parser.add_argument("--wsl-distro", default=os.environ.get("MEET_BRIDGE_WSL_DISTRO"), help="WSL distro name for --browser-backend wsl (default: first distro from `wsl -l -q`)")
     parser.add_argument("--profile", default=str(DEFAULT_PROFILE), help="Persistent profile dir for the popup browser (keeps your SSO login; default %(default)s)")
     parser.add_argument("--port", type=int, default=9223, help="DevTools port for the popup browser (default %(default)s)")
     parser.add_argument("--forget-sso", action="store_true", help="Wipe the popup browser's stored Google login (profile dir) and exit -- use when the SSO session expired or to switch accounts")
@@ -322,7 +325,7 @@ def main() -> None:
     # `captionCount` = distinct stored rows (add/edit collapses to one per
     # key); `emitCount` = total raw emit() calls ever made (every add AND
     # every edit counted separately).
-    status: dict[str, Any] = {"ok": True, "service": "ws_collab_meet_bridge", "meetingUrl": holder.get("url"), "lastCaptionAt": None, "captionCount": 0, "emitCount": 0, "outbox": args.outbox, "recipients": recipients, "hostProfile": _host_profile_info()}
+    status: dict[str, Any] = {"ok": True, "service": "ws_collab_meet_bridge", "meetingUrl": holder.get("url"), "lastCaptionAt": None, "captionCount": 0, "emitCount": 0, "outbox": args.outbox, "recipients": recipients, "hostProfile": _host_profile_info(), "browserBackend": args.browser_backend}
     captions_log: list[dict[str, Any]] = []  # ring buffer for the ws_collab STT driver
     captions_index: dict[str, int] = {}  # row key -> index into captions_log, for in-place ADD/EDIT
     captions_lock = threading.Lock()
@@ -534,17 +537,16 @@ def main() -> None:
             try:
                 if not cdp_alive(companion_cdp):
                     companion_profile.mkdir(parents=True, exist_ok=True)
-                    browser = find_browser(args.browser)
                     subprocess.Popen(
-                        [
-                            browser,
-                            f"--remote-debugging-port={companion_port}",
-                            f"--user-data-dir={companion_profile}",
-                            "--no-first-run", "--no-default-browser-check",
-                            "--use-fake-ui-for-media-stream",
-                            "--mute-audio",
-                            "--new-window", target,
-                        ],
+                        build_launch(
+                            getattr(args, "browser_backend", "windows"),
+                            companion_port,
+                            companion_profile,
+                            target,
+                            browser=args.browser,
+                            wsl_distro=getattr(args, "wsl_distro", None),
+                            extra_args=["--mute-audio", "--new-window"],
+                        ),
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     )
                     if not told_sso:
@@ -768,21 +770,27 @@ def main() -> None:
         if wanted in (None, "host"):
             tab = holder.get("tab")
             if tab is not None:
-                try:
-                    tab.bring_to_front()
-                    raised.append("host")
-                except Exception as error:  # noqa: BLE001
-                    failed.append(f"host ({error})")
+                if args.browser_backend == "wsl":
+                    failed.append("host (backend=wsl, no OS window to foreground by design)")
+                else:
+                    try:
+                        tab.bring_to_front()
+                        raised.append("host")
+                    except Exception as error:  # noqa: BLE001
+                        failed.append(f"host ({error})")
             else:
                 failed.append("host (no tab)")
         if wanted in (None, "companion"):
             companion_tab = holder.get("companion_tab")
             if companion_tab is not None:
-                try:
-                    companion_tab.bring_to_front()
-                    raised.append("companion")
-                except Exception as error:  # noqa: BLE001
-                    failed.append(f"companion ({error})")
+                if args.browser_backend == "wsl":
+                    failed.append("companion (backend=wsl, no OS window to foreground by design)")
+                else:
+                    try:
+                        companion_tab.bring_to_front()
+                        raised.append("companion")
+                    except Exception as error:  # noqa: BLE001
+                        failed.append(f"companion ({error})")
             elif args.companion:
                 failed.append("companion (not joined yet)")
             elif wanted == "companion":

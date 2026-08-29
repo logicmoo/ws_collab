@@ -2114,6 +2114,7 @@ async function loadMeet() {
     `service       ${health.service || "ws_collab_meet_bridge"}`,
     `meeting       ${health.meetingUrl || "\u2014"}`,
     `chrome profile (host)   ${hostProfileLabel}`,
+    `browser backend  ${health.browserBackend || "windows"}`,
     `captions      ${health.captionCount ?? 0} total, last at ${health.lastCaptionAt || "\u2014"}`,
     `outbox        ${health.outbox || "\u2014"}`,
     `transcripts   \u2192 ${(health.recipients || []).join(", ") || "\u2014"}`,
