@@ -1714,7 +1714,14 @@ async function loadBrowserSettings() {
       ["Setting", "Value"],
       [
         ["Browser backend", backend],
-        ["Host profile path", profile],
+        ["Host profile path", (() => {
+          const wrap = el("div");
+          const jump = el("a", null, "Manage SSO sign-in →");
+          jump.href = "#sso";
+          jump.style.marginLeft = "8px";
+          wrap.append(profile, jump);
+          return wrap;
+        })()],
         ["Companion profile path", mono(data.companion_profile_path || "—")],
         ["Shared window", sharedWrap],
       ],
