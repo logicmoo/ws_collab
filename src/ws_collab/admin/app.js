@@ -2126,6 +2126,13 @@ function setAllMeetRowCounts(value) {
   });
 }
 
+function setAllMeetAutoscroll(on) {
+  MEET_SCROLL_LABELS.forEach((label) => {
+    setMeetAutoscroll(label, on);
+    if (on) applyMeetRowCount(label);
+  });
+}
+
 function meetCopyLink(url) {
   const room = meetRoomId(url) || url;
   const link = el("a", "mono", room);
@@ -2409,10 +2416,37 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
 async function loadMeet() {
   const statusLine = $("meet-status-line");
   const dot = $("meet-nav-dot");
+  const autoBtn = actionButton("", "mini toggle");
+  const paintAutoAll = (on) => {
+    autoBtn.textContent = on ? "Autoscroll: ON" : "Autoscroll: OFF";
+    autoBtn.classList.toggle("on", on);
+  };
+  const allAutoOn = MEET_SCROLL_LABELS.every((label) => getMeetAutoscroll(label));
+  paintAutoAll(allAutoOn);
+  autoBtn.onclick = () => {
+    const next = !MEET_SCROLL_LABELS.every((label) => getMeetAutoscroll(label));
+    setAllMeetAutoscroll(next);
+    paintAutoAll(next);
+  };
+  const exactAll = el("input", "mini-input");
+  exactAll.type = "number";
+  exactAll.min = "2";
+  exactAll.step = "1";
+  exactAll.id = "meet-exact-all";
+  exactAll.style.width = "72px";
+  exactAll.onchange = () => {
+    const rows = Math.max(2, parseInt(exactAll.value, 10) || 10);
+    exactAll.value = String(rows);
+    setAllMeetRowCounts(rows);
+  };
   $("meet-kind-toolbar").replaceChildren(
     el("span", "mini-label", "Show:"),
     meetKindToggle("driver", "Driver"),
     meetKindToggle("client", "Client"),
+    actionButton("Clear all", "mini", clearAllMeetSections),
+    autoBtn,
+    el("span", "mini-label", "Exact"),
+    exactAll,
   );
   let health;
   try {
@@ -3430,13 +3464,6 @@ function wireEvents() {
     .forEach((btn) => wireCatFilter(btn, loadDevices));
   $("dv-search").addEventListener("input", loadDevices);
   $("meet-refresh").onclick = loadMeet;
-  $("meet-clear-all").onclick = clearAllMeetSections;
-  $("meet-exact-all").onchange = () => {
-    const input = $("meet-exact-all");
-    const rows = Math.max(2, parseInt(input.value, 10) || 10);
-    input.value = String(rows);
-    setAllMeetRowCounts(rows);
-  };
   $("meet-join-btn").onclick = () => {
     const url = $("meet-join-url").value.trim();
     if (!url) { pushError("Enter a meeting URL to join."); return; }
