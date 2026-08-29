@@ -1005,7 +1005,7 @@ function showPage(page) {
   const loaders = {
     workers: loadWorkers, alerts: loadAlerts, devices: loadDevices, voices: loadVoices,
     accuracy: loadAccuracy, cursors: loadCursors, prompt: loadPrompt, system: loadSystem,
-    meet: loadMeetWithPolling, stt: loadStt, meetbridge: loadMeetBridge, processes: loadProcesses,
+    meet: loadMeetWithPolling, stt: loadStt, meetbridge: loadMeetBridge, processes: loadProcesses, sso: loadSsoPage,
   };
   if (loaders[page]) loaders[page]();
   Object.values(state.views).forEach((v) => v.draw());
@@ -1609,6 +1609,11 @@ async function postMeetBridgeCommand(command) {
   loadMeetBridge();
 }
 
+function loadSsoPage() {
+  $("mb-sso-result").textContent = "";
+  loadMeetSso();
+}
+
 async function postMeetSso(path, body, confirmText) {
   if (confirmText && !confirm(confirmText)) return;
   const resultEl = $("mb-sso-result");
@@ -1718,8 +1723,10 @@ async function loadProcesses() {
  * microphone" vs. a device name) — no separate checkbox needed for that. */
 function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
   const rejoin = (state) => actionButton(state === "in-call" ? "Rejoin" : "Join", "", () => postMeetCommand(`/join ${url}`));
+  const captureListening = !!state.meetCaptureListening;
   const actionsFor = (role) => {
     const wrap = el("span", "meet-row-actions");
+    if (role === "host") wrap.append(actionButton(captureListening ? "Mute" : "Unmute", "mini", () => toggleMeetCapture(captureListening)));
     wrap.append(
       actionButton("Foreground", "mini", () => postMeetCommand(`/foreground ${role}`)),
       actionButton("Disconnect", "mini danger", () => postMeetCommand(`/disconnect ${role}`)),
@@ -1735,7 +1742,7 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
   };
   const ssoLink = (profile) => {
     const link = el("a", null, ssoLabel(profile));
-    link.href = "#meetbridge";
+    link.href = "#sso";
     return link;
   };
   if (kind === "client") {
@@ -1982,6 +1989,15 @@ function meetDevicesLink() {
   return link;
 }
 
+async function toggleMeetCapture(listening) {
+  try {
+    await api(`${V1}/audio/capture/${listening ? "stop" : "start"}`, { method: "POST", body: {} });
+  } catch (error) {
+    pushError(error.message);
+  }
+  loadMeet();
+}
+
 /* One streaming section: a small toolbar (Clear + an Autoscroll on/off
  * toggle, default ON per the operator's request) above a fixed-height
  * (~10 rows) scrollable box the operator can still drag taller (native CSS
@@ -2220,6 +2236,12 @@ async function loadMeet() {
   const dot = $("meet-nav-dot");
   let health;
   try {
+    const capture = await api(`${V1}/audio/capture`);
+    state.meetCaptureListening = !!capture.listening;
+  } catch (_error) {
+    state.meetCaptureListening = false;
+  }
+  try {
     health = await api(`${MEET_BRIDGE_BASE}/health`);
   } catch (error) {
     statusLine.textContent = `bridge offline (${error.message}) — start it from the Processes page or ` +
@@ -2383,7 +2405,6 @@ function mbPollOnce() {
 async function loadMeetBridge() {
   const feed = $("mb-captions-feed");
   if (!feed.hasChildNodes()) feed.appendChild(el("div", "hint", "Caption lines appear here the moment anyone speaks in the bridged meeting."));
-  loadMeetSso();
   if (mbPolling) return;
   mbPolling = true;
   mbPollOnce();
@@ -3241,6 +3262,7 @@ function wireEvents() {
     postMeetCommand(`/say ${text}`);
   };
   $("mb-refresh").onclick = loadMeetBridge;
+  $("sso-refresh").onclick = loadSsoPage;
   $("ps-refresh").onclick = loadProcesses;
   $("mb-join-btn").onclick = () => {
     const url = $("mb-join-url").value.trim();
