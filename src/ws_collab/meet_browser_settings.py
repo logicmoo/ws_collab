@@ -12,8 +12,8 @@ from typing import Any
 class MeetBrowserSettings:
     """A small atomic JSON store for Meet browser launch preferences."""
 
-    _PROFILE_MODE_KEY = "profile_mode"
-    _SHARED_PROFILES_KEY = "shared_profiles"
+    _PROFILES_KEY = "profiles"
+    _LEGACY_PROFILES_KEY = "shared_profiles"
 
     def __init__(self, directory: Path | str):
         self.directory = Path(directory)
@@ -55,23 +55,13 @@ class MeetBrowserSettings:
                 self._data[key] = value
             self._save()
 
-    def get_profile_mode(self) -> str:
-        mode = str(self.get(self._PROFILE_MODE_KEY, "separate") or "separate").strip().lower()
-        return mode if mode in {"shared", "separate"} else "separate"
-
-    def set_profile_mode(self, mode: str) -> None:
-        wanted = str(mode or "separate").strip().lower()
-        if wanted not in {"shared", "separate"}:
-            wanted = "separate"
-        self.set(self._PROFILE_MODE_KEY, wanted)
-
-    def _shared_profiles_copy(self) -> dict[str, Any]:
-        raw = self.get(self._SHARED_PROFILES_KEY, {})
+    def _profiles_copy(self) -> dict[str, Any]:
+        raw = self.get(self._PROFILES_KEY, self.get(self._LEGACY_PROFILES_KEY, {}))
         return raw if isinstance(raw, dict) else {}
 
-    def get_shared_profile_state(self, profile_path: Path | str) -> dict[str, Any]:
+    def get_profile_state(self, profile_path: Path | str) -> dict[str, Any]:
         key = str(Path(profile_path).expanduser())
-        profiles = self._shared_profiles_copy()
+        profiles = self._profiles_copy()
         state = profiles.get(key, {})
         if not isinstance(state, dict):
             state = {}
@@ -82,7 +72,7 @@ class MeetBrowserSettings:
             "role_account_map": role_account_map if isinstance(role_account_map, dict) else {},
         }))
 
-    def set_shared_profile_state(
+    def set_profile_state(
         self,
         profile_path: Path | str,
         *,
@@ -91,7 +81,7 @@ class MeetBrowserSettings:
     ) -> dict[str, Any]:
         key = str(Path(profile_path).expanduser())
         with self._lock:
-            profiles = self._shared_profiles_copy()
+            profiles = self._profiles_copy()
             state = profiles.get(key, {})
             if not isinstance(state, dict):
                 state = {}
@@ -100,6 +90,19 @@ class MeetBrowserSettings:
             if role_account_map is not None:
                 state["role_account_map"] = role_account_map
             profiles[key] = state
-            self._data[self._SHARED_PROFILES_KEY] = profiles
+            self._data[self._PROFILES_KEY] = profiles
+            self._data.pop(self._LEGACY_PROFILES_KEY, None)
             self._save()
-        return self.get_shared_profile_state(key)
+        return self.get_profile_state(key)
+
+    def clear_profile_state(self, profile_path: Path | str) -> None:
+        key = str(Path(profile_path).expanduser())
+        with self._lock:
+            profiles = self._profiles_copy()
+            profiles.pop(key, None)
+            if profiles:
+                self._data[self._PROFILES_KEY] = profiles
+            else:
+                self._data.pop(self._PROFILES_KEY, None)
+            self._data.pop(self._LEGACY_PROFILES_KEY, None)
+            self._save()

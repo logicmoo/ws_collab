@@ -21,12 +21,14 @@ Playwright/Selenium), and has two jobs:
 ## Why two bots (HOST + COMPANION)
 
 Google ends or nags a meeting that has only one silent participant. `--companion`
-keeps a **second** signed-in Google account (its own SSO profile, signed in
-once) sitting **muted and deaf** in the call so Google always sees two
-participants. The real (HOST) account's microphone is never touched by any
-automation; the companion's "microphone" is a synthetic in-page WebAudio
-source (or, if `--mic-select-device`/`--tts-output-device` are configured, a
-real virtual-cable device) that only carries `/say` speech, never the room.
+keeps a **second** signed-in Google account sitting **muted and deaf** in the
+call so Google always sees two participants. Both accounts use one Chrome
+profile and process, with one tab per account selected by Google's
+`?authuser=N` URL parameter. The real (HOST) account's microphone is never
+touched by automation; the companion's "microphone" is a synthetic in-page
+WebAudio source (or, if `--mic-select-device`/`--tts-output-device` are
+configured, a real virtual-cable device) that only carries `/say` speech,
+never the room.
 
 ## Running it
 
@@ -38,9 +40,36 @@ ws-collab-meet-bridge --companion        # + a second muted account
 ws-collab-meet-bridge --list-audio-devices
 ```
 
-First run: a Chrome window pops up with its own persistent profile -- pick
-your Google account once (the SSO login persists across runs; `--forget-sso`
-wipes it to switch accounts).
+First run: one Chrome window pops up with a persistent profile. Sign in every
+Google account the bridge will use; the sessions persist across runs.
+`--forget-sso` wipes the whole browser profile.
+
+## Accounts and Meet roles
+
+Browser sign-in state is account-centric. The admin **SSO / Browser** page
+discovers accounts in the profile and gives them stable local IDs (`sso_1`,
+`sso_2`, ...). Those IDs remain attached to known accounts even if Google
+changes their numeric `authuser` slots. `role_account_map` is only the mapping
+from a Meet role such as HOST or COMPANION to one of those account IDs. Each
+active role must use a distinct account.
+
+The next-launch command includes the current numeric slots:
+
+```
+ws-collab-meet-bridge --companion \
+  --role-authuser host=0 \
+  --role-authuser companion=1
+```
+
+The defaults are HOST `authuser=0`, COMPANION `authuser=1`, and the reserved
+future GUEST slot `authuser=2`. Assign accounts on the **Google Meet** page
+rather than associating particular email addresses with roles in configuration.
+
+The Browser and SSO panels are intentionally account-only: Browser configures
+the single profile path and backend, while SSO manages signed-in accounts.
+HOST/COMPANION assignment is shown only on the Google Meet page because it is
+meeting orchestration, not browser state. These settings affect only the next
+bridge launch; they do not reconfigure a running process.
 
 ## Browser backend
 
@@ -54,7 +83,7 @@ ws-collab-meet-bridge --browser-backend wsl --wsl-distro Ubuntu-24.04
 ```
 
 - `--browser-backend windows` keeps today's behavior: native Windows browser
-  windows, visible on the desktop, foreground-able with `/foreground`.
+  window, visible on the desktop and foreground-able with `/foreground`.
 - `--browser-backend wsl` launches Chrome/Chromium **inside WSL2** under a real
   `Xvfb` virtual display, so there is **no Windows OS window at all**. CDP is
   still reached from the Windows-side Python bridge at `http://127.0.0.1:<port>`.

@@ -775,10 +775,10 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         auth = await _require(request, "operator", mutating=True)
         return guarded(service.set_voice_profile, agent_id, body, auth.principal.label)
 
-    @router.get(f"{mount}/meet/sso/profiles")
-    async def meet_sso_profiles(request: Request) -> dict[str, Any]:
+    @router.get(f"{mount}/meet/sso/accounts")
+    async def meet_sso_accounts(request: Request) -> dict[str, Any]:
         await _require(request, "viewer")
-        return guarded(service.list_meet_sso_profiles)
+        return guarded(service.list_meet_sso_accounts)
 
     @router.get(f"{mount}/meet/browser-settings")
     async def meet_browser_settings(request: Request) -> dict[str, Any]:
@@ -791,18 +791,24 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         return guarded(
             service.set_meet_browser_settings,
             body.get("browser_backend", "windows"),
-            bool(body.get("shared_window", False)),
             body.get("profile_path", ""),
-            body.get("profile_mode", "separate"),
-            body.get("role_account_map"),
         )
+
+    @router.get(f"{mount}/meet/role-assignments")
+    async def meet_role_assignments(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.get_meet_role_assignments)
+
+    @router.post(f"{mount}/meet/role-assignments")
+    async def set_meet_role_assignments(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.set_meet_role_assignments, body.get("role_account_map"))
 
     @router.post(f"{mount}/meet/sso/open")
     async def meet_sso_open(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
         return guarded(
-            service.open_meet_sso_profile,
-            body.get("role", ""),
+            service.open_meet_sso_account,
             body.get("account_id", ""),
             bool(body.get("add_account", False)),
         )
@@ -810,7 +816,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     @router.post(f"{mount}/meet/sso/forget")
     async def meet_sso_forget(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
-        return guarded(service.forget_meet_sso_profile, body.get("role", ""))
+        return guarded(service.forget_meet_sso_profile)
 
     # ---------------------------------------------------------------- convert
     @router.post(f"{mount}/convert")

@@ -66,7 +66,7 @@ from .tts.engine import TtsEngine
 from .tts.voices import VoiceManager
 from .workers import WorkerMonitor
 from . import __version__
-from .meet_bridge.cdp import DEFAULT_PROFILE, companion_profile_path, find_browser
+from .meet_bridge.cdp import DEFAULT_PROFILE, find_browser
 from .meet_browser_settings import MeetBrowserSettings
 
 
@@ -77,8 +77,7 @@ DEFAULT_ROUTE_SOURCE = "microphone"
 # stream, not the pre-filter read window, so virtual/merge streams scan sources up
 # to this ceiling (effectively "all") and only truncate the final result.
 _MAX_SCAN = 100_000
-MEET_PROFILE_MODES = {"separate", "shared"}
-MEET_SHARED_ROLES = ("host", "companion", "guest")
+MEET_ROLES = ("host", "companion", "guest")
 
 
 def _sso_sort_key(account_id: str) -> tuple[int, str]:
@@ -97,7 +96,7 @@ def _coerce_authuser(value: Any) -> int | None:
 def _default_authuser_for_role(role: str) -> int | None:
     role = str(role or "").strip().lower()
     try:
-        return MEET_SHARED_ROLES.index(role)
+        return MEET_ROLES.index(role)
     except ValueError:
         return None
 
@@ -255,30 +254,26 @@ class WsCollabService:
         except Exception:
             return None
 
-    def _meet_profile_mode(self) -> str:
-        mode = self.meet_browser_settings.get_profile_mode()
-        return mode if mode in MEET_PROFILE_MODES else "separate"
-
     def _meet_profile_path(self) -> Path:
         return Path(str(self.meet_browser_settings.get("profile_path") or DEFAULT_PROFILE)).expanduser()
 
-    def _meet_shared_state(self, profile_path: Path | None = None) -> dict[str, Any]:
-        return self.meet_browser_settings.get_shared_profile_state(profile_path or self._meet_profile_path())
+    def _meet_profile_state(self, profile_path: Path | None = None) -> dict[str, Any]:
+        return self.meet_browser_settings.get_profile_state(profile_path or self._meet_profile_path())
 
-    def _set_meet_shared_state(
+    def _set_meet_profile_state(
         self,
         profile_path: Path | None = None,
         *,
         accounts: dict[str, Any] | None = None,
         role_account_map: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self.meet_browser_settings.set_shared_profile_state(
+        return self.meet_browser_settings.set_profile_state(
             profile_path or self._meet_profile_path(),
             accounts=accounts,
             role_account_map=role_account_map,
         )
 
-    def _normalize_shared_accounts(self, accounts: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    def _normalize_sso_accounts(self, accounts: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
         cleaned: dict[str, dict[str, Any]] = {}
         if not isinstance(accounts, dict):
             return cleaned
@@ -297,15 +292,15 @@ class WsCollabService:
 
     def _normalize_role_account_map(self, mapping: dict[str, Any] | None, accounts: dict[str, dict[str, Any]]) -> dict[str, str]:
         cleaned: dict[str, str] = {}
+        assigned: set[str] = set()
         if isinstance(mapping, dict):
-            for role, account_id in mapping.items():
-                role_name = str(role or "").strip().lower()
-                value = str(account_id or "").strip()
-                if not role_name or not value:
+            for role_name in MEET_ROLES:
+                value = str(mapping.get(role_name) or "").strip()
+                if not value or value not in accounts or value in assigned:
                     continue
                 cleaned[role_name] = value
-        assigned = {value for value in cleaned.values() if value}
-        for role in MEET_SHARED_ROLES:
+                assigned.add(value)
+        for role in MEET_ROLES:
             if role in cleaned:
                 continue
             for account_id in sorted(accounts, key=_sso_sort_key):
@@ -316,12 +311,17 @@ class WsCollabService:
                 break
         return cleaned
 
-    def _persist_live_shared_accounts(self, health: dict[str, Any] | None) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-        live_host_profile = Path(str(((health or {}).get("hostProfile") or {}).get("path") or self._meet_profile_path())).expanduser()
-        state = self._meet_shared_state(live_host_profile)
-        stored_accounts = self._normalize_shared_accounts(state.get("accounts"))
+    def _persist_live_sso_accounts(self, health: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+        profile_path = Path(str(((health or {}).get("hostProfile") or {}).get("path") or self._meet_profile_path())).expanduser()
+        state = self._meet_profile_state(profile_path)
+        stored_accounts = self._normalize_sso_accounts(state.get("accounts"))
         live_rows = (health or {}).get("ssoAccounts") or []
-        next_num = max([_sso_sort_key(account_id)[0] for account_id in stored_accounts] or [0]) + 1
+        existing_numbers = [
+            number
+            for account_id in stored_accounts
+            if (number := _sso_sort_key(account_id)[0]) < 10_000_000
+        ]
+        next_num = max(existing_numbers or [0]) + 1
         by_email = {
             str(row.get("email") or "").strip().lower(): account_id
             for account_id, row in stored_accounts.items()
@@ -339,7 +339,10 @@ class WsCollabService:
             email = str(raw.get("email") or "").strip().lower()
             account_id = by_email.get(email) if email else None
             if account_id is None and authuser is not None:
-                account_id = by_authuser.get(authuser)
+                candidate = by_authuser.get(authuser)
+                candidate_email = str((stored_accounts.get(candidate or "") or {}).get("email") or "").strip().lower()
+                if not email or not candidate_email:
+                    account_id = candidate
             if account_id is None:
                 account_id = f"sso_{next_num}"
                 next_num += 1
@@ -350,44 +353,46 @@ class WsCollabService:
             if label:
                 merged["label"] = label
             if authuser is not None:
+                for other_id, other in stored_accounts.items():
+                    if other_id != account_id and _coerce_authuser(other.get("authuser")) == authuser:
+                        other["authuser"] = None
                 merged["authuser"] = authuser
             stored_accounts[account_id] = merged
             if email:
                 by_email[email] = account_id
             if authuser is not None:
                 by_authuser[authuser] = account_id
-        role_account_map = self._normalize_role_account_map(state.get("role_account_map"), stored_accounts)
-        self._set_meet_shared_state(live_host_profile, accounts=stored_accounts, role_account_map=role_account_map)
-        return stored_accounts, role_account_map
+        self._set_meet_profile_state(profile_path, accounts=stored_accounts)
+        return stored_accounts
 
-    def _shared_accounts_and_roles(self, health: dict[str, Any] | None = None, *, profile_path: Path | None = None) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    def _sso_accounts(self, health: dict[str, Any] | None = None, *, profile_path: Path | None = None) -> dict[str, dict[str, Any]]:
         path = Path(profile_path or self._meet_profile_path()).expanduser()
-        if health and str((health.get("profileMode") or "")).strip().lower() == "shared":
-            accounts, role_account_map = self._persist_live_shared_accounts(health)
+        if health:
+            accounts = self._persist_live_sso_accounts(health)
             if live_path := ((health.get("hostProfile") or {}).get("path")):
                 if Path(str(live_path)).expanduser() == path:
-                    return accounts, role_account_map
-        state = self._meet_shared_state(path)
-        accounts = self._normalize_shared_accounts(state.get("accounts"))
+                    return accounts
+        state = self._meet_profile_state(path)
+        accounts = self._normalize_sso_accounts(state.get("accounts"))
+        self._set_meet_profile_state(path, accounts=accounts)
+        return accounts
+
+    def _sso_account_rows(self, accounts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {**accounts[account_id], "id": account_id}
+            for account_id in sorted(accounts, key=_sso_sort_key)
+        ]
+
+    def _meet_role_account_map(self, accounts: dict[str, dict[str, Any]], profile_path: Path | None = None) -> dict[str, str]:
+        path = Path(profile_path or self._meet_profile_path()).expanduser()
+        state = self._meet_profile_state(path)
         role_account_map = self._normalize_role_account_map(state.get("role_account_map"), accounts)
-        self._set_meet_shared_state(path, accounts=accounts, role_account_map=role_account_map)
-        return accounts, role_account_map
+        self._set_meet_profile_state(path, role_account_map=role_account_map)
+        return role_account_map
 
-    def _shared_account_rows(self, accounts: dict[str, dict[str, Any]], role_account_map: dict[str, str]) -> list[dict[str, Any]]:
-        role_lookup: dict[str, list[str]] = {}
-        for role, account_id in role_account_map.items():
-            role_lookup.setdefault(account_id, []).append(role)
+    def _meet_role_assignments(self, accounts: dict[str, dict[str, Any]], role_account_map: dict[str, str]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for account_id in sorted(accounts, key=_sso_sort_key):
-            row = dict(accounts[account_id])
-            row["id"] = account_id
-            row["assigned_roles"] = sorted(role_lookup.get(account_id, []))
-            rows.append(row)
-        return rows
-
-    def _shared_role_assignments(self, accounts: dict[str, dict[str, Any]], role_account_map: dict[str, str]) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        for role in MEET_SHARED_ROLES:
+        for role in MEET_ROLES:
             account_id = role_account_map.get(role)
             account = accounts.get(account_id or "", {})
             rows.append({
@@ -399,9 +404,9 @@ class WsCollabService:
             })
         return rows
 
-    def _shared_role_authusers(self, accounts: dict[str, dict[str, Any]], role_account_map: dict[str, str]) -> dict[str, int]:
+    def _meet_role_authusers(self, accounts: dict[str, dict[str, Any]], role_account_map: dict[str, str]) -> dict[str, int]:
         resolved: dict[str, int] = {}
-        for role in MEET_SHARED_ROLES:
+        for role in MEET_ROLES:
             account_id = role_account_map.get(role)
             authuser = _coerce_authuser((accounts.get(account_id or "") or {}).get("authuser"))
             if authuser is not None:
@@ -412,185 +417,82 @@ class WsCollabService:
                 resolved[role] = default_authuser
         return resolved
 
-    def _shared_account_summary(self, role: str, accounts: dict[str, dict[str, Any]], role_account_map: dict[str, str]) -> tuple[str, str | None, int | None]:
-        account_id = role_account_map.get(role)
-        account = accounts.get(account_id or "", {})
-        email = str(account.get("email") or "").strip() or None
-        label = str(account.get("label") or "").strip() or None
-        authuser = _coerce_authuser(account.get("authuser"))
-        if email:
-            return email, account_id, authuser
-        if label:
-            return label, account_id, authuser
-        if account_id:
-            return account_id, account_id, authuser
-        return "unassigned", None, _default_authuser_for_role(role)
-
-    def _meet_sso_profiles_default(self) -> list[dict[str, Any]]:
-        host = self._meet_profile_path()
-        if self._meet_profile_mode() == "shared":
-            return [
-                {"role": "host", "path": str(host), "exists": host.is_dir()},
-                {"role": "companion", "path": str(host), "exists": host.is_dir()},
-            ]
-        companion = companion_profile_path(host)
-        return [
-            {"role": "host", "path": str(host), "exists": host.is_dir()},
-            {"role": "companion", "path": str(companion), "exists": companion.is_dir()},
-        ]
-
-    def _meet_account_summary(self, role: str, health: dict[str, Any] | None) -> str:
-        if not health:
-            return "unknown -- no live window to check"
-        if role == "host":
-            account = ((health.get("hostProfile") or {}).get("account")) or {}
-            return account.get("email") or account.get("label") or "unknown"
-        for client in health.get("clients") or []:
-            if str(client.get("role") or "") == role:
-                account = client.get("account") or {}
-                return account.get("email") or account.get("label") or "unknown"
-        return "unknown -- no live window to check"
-
     def _meet_bridge_health_for_settings(self) -> dict[str, Any] | None:
-        health = self._meet_bridge_health()
-        if health and str((health.get("profileMode") or "")).strip().lower() == "shared":
-            self._meet_bridge_command("/sso-scan", timeout=2.0)
-            refreshed = self._meet_bridge_health(timeout=1.0)
-            if refreshed:
-                health = refreshed
-        return health
+        return self._meet_bridge_health()
 
-    def list_meet_sso_profiles(self) -> dict[str, Any]:
-        profiles = {entry["role"]: entry for entry in self._meet_sso_profiles_default()}
+    def list_meet_sso_accounts(self) -> dict[str, Any]:
         health = self._meet_bridge_health_for_settings()
-        profile_mode = self._meet_profile_mode()
-        live_mode = ""
-        if health:
-            live_mode = str((health.get("profileMode") or "")).strip().lower()
-            host_profile = (health.get("hostProfile") or {}).get("path")
-            if host_profile:
-                p = Path(host_profile).expanduser()
-                profiles["host"] = {"role": "host", "path": str(p), "exists": p.is_dir()}
-                if live_mode == "shared":
-                    profiles["companion"] = {"role": "companion", "path": str(p), "exists": p.is_dir()}
-            for client in health.get("clients") or []:
-                if str(client.get("role") or "") == "companion" and client.get("profile") and live_mode != "shared":
-                    p = Path(str(client["profile"])).expanduser()
-                    profiles["companion"] = {"role": "companion", "path": str(p), "exists": p.is_dir()}
-        effective_profile_mode = live_mode if live_mode in MEET_PROFILE_MODES else profile_mode
-        if effective_profile_mode == "shared":
-            accounts, role_account_map = self._shared_accounts_and_roles(health)
-            for role, entry in profiles.items():
-                summary, account_id, authuser = self._shared_account_summary(role, accounts, role_account_map)
-                entry["account"] = summary
-                entry["account_id"] = account_id
-                entry["authuser"] = authuser
-                entry["profile_mode"] = "shared"
-            return {"profiles": list(profiles.values())}
-        for role, entry in profiles.items():
-            entry["account"] = self._meet_account_summary(role, health)
-            entry["profile_mode"] = "separate"
-        return {"profiles": list(profiles.values())}
+        accounts = self._sso_accounts(health)
+        return {
+            "profile_path": str(self._meet_profile_path()),
+            "accounts": self._sso_account_rows(accounts),
+        }
 
     def get_meet_browser_settings(self) -> dict[str, Any]:
         backend = str(self.meet_browser_settings.get("browser_backend") or "windows")
-        shared_window = bool(self.meet_browser_settings.get("shared_window") or False)
-        profile_mode = self._meet_profile_mode()
-        host_profile = self._meet_profile_path()
-        companion_profile = host_profile if profile_mode == "shared" else companion_profile_path(host_profile)
-        health = self._meet_bridge_health_for_settings()
-        accounts, role_account_map = self._shared_accounts_and_roles(health, profile_path=host_profile)
-        profiles = {row["role"]: row for row in self.list_meet_sso_profiles()["profiles"]}
-        command = ["ws-collab-meet-bridge", "--profile", str(host_profile), "--browser-backend", backend, "--companion"]
-        if profile_mode == "shared":
-            command.extend(["--profile-mode", "shared"])
-            for role, authuser in self._shared_role_authusers(accounts, role_account_map).items():
-                if role in ("host", "companion") or role_account_map.get(role):
-                    command.extend(["--role-authuser", f"{role}={authuser}"])
+        profile_path = self._meet_profile_path()
+        command = ["ws-collab-meet-bridge", "--profile", str(profile_path), "--browser-backend", backend, "--companion"]
         return {
             "browser_backend": backend,
-            "shared_window": shared_window,
-            "profile_mode": profile_mode,
-            "profile_path": str(host_profile),
-            "companion_profile_path": str(companion_profile),
-            "accounts": self._shared_account_rows(accounts, role_account_map),
-            "role_account_map": role_account_map,
-            "role_assignments": self._shared_role_assignments(accounts, role_account_map),
-            "live_profile_mode": str((health or {}).get("profileMode") or "").strip().lower() or None,
+            "profile_path": str(profile_path),
             "next_launch_command": " ".join(f'"{part}"' if " " in part else part for part in command),
-            "profiles": [
-                {
-                    "role": "host",
-                    "path": str(host_profile),
-                    "exists": host_profile.is_dir(),
-                    "account": profiles.get("host", {}).get("account", "unknown -- no live window to check"),
-                },
-                {
-                    "role": "companion",
-                    "path": str(companion_profile),
-                    "exists": companion_profile.is_dir(),
-                    "account": profiles.get("companion", {}).get("account", "unknown -- no live window to check"),
-                },
-            ],
         }
 
     def set_meet_browser_settings(
         self,
         browser_backend: str,
-        shared_window: bool,
         profile_path: str,
-        profile_mode: str = "separate",
-        role_account_map: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         backend = str(browser_backend or "windows").strip().lower()
         if backend not in {"windows", "wsl"}:
             raise ValidationError(f"invalid browser backend: {backend!r}")
         path = str(profile_path or "").strip() or str(DEFAULT_PROFILE)
-        mode = str(profile_mode or "separate").strip().lower()
-        if mode not in MEET_PROFILE_MODES:
-            raise ValidationError(f"invalid profile mode: {mode!r}")
         self.meet_browser_settings.set("browser_backend", backend)
-        self.meet_browser_settings.set("shared_window", bool(shared_window))
         self.meet_browser_settings.set("profile_path", path)
-        self.meet_browser_settings.set_profile_mode(mode)
-        if role_account_map is not None:
-            state = self._meet_shared_state(Path(path).expanduser())
-            accounts = self._normalize_shared_accounts(state.get("accounts"))
-            cleaned = {}
-            for role, account_id in (role_account_map or {}).items():
-                role_name = str(role or "").strip().lower()
-                value = str(account_id or "").strip()
-                if not role_name:
-                    continue
-                if value and value not in accounts:
-                    raise ValidationError(f"unknown SSO account for {role_name}: {value}")
-                if value:
-                    cleaned[role_name] = value
-            duplicates = [account_id for account_id in set(cleaned.values()) if list(cleaned.values()).count(account_id) > 1]
-            if mode == "shared" and duplicates:
-                raise ValidationError("shared profile role assignments must use distinct signed-in accounts")
-            self._set_meet_shared_state(Path(path).expanduser(), accounts=accounts, role_account_map=cleaned)
         return self.get_meet_browser_settings()
 
-    def _meet_sso_profile_path(self, role: str) -> Path:
-        if self._meet_profile_mode() == "shared":
-            return self._meet_profile_path()
-        profiles = {entry["role"]: Path(str(entry["path"])).expanduser() for entry in self.list_meet_sso_profiles()["profiles"]}
-        if role not in profiles:
-            raise ValidationError(f"unknown role {role!r}")
-        return profiles[role]
+    def get_meet_role_assignments(self) -> dict[str, Any]:
+        profile_path = self._meet_profile_path()
+        health = self._meet_bridge_health_for_settings()
+        accounts = self._sso_accounts(health, profile_path=profile_path)
+        role_account_map = self._meet_role_account_map(accounts, profile_path)
+        command = ["ws-collab-meet-bridge", "--companion"]
+        for role, authuser in self._meet_role_authusers(accounts, role_account_map).items():
+            if role in ("host", "companion") or role_account_map.get(role):
+                command.extend(["--role-authuser", f"{role}={authuser}"])
+        return {
+            "accounts": self._sso_account_rows(accounts),
+            "role_account_map": role_account_map,
+            "role_assignments": self._meet_role_assignments(accounts, role_account_map),
+            "role_arguments": " ".join(f'"{part}"' if " " in part else part for part in command),
+        }
 
-    def _meet_sso_in_use_warning(self, role: str, path: Path) -> str | None:
+    def set_meet_role_assignments(self, role_account_map: dict[str, Any] | None) -> dict[str, Any]:
+        profile_path = self._meet_profile_path()
+        accounts = self._sso_accounts(profile_path=profile_path)
+        cleaned: dict[str, str] = {}
+        for role, account_id in (role_account_map or {}).items():
+            role_name = str(role or "").strip().lower()
+            value = str(account_id or "").strip()
+            if role_name not in MEET_ROLES:
+                raise ValidationError(f"unknown Meet role: {role_name!r}")
+            if value and value not in accounts:
+                raise ValidationError(f"unknown SSO account for {role_name}: {value}")
+            if value:
+                cleaned[role_name] = value
+        if len(cleaned.values()) != len(set(cleaned.values())):
+            raise ValidationError("Meet role assignments must use distinct signed-in accounts")
+        self._set_meet_profile_state(profile_path, accounts=accounts, role_account_map=cleaned)
+        return self.get_meet_role_assignments()
+
+    def _meet_sso_in_use_warning(self, path: Path) -> str | None:
         health = self._meet_bridge_health()
         if not health:
             return "bridge not reachable to confirm whether this profile is already in use"
         for proc in health.get("processes") or []:
             if str(proc.get("profile") or "") != str(path) or proc.get("alive") is not True:
                 continue
-            if self._meet_profile_mode() == "shared":
-                return f"shared Meet profile appears to be in use by the running meet bridge process (pid {proc.get('pid')})"
-            if str(proc.get("role") or "") == role:
-                return f"{role} profile appears to be in use by the running meet bridge process (pid {proc.get('pid')})"
+            return f"Meet browser profile appears to be in use by the running meet bridge process (pid {proc.get('pid')})"
         return None
 
     def _meet_bridge_command(self, command: str, timeout: float = 1.0) -> dict[str, Any] | None:
@@ -609,57 +511,41 @@ class WsCollabService:
         except Exception:
             return None
 
-    def _meet_bridge_can_reuse_sso(self, health: dict[str, Any] | None, role: str, path: Path) -> bool:
+    def _meet_bridge_can_reuse_sso(self, health: dict[str, Any] | None, path: Path) -> bool:
         if not health:
             return False
         for proc in health.get("processes") or []:
             if str(proc.get("profile") or "") != str(path) or proc.get("alive") is not True:
                 continue
-            if self._meet_profile_mode() == "shared" or str((health.get("profileMode") or "")).strip().lower() == "shared":
-                return True
-            if str(proc.get("role") or "") == role:
-                return True
+            return True
         return False
 
-    def _shared_sso_target(self, role: str = "", account_id: str = "", add_account: bool = False, health: dict[str, Any] | None = None) -> str:
+    def _sso_target(self, account_id: str = "", add_account: bool = False, health: dict[str, Any] | None = None) -> tuple[str, int | None]:
         if add_account:
-            return "https://accounts.google.com/AccountChooser?continue=https://accounts.google.com/"
-        accounts, role_account_map = self._shared_accounts_and_roles(health, profile_path=self._meet_profile_path())
-        authuser = _coerce_authuser((accounts.get(str(account_id or "").strip()) or {}).get("authuser"))
-        if authuser is None and role:
-            assigned = role_account_map.get(role)
-            authuser = _coerce_authuser((accounts.get(assigned or "") or {}).get("authuser"))
-        if authuser is None:
-            authuser = _default_authuser_for_role(role)
-        return "https://accounts.google.com/" if authuser is None else f"https://accounts.google.com/?authuser={authuser}"
+            return "https://accounts.google.com/AccountChooser?continue=https://accounts.google.com/", None
+        accounts = self._sso_accounts(health, profile_path=self._meet_profile_path())
+        account = accounts.get(account_id)
+        if account is None:
+            raise ValidationError(f"unknown SSO account: {account_id}")
+        authuser = _coerce_authuser(account.get("authuser"))
+        target = "https://accounts.google.com/" if authuser is None else f"https://accounts.google.com/?authuser={authuser}"
+        return target, authuser
 
-    def open_meet_sso_profile(self, role: str = "", account_id: str = "", add_account: bool = False) -> dict[str, Any]:
-        role = str(role or "").strip().lower()
+    def open_meet_sso_account(self, account_id: str = "", add_account: bool = False) -> dict[str, Any]:
         account_id = str(account_id or "").strip()
-        if add_account and role:
-            role = ""
-        if not add_account and not role and not account_id:
-            raise ValidationError("expected a role, account_id, or add_account=true")
-        path = self._meet_sso_profile_path(role)
+        if not add_account and not account_id:
+            raise ValidationError("expected account_id or add_account=true")
+        path = self._meet_profile_path()
         path.mkdir(parents=True, exist_ok=True)
         health = self._meet_bridge_health()
-        warning = self._meet_sso_in_use_warning(role, path)
-        target_url = "https://accounts.google.com/"
-        reuse_command = f"/sso {role}"
-        can_reuse_live_window = True
-        if self._meet_profile_mode() == "shared":
-            target_url = self._shared_sso_target(role, account_id, add_account, health)
-            if add_account:
-                reuse_command = "/sso add-account"
-            elif role:
-                reuse_command = f"/sso {role}"
-            else:
-                can_reuse_live_window = False
-        if can_reuse_live_window and self._meet_bridge_can_reuse_sso(health, role, path):
+        warning = self._meet_sso_in_use_warning(path)
+        target_url, authuser = self._sso_target(account_id, add_account, health)
+        reuse_command = "/sso add-account" if add_account else f"/sso {authuser}"
+        if (add_account or authuser is not None) and self._meet_bridge_can_reuse_sso(health, path):
             result = self._meet_bridge_command(reuse_command)
             verdict = str((result or {}).get("verdict") or "")
             if result and result.get("ok") and verdict.startswith("sso:"):
-                return {"ok": True, "role": role, "account_id": account_id or None, "path": str(path), "reused_bridge_window": True, "warning": warning}
+                return {"ok": True, "account_id": account_id or None, "path": str(path), "reused_bridge_window": True, "warning": warning}
         argv = [
             find_browser(None),
             f"--user-data-dir={path}",
@@ -669,19 +555,17 @@ class WsCollabService:
             target_url,
         ]
         process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return {"ok": True, "role": role, "account_id": account_id or None, "path": str(path), "pid": process.pid, "reused_bridge_window": False, "warning": warning}
+        return {"ok": True, "account_id": account_id or None, "path": str(path), "pid": process.pid, "reused_bridge_window": False, "warning": warning}
 
-    def forget_meet_sso_profile(self, role: str) -> dict[str, Any]:
-        role = str(role or "").strip().lower()
-        if self._meet_profile_mode() == "shared" and not role:
-            role = "host"
-        path = self._meet_sso_profile_path(role)
-        warning = self._meet_sso_in_use_warning(role, path)
+    def forget_meet_sso_profile(self) -> dict[str, Any]:
+        path = self._meet_profile_path()
+        warning = self._meet_sso_in_use_warning(path)
         if warning and "in use" in warning:
             raise ConflictError("Close the bridge browser window first; that profile appears to be in use by the running meet bridge process.")
         if path.exists():
             shutil.rmtree(path, ignore_errors=True)
-        return {"ok": True, "role": role, "path": str(path), "deleted": True, "warning": warning}
+        self.meet_browser_settings.clear_profile_state(path)
+        return {"ok": True, "path": str(path), "deleted": True, "warning": warning}
 
     # ------------------------------------------- per-field value cache (candidates)
     _FIELD_CACHE_SKIP = {"id", "raw", "text", "timestamp", "ts", "seq", "mailboxId", "forwarded_by"}

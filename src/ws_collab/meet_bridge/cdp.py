@@ -87,10 +87,6 @@ def _find_wsl_browser(distro: str) -> str:
     )
 
 
-def companion_profile_path(profile: Path) -> Path:
-    return profile.with_name(profile.name + "_companion")
-
-
 def ensure_default_profile_migrated(profile: Path | None = None) -> Path:
     target = Path(profile or DEFAULT_PROFILE).expanduser()
     if os.environ.get("WS_COLLAB_MEET_PROFILE_DIR"):
@@ -100,10 +96,6 @@ def ensure_default_profile_migrated(profile: Path | None = None) -> Path:
         return target
     try:
         shutil.copytree(old, target)
-        old_companion = companion_profile_path(old)
-        target_companion = companion_profile_path(target)
-        if old_companion.exists() and not target_companion.exists():
-            shutil.copytree(old_companion, target_companion)
         print(f"[bridge] migrated existing Chrome profile from {old} to {target}")
     except Exception:
         pass
@@ -311,7 +303,7 @@ def launch_browser(args: Any) -> tuple[str, subprocess.Popen[bytes] | None]:
         # tab, and Meet -- seeing the same account twice -- offers a
         # "Switch the call here / Join here too" prompt on the new one
         # instead of just reattaching to the real, already-in-call tab.
-        target = args.meet or "https://meet.google.com/new"
+        target = getattr(args, "launch_url", None) or args.meet or "https://meet.google.com/new"
         existing = find_meet_tab(cdp)
         room = re.compile(r"meet\.google\.com/([a-z0-9-]+)", re.IGNORECASE)
         target_match = room.search(target)
