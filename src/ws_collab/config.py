@@ -38,10 +38,24 @@ def _plugin_env_variables() -> dict[str, str]:
     Lets the plugin manifest set environment variables (e.g.
     ``WS_COLLAB_AUDIO_ENABLED``) for the server without touching the OS
     environment. Best-effort: a missing or malformed manifest yields ``{}``.
+
+    Walks up from this file looking for ``plugin.json`` (bounded to a few
+    levels) rather than assuming a fixed depth: this module lives at
+    ``<plugin_root>/src/ws_collab/config.py`` (src layout, three levels below
+    the plugin root where ``plugin.json`` actually sits), but a fixed
+    ``parent.parent`` undercounts that and silently finds nothing.
     """
 
+    here = Path(__file__).resolve()
+    manifest_path = None
+    for ancestor in here.parents[:5]:
+        candidate = ancestor / "plugin.json"
+        if candidate.is_file():
+            manifest_path = candidate
+            break
+    if manifest_path is None:
+        return {}
     try:
-        manifest_path = Path(__file__).resolve().parent.parent / "plugin.json"
         data = json.loads(manifest_path.read_text("utf-8"))
     except Exception:
         return {}

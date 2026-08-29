@@ -2436,7 +2436,12 @@ class WsCollabService:
 
     @property
     def docs_dir(self) -> Path:
-        return Path(__file__).resolve().parents[1] / "docs"
+        # This module lives at <plugin_root>/src/ws_collab/service.py (src
+        # layout, three levels below the plugin root where docs/ actually
+        # sits): parents[0] is src/ws_collab, parents[1] is src, parents[2]
+        # is the plugin root. A fixed parents[1] undercounts that (a leftover
+        # from before the src/ layout move) and silently finds nothing.
+        return Path(__file__).resolve().parents[2] / "docs"
 
     def list_docs(self) -> dict[str, Any]:
         """Markdown documentation shipped with the server."""

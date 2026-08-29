@@ -44,15 +44,22 @@ remote = ["httpx>=0.27"]
 sapi = ["pywin32>=306 ; sys_platform == 'win32'"]
 # Encrypted secure-channel handshake (AES-256-GCM / HKDF).
 secure = ["cryptography>=42"]
+# Google Meet caption bridge (ws_collab.meet_bridge): drives a real Chrome
+# over the DevTools Protocol to use Meet's own live captions as an STT
+# source. websocket-client is the raw CDP transport; scipy is only touched
+# by the optional virtual-cable audio-out path (sample-rate resampling) --
+# combine with the `audio` extra (sounddevice/numpy) for that path.
+meet = ["websocket-client>=1.6", "scipy>=1.10"]
 # Everything commonly used for a full local stack (excludes the heavy NeMo ASR
 # toolkit, which is available via the separate `nemo` extra).
-all = ["ws_collab[audio,vosk,whisper,remote,secure,sapi]"]
+all = ["ws_collab[audio,vosk,whisper,remote,secure,sapi,meet]"]
 # Test / development tooling. httpx powers fastapi's TestClient.
 dev = ["pytest>=8", "httpx>=0.27", "build>=1.2"]
 
 [project.scripts]
 ws-collab = "ws_collab.server:main"
 ws-collab-standalone = "ws_collab.standalone:main"
+ws-collab-meet-bridge = "ws_collab.meet_bridge.bridge:main"
 
 [project.urls]
 Documentation = "https://example.invalid/ws_collab/docs"

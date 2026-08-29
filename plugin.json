@@ -24,7 +24,8 @@
   "env:variables": {
     "WS_COLLAB_AUDIO_ENABLED": "1",
     "WS_COLLAB_AUTH_DISABLED": "1",
-    "WS_COLLAB_REQUIRE_AUTH": "0"
+    "WS_COLLAB_REQUIRE_AUTH": "0",
+    "WS_COLLAB_STT_ENGINES": "whisper:tiny.en,whisper:base.en,vosk,google_meet"
   },
   "plugin-install": {
     "requires": [],

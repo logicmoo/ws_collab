@@ -95,6 +95,16 @@
       <svg class="nav-icon" viewBox="0 0 16 16"><path d="M8 2a2.5 2.5 0 00-2.5 2.5v4a2.5 2.5 0 005 0v-4A2.5 2.5 0 008 2z"/><path d="M3.5 8v.5a4.5 4.5 0 009 0V8M8 13v1.5"/></svg>
       <span class="nav-label">STT Test</span>
     </div>
+    <div class="nav-item" data-page="meet" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><rect x="1" y="4" width="9" height="8" rx="1.5"/><path d="M10 6.5l5-2.5v8l-5-2.5z"/></svg>
+      <span class="nav-label">Google Meet</span>
+      <span class="status-dot" id="meet-nav-dot" title="Bridge status"></span>
+    </div>
+    <div class="nav-item" data-page="meetbridge" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 3h12v8H5l-3 3V3z"/></svg>
+      <span class="nav-label">Meet Bridge</span>
+      <span class="status-dot" id="meetbridge-nav-dot" title="Bridge status"></span>
+    </div>
 
     <div class="nav-group-title">Control</div>
     <div class="nav-item" data-page="cursors" tabindex="0">
@@ -226,8 +236,12 @@
             <button class="tristate" data-cat="loopback" data-state="show">Loopback</button>
             <button class="tristate" data-cat="virtual" data-state="show">Virtual</button>
             <span class="toolbar-sep"></span>
+            <button class="tristate" data-cat="cap_in" data-state="show">Can In</button>
+            <button class="tristate" data-cat="cap_out" data-state="show">Can Out</button>
+            <span class="toolbar-sep"></span>
             <button class="tristate" data-cat="unknown" data-state="hide">Unknown</button>
             <button class="tristate" data-cat="disabled" data-state="hide">Disabled</button>
+            <button class="tristate" data-cat="row_hidden" data-state="hide">Hidden by you</button>
             <input type="search" id="dv-search" placeholder="filter by name, host API, id…" />
             <span class="spacer" style="flex:1"></span>
             <span class="mono hint" id="dv-counts"></span>
@@ -238,6 +252,130 @@
         <div id="dv-engines"></div>
         <div id="dv-defaults"></div>
         <div id="dv-routing"></div>
+      </div>
+    </section>
+
+    <!-- --------------------------------------------------------- google meet -->
+    <section class="page" data-page="meet">
+      <div class="toolbar">
+        <button class="primary" id="meet-refresh">Refresh</button>
+        <span class="mono hint" id="meet-status-line">checking…</span>
+      </div>
+      <div class="panel-body">
+        <div class="panel" id="meet-bridge-panel">
+          <div class="panel-title">Bridge</div>
+          <div class="panel-content" id="meet-bridge-card"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Driver meetings — HOST+COMPANION secret-servant pair that feeds STT</div>
+          <div class="panel-content">
+            <div class="hint" style="margin-bottom:8px">
+              Policy: keep at least one driver online at all times — the physical-room Google
+              Meet driver below. A 2nd or 3rd driver can be launched for other audio sources
+              (e.g. STT on a Discord voice room), connected the same way this one is connected
+              to the physical room's mic, via its own virtual cable. Each running bridge process
+              is its own driver; this page currently talks to one bridge
+              (<span class="mono">WS_COLLAB_MEET_BRIDGE_BASE</span>).
+            </div>
+            <div class="hint" style="margin-bottom:8px">
+              The bridge keeps ONE host+companion pair present in a meeting at a time (the
+              "driver"); this is what the <span class="mono">google_meet</span> STT engine reads
+              from. Moving it to a different meeting leaves the old one — its captions stay
+              below, tagged with the meeting they came from.
+            </div>
+            <div class="toolbar">
+              <input type="text" id="meet-join-url" placeholder="https://meet.google.com/xxx-yyyy-zzz — join a meeting you're invited to" style="flex:1" />
+              <button class="primary" id="meet-join-btn">⇒ Join this meeting</button>
+              <button id="meet-new-btn">✚ New servant meeting</button>
+            </div>
+            <div class="toolbar">
+              <input type="text" id="meet-say-text" placeholder="Text to speak into the meeting (/say)" style="flex:1" />
+              <button id="meet-say-btn">🔊 Say</button>
+            </div>
+            <div class="mono hint" id="meet-command-result"></div>
+            <!-- One <details> per meeting the bridge has ever captioned, each
+                 with 5 independently-expandable subsections: Connector
+                 agents (host/companion/client identities we control + which
+                 device their mic/speak are attached to, ours first),
+                 Virtual agents (ws_collab's own voiced agents), Presences
+                 (human and not ours), Other things (debug messages), and
+                 Captions (that meeting's feed). -->
+            <div id="meet-driver-tree"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Client meetings — guest joins into meetings hosted by others</div>
+          <div class="panel-content">
+            <div class="hint">
+              Not yet implemented. A CLIENT/GUEST mode (single account, no host authority, joins
+              meetings other people host) is designed but not built — see
+              <span class="mono">docs/GOOGLE_MEET_BRIDGE.md</span>. This section will list
+              those meetings (same Connector agents / Virtual agents / Presences / Other things /
+              Captions structure) once that mode exists.
+            </div>
+            <div class="hint" style="margin-top:6px">
+              Probe location differs from a Driver meeting: a driver relays audio IN from
+              somewhere else (Physical Computer, or a future "Discord Voice Channel — &lt;name&gt;"),
+              with the Meet room just the venue ws_collab reads captions from. A client has no
+              relay — the joined meeting itself IS the probe location, since the client is simply
+              present in it directly.
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------- meet bridge (simple transcript view) -->
+    <section class="page" data-page="meetbridge">
+      <div class="toolbar">
+        <button class="primary" id="mb-refresh">Refresh</button>
+        <span class="mono hint" id="mb-status-line">checking…</span>
+      </div>
+      <div class="panel-body">
+        <div class="panel">
+          <div class="panel-content">
+            <div class="hint" style="margin-bottom:4px">
+              GOOGLE MEET · STT SUBSYSTEM
+            </div>
+            <div style="font-size:16px;font-weight:600;color:var(--text-primary);margin-bottom:6px">Google Meet bridge</div>
+            <div class="hint">
+              Meet's live captions are ws_collab's best speech recognizer. The bridge keeps a
+              <b>servant meeting</b> listening to the room mic — and joins any meeting you invite it to,
+              so you and others can talk to each other <i>and</i> to ws_collab. Captions land in the
+              mailbox; replies go back into the Meet chat.
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" id="mb-card-panel">
+          <div class="panel-content" id="mb-card-body"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Meetings — commands travel through the real mailbox</div>
+          <div class="panel-content">
+            <div class="toolbar">
+              <input type="text" id="mb-join-url" placeholder="https://meet.google.com/xxx-yyyy-zzz — a meeting you're inviting the bridge to" style="flex:1" />
+              <button class="primary" id="mb-join-btn">⇒ Join this meeting</button>
+              <button id="mb-new-btn">✚ New servant meeting</button>
+            </div>
+            <div class="mono hint" id="mb-command-result"></div>
+            <div class="hint" style="margin-top:8px" id="mb-hint-line">
+              In an invited meeting everyone talks normally; every finished caption line arrives as
+              <span class="mono">meet-&lt;speaker&gt;</span>, and anything sent to
+              <span class="mono">google-meet</span> is typed into the Meet's in-call chat for all to see.
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title" id="mb-captions-title">Live captions</div>
+          <div class="panel-content">
+            <div id="mb-captions-feed" style="max-height:360px;overflow-y:auto"></div>
+          </div>
+        </div>
       </div>
     </section>
 

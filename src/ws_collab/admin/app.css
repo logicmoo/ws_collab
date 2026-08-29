@@ -437,6 +437,26 @@ tr:hover td { background: var(--bg-panel-raised); }
    per-engine hypothesis rows above it. */
 tr.stt-final-row td { background: var(--bg-panel-raised); border-top: 2px solid var(--accent-teal); font-weight: 600; }
 
+/* ---- drag-to-resize columns (Devices & Routing table only) ---- */
+table.dv-resizable-table {
+  table-layout: fixed;
+}
+table.dv-resizable-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.col-resize-handle {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 7px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 1;
+}
+.col-resize-handle:hover, .col-resize-handle:active { background: var(--accent-teal); opacity: 0.35; }
+
 /* ------------------------------------------------------------------ badges */
 .badge {
   display: inline-block;
@@ -454,6 +474,94 @@ tr.stt-final-row td { background: var(--bg-panel-raised); border-top: 2px solid 
 .badge.danger { border-color: var(--status-danger); color: var(--status-danger); }
 .badge.teal { border-color: var(--accent-teal); color: var(--accent-teal); }
 .badge.purple { border-color: var(--accent-purple); color: #b49cf5; }
+
+/* ---- live "Connected" indicator dot (Devices & Routing table) ---- */
+.status-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  box-shadow: 0 0 4px currentColor;
+}
+.status-dot.ok { background: var(--status-success); color: var(--status-success); }
+.status-dot.danger { background: var(--status-danger); color: var(--status-danger); opacity: 0.6; box-shadow: none; }
+
+/* ---- clickable, sortable table column headers (Devices & Routing table) --- */
+th button.sort-header {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+th button.sort-header:hover { color: var(--accent-teal); }
+
+/* ---- per-row Enabled/Disabled toggle (Devices & Routing table) ---- */
+button.row-enabled-toggle[data-enabled="true"] { border-color: var(--status-success); color: var(--status-success); }
+button.row-enabled-toggle[data-enabled="false"] { border-color: var(--status-danger); color: var(--status-danger); }
+
+/* ---- Google Meet page: per-meeting Connector agents / Virtual agents /
+   Presences / Other things / Captions sections ---- */
+.meet-tree-meeting {
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+.meet-tree-meeting > summary {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.meet-tree-meeting > summary a { color: var(--accent-teal); }
+.meet-tree-meeting > summary button {
+  margin-left: 8px;
+  font-size: 10px;
+  padding: 2px 8px;
+  vertical-align: middle;
+}
+/* A single compact row of checkboxes replaces 5 separate section headings
+ * — unchecking one hides its whole content block (see `hidden` in JS), so
+ * no space is spent on sections nobody asked to see. */
+.meet-section-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  align-items: center;
+  margin: 8px 0;
+  padding: 6px 8px;
+  background: var(--bg-panel-raised);
+  border-radius: 4px;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.meet-section-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.meet-section-toggle input[type="checkbox"] { cursor: pointer; }
+.meet-section-toggle.all { color: var(--text-primary); border-right: 1px solid var(--border-subtle); padding-right: 14px; }
+
+/* the reassembled "Transcribe" readout under Captions */
+.meet-tree-meeting pre.mono {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg-panel-raised);
+  border-radius: 4px;
+  padding: 8px 10px;
+  max-height: 240px;
+  overflow-y: auto;
+  margin: 0;
+}
+
 
 /* -------------------------------------------------------------- event list */
 .event-scroll {

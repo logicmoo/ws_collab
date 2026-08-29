@@ -29,6 +29,26 @@ const V1 = /\/v1$/.test(BASE) ? BASE : BASE + "/v1";
 const ROW_H = 22;
 const MAX_BUFFER = 5000;
 
+/* The Google Meet caption bridge (ws_collab.meet_bridge) is its own
+ * always-running process, not part of ws_collab's own async server — it
+ * drives a real Chrome over the DevTools Protocol, which needs its own
+ * blocking loop/threads, and exposes a small unauthenticated HTTP API
+ * (health/captions/command) on its own port for any consumer, including
+ * this admin UI and the google_meet STT driver.
+ * `WS_COLLAB_MEET_BRIDGE_BASE` overrides the default for a non-default
+ * --status-port or a bridge reachable elsewhere. */
+const MEET_BRIDGE_BASE = window.WS_COLLAB_MEET_BRIDGE_BASE || "http://127.0.0.1:48699";
+/* Known driver meetings (host+companion secret-servant rooms this bridge
+ * has been pointed at) — shown as placeholder entries even when the bridge
+ * isn't currently attached to them (e.g. Google ended one and auto-recreate
+ * moved on, or it just hasn't switched there yet), so they stay visible
+ * instead of the page going blank the moment they're not the live one.
+ * Override with `WS_COLLAB_DEFAULT_MEET_URLS` (array). */
+const DEFAULT_DRIVER_MEETING_URLS = window.WS_COLLAB_DEFAULT_MEET_URLS || [
+  "https://meet.google.com/bgb-xqts-xjt",
+  "https://meet.google.com/vfi-zywr-ezz",
+];
+
 const state = {
   token: sessionStorage.getItem("ws_collab_token") || "",
   transport: "disconnected",
@@ -975,7 +995,8 @@ function showPage(page) {
   if (location.hash.slice(1) !== page) history.replaceState(null, "", `#${page}`);
   const loaders = {
     workers: loadWorkers, alerts: loadAlerts, devices: loadDevices, voices: loadVoices,
-    accuracy: loadAccuracy, cursors: loadCursors, prompt: loadPrompt, system: loadSystem, stt: loadStt,
+    accuracy: loadAccuracy, cursors: loadCursors, prompt: loadPrompt, system: loadSystem,
+    meet: loadMeet, stt: loadStt, meetbridge: loadMeetBridge,
   };
   if (loaders[page]) loaders[page]();
   Object.values(state.views).forEach((v) => v.draw());
@@ -1036,6 +1057,16 @@ async function loadAlerts() {
 function deviceGroup(device) {
   if (device.direction === "input" || device.direction === "loopback") return "input";
   if (device.direction === "output") return "output";
+  // A "virtual" direction (a cable's two sides, both collapsed into this one
+  // bucket) has no case above, so it fell through to "unknown" here — which,
+  // combined with the "Unknown" filter defaulting to hidden, silently
+  // dropped EVERY virtual device from the table by default. Use the real
+  // capture/playback capability (independent of the collapsed direction
+  // label) to place it correctly instead.
+  if (device.direction === "virtual") {
+    if (device.supports_input) return "input";
+    if (device.supports_output) return "output";
+  }
   return "unknown";
 }
 
@@ -1051,6 +1082,7 @@ function deviceClass(device) {
 const DEVICE_FILTER_DEFAULTS = {
   inputs: "show", outputs: "show", physical: "show", loopback: "show",
   virtual: "show", unknown: "hide", disabled: "hide",
+  cap_in: "show", cap_out: "show", row_hidden: "hide",
 };
 const DEVICE_FILTER_STATES = ["hide", "show", "neutral"];
 
@@ -1071,6 +1103,137 @@ function wireCatFilter(button, onChange) {
   });
 }
 
+/* ---- per-row manual Enabled/Disabled toggle: UI-only display control, kept
+ * separate from the routing/engine device lists (this never changes which
+ * devices appear in the "capture"/"speak through" dropdowns elsewhere on the
+ * page — it only hides the row from THIS table). Persisted per device id. */
+function rowEnabled(deviceId) {
+  return localStorage.getItem(`ws_collab_devrow_${deviceId}`) !== "disabled";
+}
+function setRowEnabled(deviceId, enabled) {
+  if (enabled) localStorage.removeItem(`ws_collab_devrow_${deviceId}`);
+  else localStorage.setItem(`ws_collab_devrow_${deviceId}`, "disabled");
+}
+
+/* ---- column sort state for the devices table (persisted across reloads) */
+function getDeviceSort() {
+  try { return JSON.parse(localStorage.getItem("ws_collab_devsort") || "null") || { key: null, dir: 1 }; }
+  catch { return { key: null, dir: 1 }; }
+}
+function setDeviceSort(sort) { localStorage.setItem("ws_collab_devsort", JSON.stringify(sort)); }
+
+/* ---- persisted, drag-to-resize column widths for the devices table ---- */
+function getColumnWidth(label) {
+  const raw = localStorage.getItem(`ws_collab_devcolwidth_${label}`);
+  return raw ? parseInt(raw, 10) : null;
+}
+function setColumnWidth(label, px) {
+  localStorage.setItem(`ws_collab_devcolwidth_${label}`, String(Math.max(24, Math.round(px))));
+}
+
+/* Renders a <tr> of <th> cells; any column with a `key` is clickable and
+ * cycles ascending -> descending -> unsorted, persisting the choice. Every
+ * header also gets a drag handle on its right edge to resize that column
+ * (width persisted per label, applied via the matching <col> in `colEls`). */
+function sortableHeaderRow(columns, sort, onChange, colEls) {
+  const hr = el("tr");
+  columns.forEach((col, index) => {
+    const th = el("th");
+    th.style.position = "relative";
+    if (!col.key) {
+      th.textContent = col.label;
+    } else {
+      const active = sort.key === col.key;
+      const arrow = active ? (sort.dir === 1 ? " \u25B2" : " \u25BC") : "";
+      const button = el("button", "sort-header", col.label + arrow);
+      button.type = "button";
+      button.title = "Click to sort by this column";
+      button.onclick = () => {
+        let next;
+        if (!active) next = { key: col.key, dir: 1 };
+        else if (sort.dir === 1) next = { key: col.key, dir: -1 };
+        else next = { key: null, dir: 1 };
+        setDeviceSort(next);
+        onChange();
+      };
+      th.appendChild(button);
+    }
+    if (colEls && colEls[index]) {
+      const handle = el("span", "col-resize-handle");
+      handle.title = "Drag to resize this column";
+      handle.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        const startX = event.clientX;
+        const startWidth = colEls[index].getBoundingClientRect().width;
+        const onMove = (moveEvent) => {
+          colEls[index].style.width = `${Math.max(24, startWidth + (moveEvent.clientX - startX))}px`;
+        };
+        const onUp = () => {
+          document.removeEventListener("mousemove", onMove);
+          document.removeEventListener("mouseup", onUp);
+          setColumnWidth(col.label, colEls[index].getBoundingClientRect().width);
+        };
+        document.addEventListener("mousemove", onMove);
+        document.addEventListener("mouseup", onUp);
+      });
+      th.appendChild(handle);
+    }
+    hr.appendChild(th);
+  });
+  return hr;
+}
+
+/* Resolves a column's sort key to a comparable value for one device. Most
+ * keys are a direct Device field; a few columns show something DERIVED
+ * (a class-membership checkmark, a joined rates list, the composite
+ * "default" flags string, or an action's own eligibility) that has no
+ * single matching Device field, so those are computed here instead —
+ * every column stays sortable, not just the ones with a 1:1 field. */
+function deviceSortValue(d, key) {
+  switch (key) {
+    case "class_virtual": return (d.classes || []).includes("virtual");
+    case "class_physical": return (d.classes || []).includes("physical");
+    case "class_loopback": return (d.classes || []).includes("loopback");
+    case "rates": return (d.sample_rates || []).join(",");
+    case "default": return [d.is_default_input && "in", d.is_default_output && "out", d.is_default_comm && "comm"].filter(Boolean).join("/");
+    case "row_enabled": return rowEnabled(d.id);
+    case "select_eligible": return (deviceGroup(d) === "input" || d.direction === "output" || d.direction === "virtual") && !!d.available;
+    default: return d[key];
+  }
+}
+
+/* Sorts decorated rows ({device, state, reason}) by a device sort key. */
+function sortDeviceRows(rows, sort) {
+  if (!sort.key) return rows;
+  const { key, dir } = sort;
+  // A field like `classes` can be a list (a device may genuinely carry more
+  // than one classification at once). Join multi-value lists into a
+  // sortable string as the general case; only fall back to the bare single
+  // value last, as a special case for the (common) single-class device.
+  const sortValue = (v) => {
+    if (!Array.isArray(v)) return v;
+    if (v.length !== 1) return v.slice().sort().join(",");
+    return v[0];
+  };
+  return rows.slice().sort((a, b) => {
+    const av = sortValue(deviceSortValue(a.device, key));
+    const bv = sortValue(deviceSortValue(b.device, key));
+    if (typeof av === "boolean" || typeof bv === "boolean") return (Number(!!av) - Number(!!bv)) * dir;
+    if (typeof av === "number" || typeof bv === "number") return ((av || 0) - (bv || 0)) * dir;
+    return String(av ?? "").localeCompare(String(bv ?? "")) * dir;
+  });
+}
+
+function connectedLight(available) {
+  const dot = el("span", `status-dot ${available ? "ok" : "danger"}`, "");
+  dot.title = available ? "Connected" : "Not connected / unavailable";
+  return dot;
+}
+
+function checkMark(truthy) {
+  return el("span", "mono", truthy ? "\u2713" : "\u2014");
+}
+
 /* A device sits on several categories at once (direction, class, availability). */
 function deviceCategories(device) {
   const group = deviceGroup(device);
@@ -1083,6 +1246,13 @@ function deviceCategories(device) {
   if (klass === "loopback") cats.push("loopback");
   if (klass === "virtual") cats.push("virtual");
   if (!device.available) cats.push("disabled");
+  // Raw capture/playback capability (independent of the collapsed
+  // "direction" category above — e.g. a virtual cable's two sides both
+  // report direction "virtual" but only one of them actually captures).
+  if (device.supports_input) cats.push("cap_in");
+  if (device.supports_output) cats.push("cap_out");
+  // The manual per-row Enabled/Disabled toggle (UI-only, see rowEnabled()).
+  if (!rowEnabled(device.id)) cats.push("row_hidden");
   return cats;
 }
 
@@ -1104,6 +1274,38 @@ function deviceVerdict(device) {
     if (!hay.includes(needle)) return { state: "hide", reason: "no text match" };
   }
   return { state, reason };
+}
+
+/* Persisted "which host API variant is shown" choice per device identity
+ * (name+direction) — a device registers once per host API (MME,
+ * DirectSound, WASAPI, WDM-KS), each with its own channel count, sample
+ * rates, and latency (these differ almost every time — checked live: 23/23
+ * duplicate-name devices differ in latency+rates, 22/23 in channels), so
+ * there's rarely a single "the same" row to collapse to. Instead, group
+ * one row per identity with a clickable pill per host API; whichever pill
+ * is selected drives that row's Channels/Rates/Latency/actions. */
+function getSelectedHostApi(key) {
+  return localStorage.getItem(`ws_collab_devhostapi_${key}`);
+}
+function setSelectedHostApi(key, hostApi) {
+  localStorage.setItem(`ws_collab_devhostapi_${key}`, hostApi);
+}
+
+function groupDevicesByIdentity(rows) {
+  const groups = [];
+  const byKey = new Map();
+  rows.forEach((row) => {
+    const key = `${row.device.name}|${row.device.direction}`;
+    let group = byKey.get(key);
+    if (!group) { group = { key, variants: [] }; byKey.set(key, group); groups.push(group); }
+    group.variants.push(row);
+  });
+  return groups.map(({ key, variants }) => {
+    if (variants.length === 1) return { ...variants[0], variants };
+    const saved = getSelectedHostApi(key);
+    const selected = variants.find((v) => v.device.host_api === saved) || variants[0];
+    return { ...selected, variants, identityKey: key };
+  });
 }
 
 async function loadDevices() {
@@ -1135,7 +1337,12 @@ async function loadDevices() {
     });
     const shownCount = decorated.filter((r) => r.state === "show").length;
     const neutralCount = decorated.filter((r) => r.state === "neutral").length;
-    const visible = decorated.filter((r) => r.state !== "hide");
+    // "row_hidden" (the per-row Enabled/Disabled toggle) is now just another
+    // category, so it folds into the same hide/show/neutral pipeline as
+    // every other filter — the "Hidden by you" filter button can bring
+    // individually-disabled rows back into view (show/neutral) same as any
+    // other category.
+    const visible = sortDeviceRows(decorated.filter((r) => r.state !== "hide"), getDeviceSort());
     $("dv-counts").textContent =
       `${shownCount} shown · ${neutralCount} neutral · ${all.length - visible.length} hidden`;
 
@@ -1144,41 +1351,127 @@ async function loadDevices() {
     if (!visible.length) {
       target.appendChild(el("div", "hint", "No devices match the current filters."));
     } else {
-      const rows = visible.map(({ device: d, state, reason }) => [
-        mono(d.id), d.name,
-        badge(d.direction, { input: "teal", loopback: "purple", output: "" }[d.direction] || "warn"),
-        badge(deviceClass(d), deviceClass(d) === "physical" ? "ok" : ""),
-        mono(d.host_api || "—"), String(d.channels),
-        mono((d.sample_rates || []).join(",")),
-        mono(d.latency_ms != null ? `${d.latency_ms}ms` : "—"),
-        [d.is_default_input && "in", d.is_default_output && "out", d.is_default_comm && "comm"]
-          .filter(Boolean).join("/") || "—",
-        badge(d.available ? "yes" : "no", d.available ? "ok" : "danger"),
-        state === "neutral"
-          ? badge(reason, "warn")
-          : (deviceGroup(d) === "input" && d.available
-              ? actionButton("Use", "", async () => {
-                  if (!confirm(`Switch the active capture device to "${d.name}"? Listening will restart on this device.`)) return;
-                  try { await api(`${V1}/audio/capture/start`, { method: "POST", body: { device_id: d.id } }); }
-                  catch (error) { pushError(error.message); }
-                  loadDevices();
-                })
-              : ((d.direction === "output" || d.direction === "virtual") && d.available
-                  ? actionButton("Test", "", async () => {
-                      try { await api(`${V1}/audio/devices/test`, { method: "POST", body: { device_id: d.id } }); }
-                      catch (error) { pushError(error.message); }
-                    })
-                  : "—")),
-      ]);
-      const table_ = table(
-        ["ID", "Name", "Direction", "Class", "Host API", "Ch", "Rates", "Latency", "Default", "Available", "Select"],
-        rows);
-      // Mark neutral rows so it is obvious they are passive, not selectable.
-      const bodyRows = table_.querySelectorAll("tbody tr");
-      visible.forEach((row, index) => {
-        if (row.state === "neutral" && bodyRows[index]) bodyRows[index].classList.add("filtered-out");
+      const COLUMNS = [
+        { label: "ID", key: "id", width: 70 }, { label: "Name", key: "name", width: 280 },
+        { label: "I", key: "supports_input", width: 32 }, { label: "O", key: "supports_output", width: 32 },
+        { label: "V", key: "class_virtual", width: 32 }, { label: "P", key: "class_physical", width: 32 },
+        { label: "L", key: "class_loopback", width: 32 },
+        { label: "Class", key: "classes", width: 150 },
+        { label: "Host API", key: "host_api", width: 80 }, { label: "Ch", key: "channels", width: 40 },
+        { label: "Rates", key: "rates", width: 100 }, { label: "Latency", key: "latency_ms", width: 80 },
+        { label: "Default", key: "default", width: 80 }, { label: "Available", key: "available", width: 90 },
+        { label: "Select", key: "select_eligible", width: 70 }, { label: "Disabled", key: "row_enabled", width: 80 },
+        { label: "Hide", key: "row_enabled", width: 60 }, { label: "Connected", key: "available", width: 100 },
+      ];
+      const sort = getDeviceSort();
+      const renderRows = groupDevicesByIdentity(visible);
+      const t = el("table");
+      t.classList.add("dv-resizable-table");
+      const colgroup = el("colgroup");
+      // Every column always gets a starting width — the saved (user-resized)
+      // one if present, else its own sane default — so `table-layout: fixed`
+      // never falls back to an even 1/18th split, which squeezed columns
+      // like Name down to ~50px and truncated device names unreadably.
+      const colEls = COLUMNS.map((col) => {
+        const c = el("col");
+        c.style.width = `${getColumnWidth(col.label) || col.width || 80}px`;
+        colgroup.appendChild(c);
+        return c;
       });
-      target.appendChild(table_);
+      t.appendChild(colgroup);
+      const thead = el("thead");
+      thead.appendChild(sortableHeaderRow(COLUMNS, sort, loadDevices, colEls));
+      t.appendChild(thead);
+      const tbody = el("tbody");
+      renderRows.forEach(({ device: d, state, reason, variants, identityKey }) => {
+        const enabledKey = identityKey || d.id;
+        const enabled = rowEnabled(enabledKey);
+        // `d.classes` is the real, possibly multi-valued classification
+        // (a device can be BOTH "physical" and "loopback" at once, e.g. a
+        // real Stereo Mix device) — never a single mutually-exclusive
+        // bucket. `deviceClass(d)` (used only by the existing category
+        // filter buttons/legacy grouping) still returns one bucket for
+        // backward compatibility with that older logic.
+        const classes = d.classes || [];
+        const tr = el("tr");
+        if (state === "neutral") tr.classList.add("filtered-out");
+        // Host API cell: a plain label when there's only one, otherwise one
+        // clickable pill per host API this identity registers under —
+        // clicking a pill switches which variant's Channels/Rates/Latency/
+        // actions this row shows (they legitimately differ per host API;
+        // see groupDevicesByIdentity for how often that's actually true).
+        const hostApiCell = el("span");
+        if (variants && variants.length > 1) {
+          variants.forEach((v) => {
+            const isSelected = v.device.host_api === d.host_api;
+            const pill = actionButton(v.device.host_api, isSelected ? "primary" : "", () => {
+              setSelectedHostApi(identityKey, v.device.host_api);
+              loadDevices();
+            });
+            pill.title = isSelected ? "Currently shown variant" : `Show the ${v.device.host_api} variant instead`;
+            hostApiCell.appendChild(pill);
+          });
+        } else {
+          hostApiCell.appendChild(mono(d.host_api || "—"));
+        }
+        const cells = [
+          mono(d.id), d.name,
+          checkMark(d.supports_input), checkMark(d.supports_output),
+          checkMark(classes.includes("virtual")), checkMark(classes.includes("physical")), checkMark(classes.includes("loopback")),
+          (() => {
+            const wrap = el("span");
+            classes.forEach((c) => wrap.appendChild(badge(c, c === "physical" ? "ok" : c === "loopback" ? "purple" : "")));
+            return wrap;
+          })(),
+          hostApiCell, String(d.channels),
+          mono((d.sample_rates || []).join(",")),
+          mono(d.latency_ms != null ? `${d.latency_ms}ms` : "—"),
+          [d.is_default_input && "in", d.is_default_output && "out", d.is_default_comm && "comm"]
+            .filter(Boolean).join("/") || "—",
+          badge(d.available ? "yes" : "no", d.available ? "ok" : "danger"),
+          state === "neutral"
+            ? badge(reason, "warn")
+            : (deviceGroup(d) === "input" && d.available
+                ? actionButton("Use", "", async () => {
+                    if (!confirm(`Switch the active capture device to "${d.name}"? Listening will restart on this device.`)) return;
+                    try { await api(`${V1}/audio/capture/start`, { method: "POST", body: { device_id: d.id } }); }
+                    catch (error) { pushError(error.message); }
+                    loadDevices();
+                  })
+                : ((d.direction === "output" || d.direction === "virtual") && d.available
+                    ? actionButton("Test", "", async () => {
+                        try { await api(`${V1}/audio/devices/test`, { method: "POST", body: { device_id: d.id } }); }
+                        catch (error) { pushError(error.message); }
+                      })
+                    : "—")),
+          // Toggle: flips between Enabled <-> Disabled, re-enterable from
+          // here once a hidden row is brought back via the "Hidden by you"
+          // filter button. Keyed by device identity (name+direction) when
+          // this row groups multiple host APIs, so Disable/Hide applies to
+          // the logical device regardless of which pill is selected.
+          actionButton(enabled ? "Enabled" : "Disabled", "row-enabled-toggle", () => {
+            setRowEnabled(enabledKey, !enabled);
+            loadDevices();
+          }),
+          // One-click shortcut that immediately hides the row (same
+          // underlying flag as the Disabled toggle above, offered as its
+          // own explicit action for a faster "get this out of my way").
+          enabled
+            ? actionButton("Hide", "", () => { setRowEnabled(enabledKey, false); loadDevices(); })
+            : "—",
+          connectedLight(d.available),
+        ];
+        cells.forEach((cell) => {
+          const td = el("td");
+          if (cell instanceof Node) td.appendChild(cell); else td.textContent = esc(cell);
+          tr.appendChild(td);
+        });
+        const enabledButton = tr.querySelector("button.row-enabled-toggle");
+        if (enabledButton) enabledButton.dataset.enabled = String(enabled);
+        tbody.appendChild(tr);
+      });
+      t.appendChild(tbody);
+      target.appendChild(t);
     }
 
     // ---- one row per STT engine, each pointing at a chosen input device
@@ -1276,6 +1569,427 @@ async function loadDevices() {
   } catch (error) {
     $("dv-capture").textContent = `error: ${error.message}`;
   }
+}
+
+/* ---- google meet bridge (ws_collab.meet_bridge — its own process) */
+async function postMeetCommand(command) {
+  const resultEl = $("meet-command-result");
+  resultEl.textContent = `${command} — sending…`;
+  try {
+    const result = await api(`${MEET_BRIDGE_BASE}/command`, { method: "POST", body: { command } });
+    resultEl.textContent = `${command} → ${result.verdict}`;
+  } catch (error) {
+    resultEl.textContent = `${command} → error: ${error.message}`;
+  }
+  loadMeet();
+}
+
+/* Same bridge, same /command endpoint -- a separate result target and
+ * refresh (the simple "Meet Bridge" transcript-viewer page) so driving it
+ * from there doesn't depend on the deep ops "Google Meet" page also being
+ * loaded. */
+async function postMeetBridgeCommand(command) {
+  const resultEl = $("mb-command-result");
+  resultEl.textContent = `${command} — sending…`;
+  try {
+    const result = await api(`${MEET_BRIDGE_BASE}/command`, { method: "POST", body: { command } });
+    resultEl.textContent = `${command} → ${result.verdict}`;
+  } catch (error) {
+    resultEl.textContent = `${command} → error: ${error.message}`;
+  }
+  loadMeetBridge();
+}
+
+/* Builds the "Us" rows for a meeting: HOST is real hardware and always
+ * listed first (never automated, so its device is just "real"); COMPANION
+ * always follows — every driver is structurally a HOST+COMPANION pair, so
+ * both rows are always shown, even for a not-current/placeholder driver
+ * meeting where there's no live per-client data to show yet. Every row
+ * always shows the meeting URL + live connection state, plus a Join/Rejoin
+ * button (re-issues /join at this url — the same recovery path used for
+ * "already in this call elsewhere" duplicate-tab situations). Device
+ * detail is only meaningful for the CURRENT meeting — the bridge doesn't
+ * retain per-participant device history for meetings it has left. Whether
+ * a mic is "physical" or not is already obvious from its Mic text ("real
+ * microphone" vs. a device name) — no separate checkbox needed for that. */
+function meetUsRows(isCurrent, clients, url) {
+  const rejoin = (state) => actionButton(state === "in-call" ? "Rejoin" : "Join", "", () => postMeetCommand(`/join ${url}`));
+  if (!isCurrent) {
+    const rows = [
+      ["HOST", "not current", url, "\u2014", "\u2014", rejoin("not current")],
+      ["COMPANION", "not current", url, "\u2014", "\u2014", rejoin("not current")],
+    ];
+    return { rows, note: "Not the current meeting — participant/device detail is only tracked live; Join re-attaches the driver here." };
+  }
+  const rows = [["HOST", "in-call", url, "real microphone (untouched)", "real speakers (untouched)", rejoin("in-call")]];
+  const companion = (clients || []).find((c) => c.role === "companion");
+  if (companion) {
+    rows.push(["COMPANION", companion.state || "\u2014", url, companion.mic || "\u2014", companion.speak || "\u2014", rejoin(companion.state)]);
+  } else {
+    rows.push(["COMPANION", "not armed (no --companion)", url, "\u2014", "\u2014", "\u2014"]);
+  }
+  // Any OTHER controlled identity beyond host/companion (e.g. a future
+  // CLIENT sharing this driver) still gets listed, in whatever order the
+  // bridge reported it.
+  (clients || []).filter((c) => c.role !== "companion").forEach((c) => rows.push([
+    (c.role || "").toUpperCase(), c.state || "\u2014", url, c.mic || "\u2014", c.speak || "\u2014", rejoin(c.state),
+  ]));
+  return { rows, note: null };
+}
+
+/* ws_collab's own agent voices (the Agent Voices page) are a SEPARATE TTS
+ * path from the bridge's own SAPI call in say_into_meeting() — an agent's
+ * speech only reaches a Meet call today if something explicitly relays it
+ * through /say (or the google-meet mailbox), never automatically. Listed
+ * honestly here (real profiles from `${V1}/voices`), not implying a live
+ * wire that doesn't exist yet. */
+function meetVirtualAgentRows(agentProfiles) {
+  return (agentProfiles || []).map((p) => [
+    p.agent_id, p.voice_id || "(unset)",
+    p.speaking_permission === false ? "muted" : "allowed",
+    "not auto-wired \u2014 reaches this meeting only via /say",
+  ]);
+}
+
+/* Persisted "show this section type" preference, keyed by section label —
+ * a SINGLE global checkbox per type (not one per meeting) controls that
+ * section across every driver meeting at once: unchecking "Captions" hides
+ * every meeting's captions block simultaneously, no per-meeting repeats. */
+function getMeetSectionOpen(key) {
+  const raw = localStorage.getItem(`ws_collab_meet_section_open_${key}`);
+  return raw === null ? null : raw === "1";
+}
+function setMeetSectionOpen(key, isOpen) {
+  localStorage.setItem(`ws_collab_meet_section_open_${key}`, isOpen ? "1" : "0");
+}
+
+/* One checkbox+label in the global toggle row, driving every content node
+ * in `contentNodes` (one per meeting, same section type) at once via the
+ * `hidden` attribute — unchecked means zero space for ALL of them, no
+ * separate heading anywhere either, since this checkbox's own label is the
+ * only heading the section type gets. Persisted so the choice survives the
+ * next Refresh's full re-render. */
+function meetSectionToggle(label, count, defaultOn, contentNodes) {
+  const saved = getMeetSectionOpen(label);
+  const on = saved === null ? defaultOn : saved;
+  contentNodes.forEach((node) => { node.hidden = !on; });
+  const wrap = el("label", "meet-section-toggle");
+  const box = el("input");
+  box.type = "checkbox";
+  box.checked = on;
+  box.onchange = () => {
+    setMeetSectionOpen(label, box.checked);
+    contentNodes.forEach((node) => { node.hidden = !box.checked; });
+  };
+  wrap.appendChild(box);
+  wrap.appendChild(document.createTextNode(" " + (count == null ? label : `${label} (${count})`)));
+  return wrap;
+}
+
+
+/* Driver naming convention: "google-meet-stt-<room-id>" — the room id is
+ * the 3-4-3 code Meet assigns (e.g. "vfi-zywr-ezz"). This is the name the
+ * team uses for a HOST+COMPANION pair bound to one meeting, so it doubles
+ * as a stable identity for a driver even while the URL itself is opaque. */
+function driverName(url) {
+  const match = /meet\.google\.com\/([a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4})/i.exec(url || "");
+  return match ? `google-meet-stt-${match[1]}` : "google-meet-stt-(unknown)";
+}
+
+/* What real-world audio source a DRIVER meeting probes — "Physical
+ * Computer" (this machine's real mic/speakers, what HOST always is today)
+ * or a future "Discord Voice Channel — <server/channel name>" driver
+ * connected the same way, not yet built — vs. "(not connected)" for a
+ * configured-but-inactive placeholder. This is the driver/client split:
+ * a DRIVER relays audio IN from elsewhere, with the Meet room just the
+ * venue ws_collab reads captions from — the probe is that elsewhere. A
+ * CLIENT (not yet built) has no relay: the joined meeting itself IS the
+ * probe location, since the client is simply present in it directly.
+ * Only reported for the CURRENT live driver — a placeholder entry has no
+ * real probe until something actually connects it. */
+function probeLocation(isCurrent, bridgeOnline) {
+  if (isCurrent && bridgeOnline) return "Physical Computer";
+  return "(not connected)";
+}
+
+function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, debugRows, bridgeOnline, emitCount) {
+  container.replaceChildren();
+  if (!groups.length) {
+    container.appendChild(el("div", "hint", "No captions seen yet — captions appear here once the bridge is in a meeting and someone speaks."));
+    return;
+  }
+  // Collected across every meeting, one array per section type, so a single
+  // global checkbox (built after this loop) can show/hide that type
+  // everywhere at once instead of repeating 7 checkboxes per meeting.
+  const usBodies = [], agentsBodies = [], presenceBodies = [], debugBodies = [], emitBodies = [], phrasesBodies = [], transcribeBodies = [];
+  let totalAgentRows = 0, totalDebugRows = 0, totalTranscriptLines = 0, totalConnectorRows = 0, totalPhraseRows = 0;
+  const meetingEls = [];
+
+  groups.forEach(({ url, captions }) => {
+    const isCurrent = url === currentUrl;
+    const meeting = el("details");
+    meeting.open = isCurrent;
+    meeting.className = "meet-tree-meeting";
+    const summary = el("summary");
+    summary.appendChild(mono(`${driverName(url)}  `));
+    const link = el("a", null, url);
+    link.href = url; link.target = "_blank"; link.rel = "noopener";
+    link.onclick = (e) => e.stopPropagation();
+    summary.appendChild(link);
+    summary.appendChild(mono(isCurrent ? "  · current" : "  · past"));
+    summary.appendChild(badge(probeLocation(isCurrent, bridgeOnline), isCurrent && bridgeOnline ? "ok" : ""));
+    summary.appendChild(document.createTextNode(" "));
+    const connectBtn = actionButton(isCurrent && bridgeOnline ? "Rejoin" : "Connect", "primary", (e) => {
+      e.stopPropagation();
+      postMeetCommand(`/join ${url}`);
+    });
+    connectBtn.title = "Connect the live driver to this meeting (same action as the Connector agents row buttons).";
+    summary.appendChild(connectBtn);
+    meeting.appendChild(summary);
+
+    const us = meetUsRows(isCurrent, clients, url);
+    const usBody = el("div");
+    usBody.appendChild(table(["Who", "State", "Meeting", "Mic", "Speak", "Action"], us.rows));
+    if (us.note) usBody.appendChild(el("div", "hint", us.note));
+    totalConnectorRows += us.rows.length;
+
+    const agentsBody = el("div");
+    const agentRows = meetVirtualAgentRows(agentProfiles);
+    agentsBody.appendChild(agentRows.length
+      ? table(["Agent", "Voice", "Permission", "Reaches this meeting?"], agentRows)
+      : el("div", "hint", "No ws_collab agent voice profiles configured yet (see Agent Voices)."));
+
+    const presenceBody = el("div", "hint",
+      "Not yet implemented — the bridge doesn't scrape Google Meet's own People panel, so it " +
+      "can't list human or other non-controlled presences beyond the identities it controls " +
+      "(see \u201cConnectors\u201d above).");
+
+    const debugBody = el("div");
+    const rows = isCurrent ? (debugRows || []) : [];
+    debugBody.appendChild(rows.length
+      ? table(["Time", "Message"], rows.map((d) => [shortTs(d.iso) || d.iso || "", d.text || ""]))
+      : el("div", "hint", isCurrent
+        ? "No debug messages yet — autojoin verdicts, mic-select attempts, and /say results appear here."
+        : "Debug messages are only kept for the current meeting."));
+
+    // Raw emits: exactly what the bridge's emit() sent for this meeting —
+    // one row per `key`, showing its CURRENT text (since a key can be
+    // EDITED in place, not just added), plus the full info every emit
+    // carries: whether it's a settled phrase or still growing, and what
+    // key (if any) it continues from. This is the direct, honest view of
+    // the raw stream — the best way to confirm an emit actually went out
+    // and what it currently says, with nothing reassembled or hidden.
+    const emitBody = el("div");
+    const sortedByKey = captions.slice().sort((a, b) => (a.at || 0) - (b.at || 0));
+    emitBody.appendChild(table(["Key", "Time", "Speaker", "Text", "Final", "Replaces"], sortedByKey.map((c) => [
+      mono((c.key || "").slice(-10)), shortTs(c.iso) || c.iso || "", c.speaker || "", c.text || "",
+      c.final ? "yes" : "growing…", c.replaces ? mono(c.replaces.slice(-10)) : "—",
+    ])));
+
+    // Phrases: JUST the settled sentences (final=true) out of the same raw
+    // stream — every "Hello there." that will never be edited again, none
+    // of the still-growing in-progress fragments Emit also shows. This is
+    // what "phrases" means for this bridge: Meet gives one continuously
+    // growing row per monologue, and every completed sentence peeled off
+    // of it becomes one phrase here, in order.
+    const phraseRows = sortedByKey.filter((c) => c.final);
+    const phrasesBody = el("div");
+    phrasesBody.appendChild(phraseRows.length
+      ? table(["Key", "Time", "Speaker", "Text"], phraseRows.map((c) => [
+        mono((c.key || "").slice(-10)), shortTs(c.iso) || c.iso || "", c.speaker || "", c.text || "",
+      ]))
+      : el("div", "hint", "No completed phrases yet — a phrase appears here the instant a sentence finishes."));
+
+    // Transcribe: the SAME raw data, reassembled into one readable
+    // transcript (creation order, each key's current text) — a concrete
+    // example of what a consumer (an LLM agent, or ws_collab's own
+    // disambiguator) does with the raw stream: turn "row X now says Y"
+    // updates into a coherent read, without the bridge itself deciding
+    // anything about finality. Counted in SENTENCES (not raw rows) since
+    // that's what "reassembled" means — one still-growing row can already
+    // contain many settled sentences, a different number than the raw
+    // emit-event count shown by "Emit" above.
+    const transcribeBody = el("div");
+    const transcriptLines = sortedByKey.map((c) => `${c.speaker || "Speaker"}: ${c.text || ""}`);
+    transcribeBody.appendChild(el("pre", "mono", transcriptLines.join("\n") || "(nothing said yet)"));
+    const sentenceCount = sortedByKey.reduce((sum, c) =>
+      sum + (c.text || "").split(/(?<=[.!?])\s+/).filter((s) => s.trim()).length, 0);
+
+    meeting.appendChild(usBody);
+    meeting.appendChild(agentsBody);
+    meeting.appendChild(presenceBody);
+    meeting.appendChild(debugBody);
+    meeting.appendChild(emitBody);
+    meeting.appendChild(phrasesBody);
+    meeting.appendChild(transcribeBody);
+    meetingEls.push(meeting);
+
+    usBodies.push(usBody);
+    agentsBodies.push(agentsBody);
+    presenceBodies.push(presenceBody);
+    debugBodies.push(debugBody);
+    emitBodies.push(emitBody);
+    phrasesBodies.push(phrasesBody);
+    transcribeBodies.push(transcribeBody);
+    totalAgentRows += agentRows.length;
+    totalDebugRows += isCurrent ? rows.length : 0;
+    totalTranscriptLines += sentenceCount;
+    totalPhraseRows += phraseRows.length;
+  });
+
+  // ONE global toggle row, above every meeting — checking/unchecking a
+  // section type shows/hides it across ALL meetings at once, rather than
+  // repeating the same 7 checkboxes once per meeting.
+  const toggleRow = el("div", "meet-section-toggles");
+  toggleRow.appendChild(meetSectionToggle("Connectors", totalConnectorRows, true, usBodies));
+  toggleRow.appendChild(meetSectionToggle("Virtual agents", totalAgentRows, false, agentsBodies));
+  toggleRow.appendChild(meetSectionToggle("Presences", "?", false, presenceBodies));
+  toggleRow.appendChild(meetSectionToggle("Other things", totalDebugRows, false, debugBodies));
+  toggleRow.appendChild(meetSectionToggle("Emit", emitCount || 0, true, emitBodies));
+  toggleRow.appendChild(meetSectionToggle("Phrases", totalPhraseRows, true, phrasesBodies));
+  toggleRow.appendChild(meetSectionToggle("Transcribe", totalTranscriptLines, true, transcribeBodies));
+  container.appendChild(toggleRow);
+  meetingEls.forEach((meeting) => container.appendChild(meeting));
+}
+
+async function loadMeet() {
+  const statusLine = $("meet-status-line");
+  const dot = $("meet-nav-dot");
+  let health;
+  try {
+    health = await api(`${MEET_BRIDGE_BASE}/health`);
+  } catch (error) {
+    statusLine.textContent = `bridge offline (${error.message}) — start it from the Processes page or ` +
+      `run "ws-collab-meet-bridge" (or "python -m ws_collab.meet_bridge")`;
+    if (dot) { dot.classList.remove("ok"); dot.classList.add("danger"); }
+    $("meet-bridge-card").textContent = "Bridge unreachable.";
+    // Still show the known default driver meetings as placeholders (all
+    // correctly "not current" while the bridge itself is down) so the
+    // intended meetings stay visible instead of the section going blank.
+    renderMeetTree($("meet-driver-tree"), DEFAULT_DRIVER_MEETING_URLS.map((url) => ({ url, captions: [] })), null, [], [], [], false, 0);
+    return;
+  }
+  if (dot) { dot.classList.toggle("ok", !!health.ok); dot.classList.toggle("danger", !health.ok); }
+  statusLine.textContent = health.meetingUrl ? `bridge online — ${health.meetingUrl}` : "bridge online — no meeting";
+  const cardLines = [
+    `service       ${health.service || "ws_collab_meet_bridge"}`,
+    `meeting       ${health.meetingUrl || "\u2014"}`,
+    `captions      ${health.captionCount ?? 0} total, last at ${health.lastCaptionAt || "\u2014"}`,
+    `outbox        ${health.outbox || "\u2014"}`,
+    `transcripts   \u2192 ${(health.recipients || []).join(", ") || "\u2014"}`,
+  ];
+  $("meet-bridge-card").textContent = cardLines.join("\n");
+
+  let capData;
+  try {
+    capData = await api(`${MEET_BRIDGE_BASE}/captions?since=0`);
+  } catch (error) {
+    $("meet-driver-tree").textContent = `error loading captions: ${error.message}`;
+    return;
+  }
+  let agentProfiles = [];
+  try {
+    agentProfiles = ((await api(`${V1}/voices`)).profiles || []);
+  } catch (error) {
+    // Non-fatal — the meeting tree still renders without the Virtual agents list.
+  }
+  const byMeeting = new Map();
+  (capData.captions || []).forEach((c) => {
+    const key = c.meetingUrl || "(unknown meeting)";
+    if (!byMeeting.has(key)) byMeeting.set(key, []);
+    byMeeting.get(key).push(c);
+  });
+  // The CURRENT bridge meeting is always a driver meeting by definition —
+  // show it even with zero captions so far (e.g. right after joining,
+  // before anyone has spoken), not only once something has been said.
+  if (health.meetingUrl && !byMeeting.has(health.meetingUrl)) byMeeting.set(health.meetingUrl, []);
+  // Every known default driver meeting is shown too, even ones this bridge
+  // isn't currently attached to (e.g. it moved to a different one, or
+  // hasn't switched there yet) — Join re-attaches the live driver there.
+  DEFAULT_DRIVER_MEETING_URLS.forEach((url) => { if (!byMeeting.has(url)) byMeeting.set(url, []); });
+  // Current meeting first, then whatever else the ring buffer still
+  // remembers (most-recently-active-in-buffer order).
+  const order = [health.meetingUrl, ...[...byMeeting.keys()].filter((u) => u !== health.meetingUrl)].filter(Boolean);
+  const groups = order.filter((u) => byMeeting.has(u)).map((u) => ({ url: u, captions: byMeeting.get(u) }));
+  renderMeetTree($("meet-driver-tree"), groups, health.meetingUrl, health.clients, agentProfiles, health.debug, !!health.ok, health.emitCount);
+}
+
+/* ---- meet bridge (simple transcript-viewer page, separate from the deep
+ * ops "Google Meet" page above -- same bridge API, a friendlier front door) */
+let mbSince = 0;
+let mbPolling = false;
+let mbCaptionCount = 0;
+
+function mbRenderCard(health, offline) {
+  const body = $("mb-card-body");
+  body.replaceChildren();
+  const header = el("div", null);
+  const dot = el("b", null, offline ? "● bridge offline" : "● bridge online");
+  dot.style.color = offline ? "var(--status-warning)" : "var(--status-success)";
+  header.appendChild(dot);
+  if (!offline && health.meetingUrl) {
+    const link = el("a", "mono", health.meetingUrl.replace("https://", "") + " ↗");
+    link.href = health.meetingUrl; link.target = "_blank"; link.rel = "noreferrer";
+    link.style.marginLeft = "10px";
+    header.appendChild(link);
+  }
+  body.appendChild(header);
+  if (offline) {
+    body.appendChild(el("div", "hint", "Start it from the Processes page, or run \"ws-collab-meet-bridge\" (or \"python -m ws_collab.meet_bridge\")."));
+  } else {
+    body.appendChild(kv({
+      captions: health.captionCount ?? 0,
+      "last caption": health.lastCaptionAt || "—",
+      "command mailbox": health.outbox || "google-meet",
+      "transcripts to": (health.recipients || []).join(", ") || "—",
+    }));
+  }
+}
+
+function mbAppendCaptions(rows) {
+  const feed = $("mb-captions-feed");
+  if (feed.querySelector(".hint")) feed.replaceChildren();
+  rows.forEach((row) => {
+    const line = el("div", null);
+    line.style.cssText = "display:grid;grid-template-columns:64px 130px 1fr;gap:10px;padding:4px 2px;border-bottom:1px solid var(--border-subtle)";
+    line.appendChild(mono((row.iso || "").split("T")[1] || row.iso || ""));
+    line.appendChild(el("b", null, row.speaker || "?"));
+    line.appendChild(el("span", null, row.text || ""));
+    feed.appendChild(line);
+  });
+  mbCaptionCount += rows.length;
+  $("mb-captions-title").textContent = mbCaptionCount ? `Live captions — ${mbCaptionCount} line(s) this session` : "Live captions";
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function mbPollOnce() {
+  const dot = $("meetbridge-nav-dot");
+  api(`${MEET_BRIDGE_BASE}/health`).then((health) => {
+    if (dot) { dot.classList.toggle("ok", !!health.ok); dot.classList.toggle("danger", !health.ok); }
+    $("mb-status-line").textContent = health.meetingUrl ? `bridge online — ${health.meetingUrl}` : "bridge online — no meeting";
+    mbRenderCard(health, false);
+    return api(`${MEET_BRIDGE_BASE}/captions?since=${mbSince}`);
+  }).then((payload) => {
+    const rows = payload.captions || [];
+    if (rows.length) {
+      mbSince = Math.max(mbSince, ...rows.map((r) => r.at || 0));
+      mbAppendCaptions(rows);
+    }
+  }).catch((error) => {
+    if (dot) { dot.classList.remove("ok"); dot.classList.add("danger"); }
+    $("mb-status-line").textContent = `bridge offline (${error.message})`;
+    mbRenderCard({}, true);
+  });
+  if (state.page === "meetbridge") setTimeout(mbPollOnce, 1500);
+  else mbPolling = false;
+}
+
+async function loadMeetBridge() {
+  const feed = $("mb-captions-feed");
+  if (!feed.hasChildNodes()) feed.appendChild(el("div", "hint", "Caption lines appear here the moment anyone speaks in the bridged meeting."));
+  if (mbPolling) return;
+  mbPolling = true;
+  mbPollOnce();
 }
 
 /* ---- voices */
@@ -2117,6 +2831,25 @@ function wireEvents() {
   document.querySelectorAll(".filter-bar button.tristate[data-cat]")
     .forEach((btn) => wireCatFilter(btn, loadDevices));
   $("dv-search").addEventListener("input", loadDevices);
+  $("meet-refresh").onclick = loadMeet;
+  $("meet-join-btn").onclick = () => {
+    const url = $("meet-join-url").value.trim();
+    if (!url) { pushError("Enter a meeting URL to join."); return; }
+    postMeetCommand(`/join ${url}`);
+  };
+  $("meet-new-btn").onclick = () => postMeetCommand("/new");
+  $("meet-say-btn").onclick = () => {
+    const text = $("meet-say-text").value.trim();
+    if (!text) { pushError("Enter text to speak into the meeting."); return; }
+    postMeetCommand(`/say ${text}`);
+  };
+  $("mb-refresh").onclick = loadMeetBridge;
+  $("mb-join-btn").onclick = () => {
+    const url = $("mb-join-url").value.trim();
+    if (!url) { pushError("Enter a meeting URL to join."); return; }
+    postMeetBridgeCommand(`/join ${url}`);
+  };
+  $("mb-new-btn").onclick = () => postMeetBridgeCommand("/new");
   $("vc-refresh").onclick = loadVoices;
   $("vc-assign").onclick = async () => {
     try { await api(`${V1}/voices/assign`, { method: "POST", body: { policy: $("vc-policy").value } }); loadVoices(); }

@@ -52,6 +52,26 @@ class Device:
     error: str | None = None
     backend: str = "fake"
     backend_index: int | None = None
+    # Raw capture/playback capability, independent of ``direction``.
+    # ``direction`` classifies a device into ONE bucket (e.g. any device
+    # whose name matches a virtual-cable hint collapses to "virtual"
+    # regardless of which side of the cable it actually is), which hides
+    # whether a given "virtual" entry is the recording side or the
+    # playback side. These two booleans always reflect the raw
+    # max_input_channels/max_output_channels seen from the audio backend,
+    # so the UI can show real "In"/"Out" capability columns that stay
+    # correct even for devices whose ``direction`` is a collapsed category.
+    supports_input: bool = False
+    supports_output: bool = False
+    # Independent, possibly multi-valued classification — NOT the same as
+    # picking one bucket. A device can genuinely be more than one class at
+    # once (e.g. a real Realtek "Stereo Mix" is both physical hardware AND
+    # functions as a loopback monitor), which a single ``direction``/class
+    # string can never represent. Always a non-empty subset of
+    # {"physical", "loopback", "virtual"}; "physical" and "virtual" are
+    # mutually exclusive by construction (a device is either real hardware
+    # or a software endpoint), but either can combine with "loopback".
+    classes: list[str] = field(default_factory=list)
 
     def public(self) -> dict[str, Any]:
         return asdict(self)
@@ -66,21 +86,51 @@ def _classify(name: str, max_in: int, max_out: int) -> str:
     return DIRECTION_INPUT if max_in > 0 else DIRECTION_OUTPUT
 
 
+def _device_classes(name: str, max_in: int) -> list[str]:
+    """Independent classification tags — a device may carry more than one.
+
+    Unlike ``_classify`` (which folds direction and class into one bucket
+    with a fixed priority order), this returns every applicable tag: a
+    device is "virtual" if its name matches a known virtual-cable/mixer
+    hint, otherwise "physical" (real hardware) — those two never combine —
+    and separately gets "loopback" too whenever its name also matches a
+    loopback hint AND it can capture (``max_in > 0``), since a device that
+    only plays audio cannot itself be a loopback source.
+    """
+    lowered = name.lower()
+    is_virtual = any(hint in lowered for hint in _VIRTUAL_HINTS)
+    tags = ["virtual"] if is_virtual else ["physical"]
+    if max_in > 0 and any(hint in lowered for hint in _LOOPBACK_HINTS):
+        tags.append("loopback")
+    return tags
+
+
 def _fake_catalog() -> list[Device]:
     backend = "fake"
 
-    def make(name: str, direction: str, **kw: Any) -> Device:
+    def make(name: str, direction: str, *, supports_input: bool, supports_output: bool, **kw: Any) -> Device:
         return Device(
             id=_stable_id(backend, "fake", name, direction),
-            name=name, direction=direction, host_api="fake", backend=backend, **kw,
+            name=name, direction=direction, host_api="fake", backend=backend,
+            supports_input=supports_input, supports_output=supports_output,
+            classes=_device_classes(name, max_in=1 if supports_input else 0),
+            **kw,
         )
 
     return [
-        make("Primary Microphone", DIRECTION_INPUT, channels=1, is_default_input=True, is_default_comm=True),
-        make("Conference Array", DIRECTION_INPUT, channels=4),
-        make("Primary Speakers", DIRECTION_OUTPUT, channels=2, is_default_output=True, is_default_multimedia=True),
-        make("System Loopback", DIRECTION_LOOPBACK, channels=2),
-        make("Virtual Cable", DIRECTION_VIRTUAL, channels=2),
+        make("Primary Microphone", DIRECTION_INPUT, supports_input=True, supports_output=False,
+             channels=1, is_default_input=True, is_default_comm=True),
+        make("Conference Array", DIRECTION_INPUT, supports_input=True, supports_output=False, channels=4),
+        make("Primary Speakers", DIRECTION_OUTPUT, supports_input=False, supports_output=True,
+             channels=2, is_default_output=True, is_default_multimedia=True),
+        make("System Loopback", DIRECTION_LOOPBACK, supports_input=True, supports_output=False, channels=2),
+        # A virtual cable is really a mirrored PAIR of devices (one plays,
+        # the other records what was played) — modeled as two separate
+        # entries here, matching how a real cable driver (e.g. VB-CABLE)
+        # always registers on Windows, so the fake catalog exercises the
+        # same "which side is this" ambiguity the UI needs to resolve.
+        make("Virtual Cable (playback side)", DIRECTION_VIRTUAL, supports_input=False, supports_output=True, channels=2),
+        make("Virtual Cable (recording side)", DIRECTION_VIRTUAL, supports_input=True, supports_output=False, channels=2),
     ]
 
 
@@ -138,6 +188,9 @@ def _sounddevice_catalog() -> tuple[list[Device], str | None]:
                 latency_ms=round(float(entry.get(latency_key, 0.02) or 0.02) * 1000, 2),
                 backend="sounddevice",
                 backend_index=index,
+                supports_input=max_in > 0,
+                supports_output=max_out > 0,
+                classes=_device_classes(name, max_in),
             )
         )
     return devices, None
