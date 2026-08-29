@@ -66,6 +66,7 @@ from .tts.voices import VoiceManager
 from .workers import WorkerMonitor
 from . import __version__
 from .meet_bridge.cdp import DEFAULT_PROFILE, companion_profile_path, find_browser
+from .meet_browser_settings import MeetBrowserSettings
 
 
 # The canonical capture source that STT engine routes hang off.
@@ -150,6 +151,7 @@ class WsCollabService:
         self.devices = DeviceRegistry(config)
         self.routing = RoutingManager(config.state_dir, audit_sink=self._audit_sink)
         self.sound_settings = SoundSettings(config.state_dir)
+        self.meet_browser_settings = MeetBrowserSettings(config.state_dir)
         self.voices = VoiceManager(config, config.state_dir, audit_sink=self._audit_sink)
         self.workers = WorkerMonitor(config, self.publish, announce=self._announce)
         self.classifier = SourceClassifier(config.echo_policy)
@@ -229,12 +231,24 @@ class WsCollabService:
             return None
 
     def _meet_sso_profiles_default(self) -> list[dict[str, Any]]:
-        host = DEFAULT_PROFILE.expanduser()
+        host = Path(str(self.meet_browser_settings.get("profile_path") or DEFAULT_PROFILE)).expanduser()
         companion = companion_profile_path(host)
         return [
             {"role": "host", "path": str(host), "exists": host.is_dir()},
             {"role": "companion", "path": str(companion), "exists": companion.is_dir()},
         ]
+
+    def _meet_account_summary(self, role: str, health: dict[str, Any] | None) -> str:
+        if not health:
+            return "unknown -- no live window to check"
+        if role == "host":
+            account = ((health.get("hostProfile") or {}).get("account")) or {}
+            return account.get("email") or account.get("label") or "unknown"
+        for client in health.get("clients") or []:
+            if str(client.get("role") or "") == role:
+                account = client.get("account") or {}
+                return account.get("email") or account.get("label") or "unknown"
+        return "unknown -- no live window to check"
 
     def list_meet_sso_profiles(self) -> dict[str, Any]:
         profiles = {entry["role"]: entry for entry in self._meet_sso_profiles_default()}
@@ -248,7 +262,48 @@ class WsCollabService:
                 if str(client.get("role") or "") == "companion" and client.get("profile"):
                     p = Path(str(client["profile"])).expanduser()
                     profiles["companion"] = {"role": "companion", "path": str(p), "exists": p.is_dir()}
+        for role, entry in profiles.items():
+            entry["account"] = self._meet_account_summary(role, health)
         return {"profiles": list(profiles.values())}
+
+    def get_meet_browser_settings(self) -> dict[str, Any]:
+        backend = str(self.meet_browser_settings.get("browser_backend") or "windows")
+        shared_window = bool(self.meet_browser_settings.get("shared_window") or False)
+        host_profile = Path(str(self.meet_browser_settings.get("profile_path") or DEFAULT_PROFILE)).expanduser()
+        companion_profile = companion_profile_path(host_profile)
+        profiles = {row["role"]: row for row in self.list_meet_sso_profiles()["profiles"]}
+        command = ["ws-collab-meet-bridge", "--profile", str(host_profile), "--browser-backend", backend, "--companion"]
+        return {
+            "browser_backend": backend,
+            "shared_window": shared_window,
+            "profile_path": str(host_profile),
+            "companion_profile_path": str(companion_profile),
+            "next_launch_command": " ".join(f'"{part}"' if " " in part else part for part in command),
+            "profiles": [
+                {
+                    "role": "host",
+                    "path": str(host_profile),
+                    "exists": host_profile.is_dir(),
+                    "account": profiles.get("host", {}).get("account", "unknown -- no live window to check"),
+                },
+                {
+                    "role": "companion",
+                    "path": str(companion_profile),
+                    "exists": companion_profile.is_dir(),
+                    "account": profiles.get("companion", {}).get("account", "unknown -- no live window to check"),
+                },
+            ],
+        }
+
+    def set_meet_browser_settings(self, browser_backend: str, shared_window: bool, profile_path: str) -> dict[str, Any]:
+        backend = str(browser_backend or "windows").strip().lower()
+        if backend not in {"windows", "wsl"}:
+            raise ValidationError(f"invalid browser backend: {backend!r}")
+        path = str(profile_path or "").strip() or str(DEFAULT_PROFILE)
+        self.meet_browser_settings.set("browser_backend", backend)
+        self.meet_browser_settings.set("shared_window", bool(shared_window))
+        self.meet_browser_settings.set("profile_path", path)
+        return self.get_meet_browser_settings()
 
     def _meet_sso_profile_path(self, role: str) -> Path:
         profiles = {entry["role"]: Path(str(entry["path"])).expanduser() for entry in self.list_meet_sso_profiles()["profiles"]}

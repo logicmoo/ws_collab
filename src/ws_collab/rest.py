@@ -765,6 +765,21 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         await _require(request, "viewer")
         return guarded(service.list_meet_sso_profiles)
 
+    @router.get(f"{mount}/meet/browser-settings")
+    async def meet_browser_settings(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.get_meet_browser_settings)
+
+    @router.post(f"{mount}/meet/browser-settings")
+    async def set_meet_browser_settings(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.set_meet_browser_settings,
+            body.get("browser_backend", "windows"),
+            bool(body.get("shared_window", False)),
+            body.get("profile_path", ""),
+        )
+
     @router.post(f"{mount}/meet/sso/open")
     async def meet_sso_open(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)

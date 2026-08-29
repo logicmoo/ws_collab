@@ -1009,7 +1009,7 @@ function showPage(page) {
   const loaders = {
     workers: loadWorkers, alerts: loadAlerts, devices: loadDevices, voices: loadVoices,
     accuracy: loadAccuracy, cursors: loadCursors, prompt: loadPrompt, system: loadSystem,
-    meet: loadMeetWithPolling, stt: loadStt, meetbridge: loadMeetBridge, processes: loadProcesses, sso: loadSsoPage,
+    meet: loadMeetWithPolling, stt: loadStt, meetbridge: loadMeetBridge, processes: loadProcesses, sso: loadSsoPage, browser: loadBrowserSettings,
   };
   if (loaders[page]) loaders[page]();
   Object.values(state.views).forEach((v) => v.draw());
@@ -1651,12 +1651,88 @@ async function loadMeetSso() {
         (profile.role || "—").toUpperCase(),
         profile.path || "—",
         badge(profile.exists ? "yes" : "no", profile.exists ? "ok" : "warn"),
+        profile.account || "unknown -- no live window to check",
         actions,
       ];
     });
-    body.replaceChildren(table(["Role", "Path", "Exists", "Actions"], rows));
+    body.replaceChildren(table(["Role", "Path", "Exists", "Account", "Actions"], rows));
   } catch (error) {
     body.replaceChildren(el("div", "hint", `error loading Meet SSO profiles: ${error.message}`));
+  }
+}
+
+async function loadBrowserSettings() {
+  const body = $("br-settings");
+  const result = $("br-result");
+  try {
+    const data = await api(`${V1}/meet/browser-settings`);
+    const backend = el("select");
+    ["windows", "wsl"].forEach((value) => backend.appendChild(new Option(value, value)));
+    backend.value = data.browser_backend || "windows";
+    const shared = el("input");
+    shared.type = "checkbox";
+    shared.checked = !!data.shared_window;
+    const profile = el("input");
+    profile.type = "text";
+    profile.style.width = "100%";
+    profile.value = data.profile_path || "";
+    const preview = el("div", "mono");
+    const paintPreview = () => {
+      const cmd = [
+        "ws-collab-meet-bridge",
+        "--profile",
+        profile.value || "",
+        "--browser-backend",
+        backend.value,
+        "--companion",
+      ];
+      preview.replaceChildren(
+        mono(cmd.map((part) => (part.includes(" ") ? `"${part}"` : part)).join(" ")),
+        el("span", null, " "),
+        copyTextLink("copy", cmd.map((part) => (part.includes(" ") ? `"${part}"` : part)).join(" "), "Copy next-launch command"),
+      );
+    };
+    backend.onchange = paintPreview;
+    profile.oninput = paintPreview;
+    $("br-save").onclick = async () => {
+      try {
+        const saved = await api(`${V1}/meet/browser-settings`, {
+          method: "POST",
+          body: { browser_backend: backend.value, shared_window: shared.checked, profile_path: profile.value },
+        });
+        result.textContent = "saved";
+        profile.value = saved.profile_path || profile.value;
+        paintPreview();
+        loadBrowserSettings();
+      } catch (error) {
+        result.textContent = `error: ${error.message}`;
+      }
+    };
+    const sharedWrap = el("label", "inline");
+    sharedWrap.append(shared, document.createTextNode(" Shared window preference (currently has no effect for HOST+COMPANION; they require separate signed-in Chrome profiles. This only matters for a future identity that could join without its own persistent login, such as an unbuilt guest mode.)"));
+    const settingsTable = table(
+      ["Setting", "Value"],
+      [
+        ["Browser backend", backend],
+        ["Host profile path", profile],
+        ["Companion profile path", mono(data.companion_profile_path || "—")],
+        ["Shared window", sharedWrap],
+      ],
+    );
+    const profilesTable = table(
+      ["Role", "Path", "Exists", "Account"],
+      (data.profiles || []).map((row) => [
+        (row.role || "—").toUpperCase(),
+        row.path || "—",
+        badge(row.exists ? "yes" : "no", row.exists ? "ok" : "warn"),
+        row.account || "unknown -- no live window to check",
+      ]),
+    );
+    paintPreview();
+    body.replaceChildren(settingsTable, panel("Next launch command preview").root, profilesTable);
+    body.querySelector(".panel:last-child .panel-content").replaceChildren(preview);
+  } catch (error) {
+    body.replaceChildren(el("div", "hint", `error loading browser settings: ${error.message}`));
   }
 }
 
@@ -1979,6 +2055,21 @@ function meetCopyLink(url) {
   link.onclick = (e) => {
     e.preventDefault();
     navigator.clipboard.writeText(url).then(() => {
+      const original = link.textContent;
+      link.textContent = "copied!";
+      setTimeout(() => { link.textContent = original; }, 1000);
+    }).catch(() => {});
+  };
+  return link;
+}
+
+function copyTextLink(label, text, title) {
+  const link = el("a", "mono", label);
+  link.href = "#";
+  if (title) link.title = title;
+  link.onclick = (e) => {
+    e.preventDefault();
+    navigator.clipboard.writeText(text).then(() => {
       const original = link.textContent;
       link.textContent = "copied!";
       setTimeout(() => { link.textContent = original; }, 1000);
@@ -3267,6 +3358,7 @@ function wireEvents() {
   };
   $("mb-refresh").onclick = loadMeetBridge;
   $("sso-refresh").onclick = loadSsoPage;
+  $("br-refresh").onclick = loadBrowserSettings;
   $("ps-refresh").onclick = loadProcesses;
   $("mb-join-btn").onclick = () => {
     const url = $("mb-join-url").value.trim();

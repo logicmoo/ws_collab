@@ -327,17 +327,19 @@ def main() -> None:
 
     def _host_profile_info() -> dict[str, Any]:
         """Which Chrome profile dir (and therefore which persisted Google SSO
-        login) the HOST tab is using. Certain when the bridge launched its
-        own popup browser (--profile pins one specific persistent profile
-        dir); with --attach-only we connected to a Chrome the operator
-        already had running and never chose -- or even saw -- its
-        --user-data-dir, so say that plainly instead of guessing. Surfaced
-        at the top of the admin UI's "Google Meet" page, next to the Bridge
-        panel, plus reused per-row in the connector table."""
+        login) the HOST tab is using."""
         if args.attach_only:
-            return {"path": None, "known": False, "label": "unknown (attached externally via --cdp; profile not chosen by this bridge)"}
+            return {
+                "path": None,
+                "known": False,
+                "label": "unknown (attached externally via --cdp; profile not chosen by this bridge)",
+                "account": {"label": "unknown -- no live window to check", "signedIn": False, "email": None},
+            }
         path = str(Path(args.profile).expanduser())
-        return {"path": path, "known": True, "label": path}
+        account = holder.get("host_account") or whoami(holder.get("tab")) or {"label": "unknown -- no live window to check", "signedIn": False, "email": None}
+        if holder.get("tab") is not None:
+            holder["host_account"] = account
+        return {"path": path, "known": True, "label": path, "account": account}
 
     # ---- STT-subsystem integration: /health + /captions for consumers ------
     # `captionCount` = distinct stored rows (add/edit collapses to one per
@@ -400,8 +402,29 @@ def main() -> None:
                 # profile dir -- always known (the bridge always launches
                 # this one itself, no attach-only equivalent for companion).
                 "profile": holder.get("companion_profile"),
+                "account": holder.get("companion_account") or {"label": "unknown -- no live window to check", "signedIn": False, "email": None},
             })
         return clients
+
+    def whoami(tab: CdpTab | None) -> dict[str, Any] | None:
+        if tab is None:
+            return None
+        try:
+            raw = tab.evaluate(
+                """
+(() => {
+  const el = document.querySelector('a[aria-label*="Google Account"]');
+  if (!el) return JSON.stringify({ signedIn: false });
+  const label = (el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+  const match = label.match(/\\(([^()]+@[^()]+)\\)/);
+  return JSON.stringify({ signedIn: true, label, email: match ? match[1] : null });
+})()
+"""
+            )
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
 
     def _process_info(role: str, process: subprocess.Popen[Any] | None, *, port: int, profile: Path | str | None, backend: str) -> dict[str, Any]:
         return {
@@ -427,6 +450,7 @@ def main() -> None:
                 backend=args.browser_backend,
             ))
         return rows
+
 
     def _snapshot_current_meeting_state() -> None:
         """Record host/companion profile+state for whichever room we're
