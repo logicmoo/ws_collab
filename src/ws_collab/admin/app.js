@@ -2379,8 +2379,8 @@ async function loadMeet() {
   const dot = $("meet-nav-dot");
   $("meet-kind-toolbar").replaceChildren(
     el("span", "mini-label", "Show:"),
-    meetKindToggle("driver", "Driver meetings"),
-    meetKindToggle("client", "Client meetings"),
+    meetKindToggle("driver", "Driver"),
+    meetKindToggle("client", "Client"),
   );
   let health;
   try {
