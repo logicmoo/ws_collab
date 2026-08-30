@@ -148,7 +148,7 @@ Whenever a new task is received, whenever an agent starts or completes a task, o
 |---|---|---|---:|---:|
 | T-001 — Short task title | general-purpose-1 | Running | 3 seconds | 7/50 |
 
-Show active, queued, blocked, failed, and recently completed tasks. Use `Unassigned` and `—` where appropriate. Calculate time dynamically, escape untrusted Markdown, overwrite rather than endlessly append, use package-local temporary files for atomic writes, and keep the file synchronized with SQL state.
+Show all active, queued, blocked, and failed tasks, along with the 10 most recently completed tasks. Use `Unassigned` and `—` where appropriate. Calculate time dynamically, escape untrusted Markdown, overwrite rather than endlessly append, use package-local temporary files for atomic writes, and keep the file synchronized with SQL state.
 
 ## Required Heartbeat Automation
 
