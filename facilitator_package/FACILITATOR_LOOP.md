@@ -11,7 +11,7 @@ On each invocation, the facilitator performs the following steps in order, then 
 3. **Analyze Speech:** Evaluate any new speech for actionable development tasks. Ignore idle chatter.
 4. **Task Tracking:** Update the todos SQL database with any identified tasks. 
 5. **Delegation:** Check if any sub-agent is active. If exactly zero mutating sub-agents are active, use the task tool to delegate the highest-priority queued task to one general-purpose agent. Provide strict workspace confinement context. If an agent is active, leave tasks queued.
-6. **Reporting:** Write the current task status and active agent to FACILITATOR_STATUS.md and output it in the chat interface. (Always reprint the table whenever a new task is received, an agent starts or completes a task, or 10 seconds have passed since the last report).
+6. **Reporting:** Write the current task status and active agent to FACILITATOR_STATUS.md and output it in the chat interface. (Always update the Markdown table whenever an agent completes or starts a task, or when a new task is received, or 10 seconds have passed since the last report).
 7. **Exit:** Exit the turn immediately, leaving the Copilot CRON automation running every 5 seconds to initiate the next cycle.
 
 ## Conflict & Safety Rules
