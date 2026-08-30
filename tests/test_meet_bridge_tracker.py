@@ -32,6 +32,17 @@ def test_cold_start_baselines_silently() -> None:
     assert tracker.baselined is True
 
 
+def test_empty_poll_does_not_consume_the_cold_start_baseline() -> None:
+    tracker = _tracker()
+    emits, emit = _recorder()
+    tracker.update([], [], emit)
+    assert tracker.baselined is False
+
+    tracker.update([_row("row1", "old caption history")], ["row1"], emit)
+    assert tracker.baselined is True
+    assert emits == []
+
+
 def test_growth_waits_for_a_complete_sentence() -> None:
     tracker = _tracker()
     emits, emit = _recorder()
@@ -138,6 +149,27 @@ def test_active_row_must_remain_unchanged_for_settle_interval() -> None:
     tracker.update([_row("row1", "A complete sentence.")], ["row1"], emit)
     assert emits == [
         ("row1", "Alice", "A complete sentence.", True, None),
+    ]
+
+
+def test_reused_dom_row_resets_the_old_sentence_offset() -> None:
+    tracker = _tracker()
+    emits, emit = _recorder()
+    tracker.update([_row("row1", "")], ["row1"], emit)
+    tracker.update([_row("row1", "Um.")], ["row1"], emit)
+    tracker.update([_row("row1", "Um.")], ["row1"], emit)
+    tracker.update([_row("row1", "Okay, this is the replacement.")], ["row1"], emit)
+    tracker.update([_row("row1", "Okay, this is the replacement.")], ["row1"], emit)
+
+    assert emits == [
+        ("row1", "Alice", "Um.", True, None),
+        (
+            "row1#1",
+            "Alice",
+            "Okay, this is the replacement.",
+            True,
+            "row1",
+        ),
     ]
 
 

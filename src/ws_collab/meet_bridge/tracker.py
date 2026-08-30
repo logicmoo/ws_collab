@@ -112,6 +112,8 @@ class CaptionTracker:
 
     def update(self, rows: list[dict[str, str]], live_keys: list[str], emit) -> None:
         if not self.baselined:
+            if not rows:
+                return
             self.baselined = True
             now = self._clock()
             for row in rows:
@@ -127,10 +129,19 @@ class CaptionTracker:
             dom_key, speaker, text = row["key"], row["speaker"], row["text"]
             text = text.strip()
             seen_keys.add(dom_key)
-            changed = self.raw.get(dom_key) != text
+            previous_text = self.raw.get(dom_key, "")
+            changed = previous_text != text
             self.speakers[dom_key] = speaker
             if len(text) < 2:
                 continue
+            settled_len = self.settled_len.get(dom_key, 0)
+            settled_prefix = previous_text[:settled_len]
+            if settled_prefix and not text.startswith(settled_prefix):
+                # Meet reused this DOM node for replacement text rather than
+                # extending it. The old offset belongs to the prior wording;
+                # applying it to the replacement would turn "Okay." into
+                # fragments such as "y.".
+                self.settled_len[dom_key] = 0
             self.raw[dom_key] = text  # buffer 1: mirror updated first
             if changed:
                 self.changed_at[dom_key] = now
