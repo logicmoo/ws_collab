@@ -1,15 +1,10 @@
-"""Caption buffering: trap every row-text CHANGE and split it into sentences.
-
-Ported faithfully from the original ``meet_caption_bridge.py``'s
-``CaptionTracker`` (workbench monorepo) -- this is the most valuable, most
-thoroughly live-tested piece of the whole bridge, so it is reproduced here
-unchanged in behavior. See ``tests/test_meet_bridge_tracker.py`` for the
-regression suite ported alongside it.
-"""
+"""Caption buffering: hold Meet's active tail until it is a complete sentence."""
 
 from __future__ import annotations
 
 import re
+import time
+from collections.abc import Callable
 
 # A sentence boundary: one or more .!? immediately followed by whitespace or
 # end-of-string. Deliberately simple (this is ASR captions, not copy-edited
@@ -25,36 +20,21 @@ def _first_sentence_boundary(text: str) -> int | None:
 
 
 class CaptionTracker:
-    """Trap every row-text CHANGE, keyed by DOM element identity, and relay
-    it immediately -- zero latency, no settle timers on the bridge side at
-    all. Google's live captions get revised unpredictably (confirmed live:
-    identical audio produced a "first version", then a few seconds later a
-    completely different "corrected version" of the same stretch of
-    speech) -- every attempted "decide what's final on the bridge side"
-    heuristic ended up either hiding updates the listener needed to see,
-    or replaying huge duplicate blobs. So the bridge still never WAITS
-    before relaying a change.
+    """Split growing Meet rows without freezing the active, revisable tail.
 
-    BUT: Meet frequently keeps the SAME DOM row growing for an entire
+    Meet frequently keeps the SAME DOM row growing for an entire
     monologue (one speaker, one row, thousands of characters) rather than
-    starting a new row per utterance -- confirmed live (a single row grew
-    past 3000 chars covering many minutes of speech). Relaying that as one
-    ever-growing "line" makes the raw emit stream useless as a log of
-    distinct speech events. So the moment the growing text crosses a
-    completed sentence (`.`/`!`/`?`), that finished sentence is FROZEN
-    under the key it was already growing under (it will never be updated
-    again -- "give the last line the old key") and a brand-new key is
-    minted for whatever comes next in the same DOM row -- the still-growing
-    line keeps extending in FRONT of what's already been dished out, never
-    behind it.
+    starting a new row per utterance. Internal sentences can be frozen as soon
+    as soon as Meet advances to a newer row. The active row stays buffered
+    because Meet often shows transient punctuation while it is still revising
+    that text. Its completed sentences are emitted only after the whole row
+    remains unchanged for the settle interval.
 
     Three explicit per-DOM-row buffers:
       1. `raw`      -- an exact mirror of Meet's own row text, untouched.
       2. `pending`  -- the still-unsettled tail of `raw` (tracked as an
-                        offset, not copied) that hasn't crossed a sentence
-                        boundary yet; every CHANGE to it is still relayed
-                        immediately (in place, same key) so the consumer
-                        sees the line growing in real time, same as before.
+                        offset, not copied), including the terminal sentence
+                        in the last live row.
       3. `ready`    -- completed sentences peeled off of `pending` the
                         instant they cross a boundary, queued here and then
                         dished out to the real consumer (mailbox emit(), one
@@ -64,8 +44,14 @@ class CaptionTracker:
                         dished out as distinct, separately-ordered items.
     """
 
-    def __init__(self, settle: float) -> None:
-        self.settle = settle  # kept for CLI/call-site compatibility; unused
+    def __init__(
+        self,
+        settle: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.settle = max(0.0, settle)
+        self._clock = clock
         # Buffer 1 -- RAW: last-seen full text of each DOM row, unmodified.
         self.raw: dict[str, str] = {}
         # Buffer 2 -- PENDING: how much of `raw` has already been settled
@@ -74,6 +60,8 @@ class CaptionTracker:
         self.settled_len: dict[str, int] = {}
         self.active_key: dict[str, str] = {}
         self.clone_seq: dict[str, int] = {}
+        self.speakers: dict[str, str] = {}
+        self.changed_at: dict[str, float] = {}
         # Per DOM row: what key the CURRENT active_key replaces (the key
         # that was just frozen when this active_key was minted) -- makes the
         # chain explicit for a consumer (row1 -> row1#1 -> row1#2 is really
@@ -85,13 +73,11 @@ class CaptionTracker:
         # one at a time, to the real consumer. Populated then fully drained
         # within the same update() call (no added latency) but kept as an
         # explicit queue so the dispatch step is its own, separate stage.
-        # `final`: True for a completed sentence ("phrase") that will never
-        # be updated again once dished out; False for the still-growing
-        # live remainder -- lets a consumer distinguish settled phrases from
-        # in-progress speech without guessing from the text itself.
+        # Every dispatched item is final: incomplete active text never leaves
+        # the pending buffer.
         # `replaces`: the key this one continues from (None if it's the
         # row's original key).
-        self.ready: list[tuple[str, str, str, bool, str | None]] = []  # (key, speaker, text, final, replaces)
+        self.ready: list[tuple[str, str, str, bool, str | None]] = []
         # On the very first poll after a (re)start, whatever's already
         # visible could be minutes of accumulated on-screen history (Meet's
         # captions region keeps a long scroll-back) rather than something
@@ -99,52 +85,69 @@ class CaptionTracker:
         # wall of "new" updates every single time the bridge restarts.
         self.baselined = False
 
+    def _queue_completed(
+        self,
+        dom_key: str,
+        speaker: str,
+        text: str,
+    ) -> None:
+        settled_len = self.settled_len.get(dom_key, 0)
+        active_key = self.active_key.get(dom_key, dom_key)
+        replaces = self.replaces.get(dom_key)
+        while True:
+            pending = text[settled_len:]
+            boundary = _first_sentence_boundary(pending)
+            if boundary is None:
+                break
+            sentence = pending[:boundary].strip()
+            if sentence:
+                self.ready.append((active_key, speaker, sentence, True, replaces))
+            settled_len += boundary
+            self.clone_seq[dom_key] = self.clone_seq.get(dom_key, 0) + 1
+            replaces = active_key
+            active_key = f"{dom_key}#{self.clone_seq[dom_key]}"
+        self.settled_len[dom_key] = settled_len
+        self.active_key[dom_key] = active_key
+        self.replaces[dom_key] = replaces
+
     def update(self, rows: list[dict[str, str]], live_keys: list[str], emit) -> None:
         if not self.baselined:
             self.baselined = True
+            now = self._clock()
             for row in rows:
                 self.raw[row["key"]] = row["text"]
                 self.settled_len[row["key"]] = len(row["text"])
+                self.speakers[row["key"]] = row["speaker"]
+                self.changed_at[row["key"]] = now
             return
         seen_keys = set()
+        active_dom_key = live_keys[-1] if live_keys else (rows[-1]["key"] if rows else None)
+        now = self._clock()
         for row in rows:
             dom_key, speaker, text = row["key"], row["speaker"], row["text"]
             text = text.strip()
             seen_keys.add(dom_key)
-            if len(text) < 2 or self.raw.get(dom_key) == text:
+            changed = self.raw.get(dom_key) != text
+            self.speakers[dom_key] = speaker
+            if len(text) < 2:
                 continue
             self.raw[dom_key] = text  # buffer 1: mirror updated first
-            settled_len = self.settled_len.get(dom_key, 0)
-            active_key = self.active_key.get(dom_key, dom_key)
-            replaces = self.replaces.get(dom_key)
-            # Consume buffer 2 (the still-unsettled tail): peel off every
-            # COMPLETED sentence, queuing each into buffer 3 (`ready`) --
-            # the still-growing part always stays IN FRONT of (after) the
-            # already-settled offset, never overlapping it.
-            while True:
-                pending = text[settled_len:]
-                boundary = _first_sentence_boundary(pending)
-                if boundary is None:
-                    break
-                sentence = pending[:boundary].strip()
-                if sentence:
-                    self.ready.append((active_key, speaker, sentence, True, replaces))
-                settled_len += boundary
-                self.clone_seq[dom_key] = self.clone_seq.get(dom_key, 0) + 1
-                replaces = active_key  # the NEXT key continues from this one
-                active_key = f"{dom_key}#{self.clone_seq[dom_key]}"
-            self.settled_len[dom_key] = settled_len
-            self.active_key[dom_key] = active_key
-            self.replaces[dom_key] = replaces
-            # Whatever hasn't crossed a boundary yet is still relayed live,
-            # in place, under the (still-open) active key -- the consumer
-            # keeps seeing the growing line in real time, it just no longer
-            # carries the already-dished-out sentences in front of it.
-            live_pending = text[settled_len:].strip()
-            if live_pending:
-                self.ready.append((active_key, speaker, live_pending, False, replaces))
-        # Dispatch buffer 3: dish out every queued item to the real
-        # consumer, one at a time, in order, then clear the queue.
+            if changed:
+                self.changed_at[dom_key] = now
+            if dom_key == active_dom_key and (
+                changed or now - self.changed_at.get(dom_key, now) < self.settle
+            ):
+                continue
+            self._queue_completed(dom_key, speaker, text)
+        # A removed row can no longer be revised, so release any complete
+        # terminal sentence it was holding before discarding its state.
+        for dom_key in list(self.raw):
+            if dom_key not in seen_keys:
+                self._queue_completed(
+                    dom_key,
+                    self.speakers.get(dom_key, "Speaker"),
+                    self.raw[dom_key],
+                )
         for key, speaker, text, final, replaces in self.ready:
             emit(key, speaker, text, final=final, replaces=replaces)
         self.ready.clear()
@@ -156,3 +159,6 @@ class CaptionTracker:
                 self.settled_len.pop(dom_key, None)
                 self.active_key.pop(dom_key, None)
                 self.clone_seq.pop(dom_key, None)
+                self.replaces.pop(dom_key, None)
+                self.speakers.pop(dom_key, None)
+                self.changed_at.pop(dom_key, None)

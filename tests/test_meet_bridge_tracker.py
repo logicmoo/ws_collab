@@ -1,16 +1,4 @@
-"""Regression tests for ws_collab.meet_bridge.tracker.CaptionTracker.
-
-Ported from the original design's test suite (once
-``tests/test_meet_caption_bridge_tracker.py`` in the outer workbench
-monorepo, testing ``scripts/meet_caption_bridge.py``'s tracker), unchanged in
-behavior -- only the import path moved to the new native location. Covers
-the "trap and relay raw changes" caption pipeline: cold-start baselining,
-real-time growth relay under a single DOM row's key, and the
-sentence-boundary "clone the line" split that gives the completed sentence
-the OLD key and starts a brand-new key for whatever the row grows into
-next -- verified live against a real Google Meet call growing exactly one
-DOM row for an entire monologue.
-"""
+"""Regression tests for complete-sentence Meet caption buffering."""
 
 from __future__ import annotations
 
@@ -18,7 +6,7 @@ from ws_collab.meet_bridge.tracker import CaptionTracker
 
 
 def _tracker() -> CaptionTracker:
-    return CaptionTracker(settle=1.2)
+    return CaptionTracker(settle=0)
 
 
 def _row(key: str, text: str, speaker: str = "Alice") -> dict[str, str]:
@@ -27,10 +15,7 @@ def _row(key: str, text: str, speaker: str = "Alice") -> dict[str, str]:
 
 def _recorder() -> tuple[list[tuple[str, str, str, bool, str | None]], object]:
     """`emit(key, speaker, text, final=..., replaces=...)` -- record as a
-    tuple including both extra fields: `final` (True = completed "phrase"
-    that won't be touched again; False = still-growing live remainder) and
-    `replaces` (the key this one continues from, None for a row's very
-    first/original key)."""
+    tuple including `final` and the key this sentence continues from."""
     emits: list[tuple[str, str, str, bool, str | None]] = []
 
     def emit(key: str, speaker: str, text: str, final: bool = False, replaces: str | None = None) -> None:
@@ -47,16 +32,13 @@ def test_cold_start_baselines_silently() -> None:
     assert tracker.baselined is True
 
 
-def test_growth_relays_immediately_under_the_same_key() -> None:
+def test_growth_waits_for_a_complete_sentence() -> None:
     tracker = _tracker()
     emits, emit = _recorder()
     tracker.update([_row("row1", "")], [], emit)
     tracker.update([_row("row1", "Hello")], [], emit)
     tracker.update([_row("row1", "Hello there")], [], emit)
-    assert emits == [
-        ("row1", "Alice", "Hello", False, None),
-        ("row1", "Alice", "Hello there", False, None),
-    ]
+    assert emits == []
 
 
 def test_sentence_boundary_freezes_the_old_key_and_starts_a_new_one() -> None:
@@ -70,21 +52,26 @@ def test_sentence_boundary_freezes_the_old_key_and_starts_a_new_one() -> None:
     emits, emit = _recorder()
     tracker.update([_row("row1", "")], [], emit)
     for text in ("Hello", "Hello there", "Hello there.", "Hello there. How", "Hello there. How are you?"):
-        tracker.update([_row("row1", text)], [], emit)
+        tracker.update([_row("row1", text)], ["row1"], emit)
 
-    keys = [e[0] for e in emits]
-    assert keys == ["row1", "row1", "row1", "row1#1", "row1#1"]
-    assert emits[2] == ("row1", "Alice", "Hello there.", True, None)  # old key's FINAL phrase
+    assert emits == []
+
+    tracker.update(
+        [_row("row1", "Hello there. How are you?"), _row("row2", "Next")],
+        ["row1", "row2"],
+        emit,
+    )
+    assert [event[0] for event in emits] == ["row1", "row1#1"]
+    assert emits[0] == ("row1", "Alice", "Hello there.", True, None)
     assert emits[-1] == ("row1#1", "Alice", "How are you?", True, "row1")
-    # Every non-final (still-growing) update along the way is flagged False.
-    assert [e[3] for e in emits[:2]] == [False, False]
-    assert emits[3] == ("row1#1", "Alice", "How", False, "row1")
 
     # The old key must never be touched again even as the row keeps growing.
-    tracker.update([_row("row1", "Hello there. How are you? I am fine.")], [], emit)
-    assert emits[-1][0] == "row1#2"
-    assert emits[-1][3] is True
-    assert emits[-1][4] == "row1#1"  # continues from the previous phrase's key
+    tracker.update(
+        [_row("row1", "Hello there. How are you? I am fine."), _row("row2", "Next")],
+        ["row1", "row2"],
+        emit,
+    )
+    assert emits[-1] == ("row1#2", "Alice", "I am fine.", True, "row1#1")
 
 
 def test_multiple_sentences_completed_in_one_poll_are_dished_out_in_order() -> None:
@@ -95,12 +82,62 @@ def test_multiple_sentences_completed_in_one_poll_are_dished_out_in_order() -> N
     tracker = _tracker()
     emits, emit = _recorder()
     tracker.update([_row("row1", "")], [], emit)
-    tracker.update([_row("row1", "First one. Second one. Third starts")], [], emit)
+    tracker.update(
+        [_row("row1", "First one. Second one. Third starts")],
+        ["row1"],
+        emit,
+    )
+    tracker.update(
+        [_row("row1", "First one. Second one. Third starts")],
+        ["row1"],
+        emit,
+    )
 
     assert emits == [
         ("row1", "Alice", "First one.", True, None),
         ("row1#1", "Alice", "Second one.", True, "row1"),
-        ("row1#2", "Alice", "Third starts", False, "row1#1"),
+    ]
+
+
+def test_transient_terminal_punctuation_is_revised_before_emit() -> None:
+    tracker = _tracker()
+    emits, emit = _recorder()
+    tracker.update([_row("row1", "")], ["row1"], emit)
+    tracker.update([_row("row1", "he.")], ["row1"], emit)
+    tracker.update([_row("row1", "Here is a screensh.")], ["row1"], emit)
+    tracker.update([_row("row1", "Here is a screenshot of what I mean.")], ["row1"], emit)
+
+    assert emits == []
+
+    tracker.update(
+        [_row("row1", "Here is a screenshot of what I mean."), _row("row2", "Next")],
+        ["row1", "row2"],
+        emit,
+    )
+    assert emits == [
+        ("row1", "Alice", "Here is a screenshot of what I mean.", True, None),
+    ]
+
+
+def test_active_row_must_remain_unchanged_for_settle_interval() -> None:
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    tracker = CaptionTracker(settle=1.2, clock=clock)
+    emits, emit = _recorder()
+    tracker.update([_row("row1", "")], ["row1"], emit)
+    tracker.update([_row("row1", "A complete sentence.")], ["row1"], emit)
+
+    now = 1.1
+    tracker.update([_row("row1", "A complete sentence.")], ["row1"], emit)
+    assert emits == []
+
+    now = 1.3
+    tracker.update([_row("row1", "A complete sentence.")], ["row1"], emit)
+    assert emits == [
+        ("row1", "Alice", "A complete sentence.", True, None),
     ]
 
 
@@ -108,11 +145,12 @@ def test_forgotten_row_cleans_up_all_internal_state() -> None:
     tracker = _tracker()
     emits, emit = _recorder()
     tracker.update([_row("row1", "")], [], emit)
-    tracker.update([_row("row1", "Hello there.")], [], emit)
+    tracker.update([_row("row1", "Hello there.")], ["row1"], emit)
     assert "row1" in tracker.raw
 
     # The row disappears from the live DOM entirely (scrolled away).
     tracker.update([], [], emit)
+    assert emits == [("row1", "Alice", "Hello there.", True, None)]
     assert "row1" not in tracker.raw
     assert "row1" not in tracker.settled_len
     assert "row1" not in tracker.active_key
@@ -125,4 +163,4 @@ def test_no_op_when_text_is_unchanged() -> None:
     tracker.update([_row("row1", "")], [], emit)
     tracker.update([_row("row1", "Hello there")], [], emit)
     tracker.update([_row("row1", "Hello there")], [], emit)  # repeat, unchanged
-    assert emits == [("row1", "Alice", "Hello there", False, None)]
+    assert emits == []

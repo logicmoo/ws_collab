@@ -1,12 +1,10 @@
 """Google Meet caption bridge STT driver (drop-in, real-hardware-free network source).
 
 Rather than decoding raw audio itself, this driver reads text Google's own
-captioning engine already produced for a live Meet call, via the companion
-:mod:`ws_collab.meet_bridge` process (its own OS process -- run
-``ws-collab-meet-bridge`` or ``python -m ws_collab.meet_bridge``; see
-``docs/GOOGLE_MEET_BRIDGE.md``). The bridge exposes a small local HTTP API:
+captioning engine already produced for a live Meet call, via the server-managed
+:mod:`ws_collab.meet_bridge` worker. The worker exposes an internal local API:
 
-* ``GET {base_url}/health``   -> ``{"ok": true, "meetingUrl": ..., ...}``
+* ``GET {base_url}/health`` -> ``{"ok": true, "meetingUrl": ..., ...}``
 * ``GET {base_url}/captions?since=<epoch>`` ->
   ``{"captions": [{"at": epoch, "iso": ..., "speaker": ..., "text": ...}, ...], "now": epoch}``
 
@@ -46,14 +44,9 @@ DEFAULT_BASE_URL = "http://127.0.0.1:48699"
 # seconds (1.2s by default) plus one poll cycle; pad the correlation window on
 # both sides so a segment's own captions aren't missed due to that lag.
 _SETTLE_BUFFER_S = 2.0
-# The bridge now relays every raw caption ADD/EDIT the instant it happens
-# (see meet_caption_bridge.py's CaptionTracker) rather than deciding
-# finality itself — Google's own captions get revised unpredictably, so
-# this driver polls repeatedly, reporting each change as an interim
-# hypothesis via `on_partial` (ws_collab's disambiguator already knows how
-# to reassemble/resolve competing or evolving hypotheses; that's its job,
-# not this driver's), and only returns once the window has gone quiet for
-# a short grace period or the poll budget runs out.
+# The bridge holds the terminal live-caption row until Meet moves on, avoiding
+# transient punctuation such as "he." being mistaken for a complete sentence.
+# Poll repeatedly so multiple completed sentences can enter the audio window.
 _POLL_INTERVAL_S = 0.5
 _STABLE_GRACE_S = 1.5
 _POLL_BUDGET_S = 6.0
@@ -76,6 +69,29 @@ def _fetch_captions(base_url: str, since: float, timeout: float = 5.0) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def assemble_complete_captions(
+    rows_by_key: dict[str, dict],
+    window_lo: float,
+    window_hi: float,
+) -> tuple[str, list[str]]:
+    matched = [
+        row
+        for row in rows_by_key.values()
+        if row.get("final") is True
+        and window_lo <= float(row.get("at", 0)) <= window_hi
+    ]
+    matched.sort(key=lambda row: row.get("at", 0))
+    text = " ".join(
+        str(row.get("text", "")).strip()
+        for row in matched
+        if row.get("text")
+    ).strip()
+    speakers = sorted(
+        {str(row.get("speaker", "")) for row in matched if row.get("speaker")}
+    )
+    return text, speakers
+
+
 class GoogleMeetAdapter(SttAdapter):
     is_remote = False
 
@@ -95,13 +111,6 @@ class GoogleMeetAdapter(SttAdapter):
         window_hi = window_end + _SETTLE_BUFFER_S
 
         loop = asyncio.get_running_loop()
-
-        def _assemble(rows_by_key: dict) -> tuple[str, list[str]]:
-            matched = [r for r in rows_by_key.values() if window_lo <= float(r.get("at", 0)) <= window_hi]
-            matched.sort(key=lambda r: r.get("at", 0))
-            text = " ".join(str(r.get("text", "")).strip() for r in matched if r.get("text")).strip()
-            speakers = sorted({str(r.get("speaker", "")) for r in matched if r.get("speaker")})
-            return text, speakers
 
         rows_by_key: dict[str, dict] = {}
         last_text = ""
@@ -131,15 +140,17 @@ class GoogleMeetAdapter(SttAdapter):
                 rows_by_key[key] = row
             since = float(payload.get("now") or since)
 
-            text, speakers = _assemble(rows_by_key)
+            text, speakers = assemble_complete_captions(
+                rows_by_key,
+                window_lo,
+                window_hi,
+            )
             now_perf = time.perf_counter()
             if text != last_text:
                 last_text = text
                 stable_since = now_perf
-                # Report every revision to the disambiguator immediately as
-                # it happens — reassembling competing/evolving hypotheses
-                # into one resolved transcript is its job, not this
-                # driver's; never silently hold an update back here.
+                # These are complete sentences, but the aggregate hypothesis
+                # can still grow while this segment's polling window is open.
                 if on_partial and text:
                     on_partial(Hypothesis(
                         engine=self.name, model=self.model, raw_text=text,

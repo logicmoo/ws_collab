@@ -138,6 +138,11 @@ the authenticated `/ws_collab/v1/meet/bridge` routes:
 - `POST /command {"command": "/join <url>" | "/new" | "/say <text>"}`.
   Join and New start the worker when it is offline.
 
+Meet frequently revises the punctuation and wording at the end of its active
+caption row. The bridge therefore keeps the entire active row buffered until it
+stops changing for `--settle` seconds. It releases the buffer immediately if
+Meet advances to a newer row or removes the old row.
+
 The Chrome/CDP automation remains in a child worker because it has blocking
 browser and audio loops. Its loopback-only port (`48699` by default) is an
 internal implementation detail, so the UI does not need direct access and a
