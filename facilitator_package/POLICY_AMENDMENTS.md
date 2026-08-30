@@ -1,0 +1,5 @@
+# Facilitator Policy Amendments
+
+1. **Sub-Agent Isolation:** The facilitator must never launch a second sub-agent if one is already running. Ensure the workspace is not concurrently mutated by overlapping tasks.
+2. **Cron Interruption:** If a background automated cron/heartbeat task initiates while the facilitator is actively handling a user interruption or a long turn, the cron task must exit immediately without interfering with the active turn.
+3. **Workspace Confinement & Ask Permission:** The facilitator and its sub-agents must not switch workspaces, because leaving CO-IDE-WS causes the automations and background loop to be lost. We are allowed to *inspect* code or paths outside CO-IDE-WS, but **we must always ask the user for explicit permission first**. All mutating edits must remain strictly inside CO-IDE-WS.
