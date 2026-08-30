@@ -1794,7 +1794,7 @@ def foreground(
 
 
 def launch(
-    argv: list[str],
+    argv: list[str] | Callable[[], list[str]],
     *,
     cdp_endpoint: str,
     url: str,
@@ -1843,8 +1843,9 @@ def launch(
         allow_operation_scope=allow_operation_scope,
     )
     try:
-        process = selected.launch(argv)
-    except Exception as error:
+        launch_argv = argv() if callable(argv) else argv
+        process = selected.launch(launch_argv)
+    except (Exception, SystemExit) as error:
         _log_browser_nav_outcome(
             nav_id,
             cdp_endpoint,

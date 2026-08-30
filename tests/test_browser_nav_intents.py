@@ -697,6 +697,89 @@ def test_launch_allows_typed_approved_auth_landing(nav_records, tmp_path) -> Non
     assert outcomes(nav_records)[-1]["outcome"] == "opened"
 
 
+def test_build_launch_discovers_injected_native_browser_candidate(tmp_path) -> None:
+    browser = tmp_path / "chrome.exe"
+    browser.write_bytes(b"test browser")
+
+    argv = cdp.build_launch(
+        "windows",
+        9223,
+        tmp_path / "profile",
+        "https://meet.google.com/new",
+        browser_candidates=[tmp_path / "missing.exe", browser],
+        path_lookup=lambda _name: None,
+    )
+
+    assert argv[0] == str(browser)
+    assert "--remote-debugging-port=9223" in argv
+    assert argv[-1] == "https://meet.google.com/new"
+
+
+def test_missing_native_browser_is_logged_as_failed_launch(
+    nav_records, monkeypatch, tmp_path
+) -> None:
+    backend = navigator.InMemoryBrowserBackend()
+    monkeypatch.setattr(navigator, "_BACKEND_OVERRIDE", backend)
+    monkeypatch.setattr(cdp, "windows_browser_candidates", lambda: ())
+    monkeypatch.setattr(cdp.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(cdp, "cdp_alive", lambda _endpoint: False)
+    args = SimpleNamespace(
+        port=9223,
+        profile=tmp_path / "profile",
+        meet="https://meet.google.com/new",
+        new=False,
+        browser=None,
+        browser_backend="windows",
+        wsl_distro=None,
+        launch_url=None,
+    )
+
+    with pytest.raises(SystemExit, match="Install Chrome/Edge or pass --browser"):
+        cdp.launch_browser(args)
+
+    assert outcomes(nav_records)[-1]["outcome"] == "failed"
+    assert outcomes(nav_records)[-1]["action"] == "launch-browser"
+    assert "No native Windows Chrome or Edge executable" in outcomes(nav_records)[-1]["error"]
+
+
+def test_worker_launch_command_reaches_navigator_backend(
+    nav_records, monkeypatch, tmp_path
+) -> None:
+    browser = tmp_path / "chrome.exe"
+    browser.write_bytes(b"test browser")
+    target = "https://meet.google.com/abc-defg-hij"
+
+    class WorkerBackend(navigator.InMemoryBrowserBackend):
+        def launch(self, argv):
+            process = super().launch(argv)
+            self.open_tab(ENDPOINT, target)
+            return process
+
+    backend = WorkerBackend()
+    monkeypatch.setattr(navigator, "_BACKEND_OVERRIDE", backend)
+    alive_checks = iter([False])
+    monkeypatch.setattr(cdp, "cdp_alive", lambda _endpoint: next(alive_checks, True))
+    args = SimpleNamespace(
+        port=9223,
+        profile=tmp_path / "profile",
+        meet=target,
+        new=False,
+        browser=str(browser),
+        browser_backend="windows",
+        wsl_distro=None,
+        launch_url=None,
+    )
+
+    endpoint, process = cdp.launch_browser(args)
+
+    assert endpoint == ENDPOINT
+    assert process is not None and process.pid == 1
+    launch_action = next(value for action, value in backend.actions if action == "launch")
+    assert launch_action.startswith(str(browser))
+    assert "--remote-debugging-port=9223" in launch_action
+    assert outcomes(nav_records)[-1]["outcome"] == "opened"
+
+
 def test_rest_ingest_redacts_and_lists_merged_records(client, worker_headers, viewer_headers) -> None:
     nav_id = "nav-test-1"
     base = {

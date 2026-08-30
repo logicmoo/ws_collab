@@ -22,7 +22,7 @@ import time
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Mapping
 
 from websocket import create_connection  # websocket-client
 from websocket import WebSocketTimeoutException
@@ -39,6 +39,29 @@ DEFAULT_PROFILE = Path(
     or (_PLUGIN_ROOT / "collab_state" / "meet_bridge_profile")
 )
 DEFAULT_SSO_AUTHUSER_PROBE_SLOTS = (0, 1)
+WSL_BROWSER_CANDIDATES = ("google-chrome", "google-chrome-stable", "chromium-browser", "chromium")
+
+
+def windows_browser_candidates(
+    environ: Mapping[str, str] | None = None,
+    *,
+    home: Path | None = None,
+) -> tuple[Path, ...]:
+    """Return native browser locations owned by the Windows CDP launcher."""
+    values = os.environ if environ is None else environ
+    program_files = values.get("PROGRAMFILES") or r"C:\Program Files"
+    program_files_x86 = values.get("PROGRAMFILES(X86)") or r"C:\Program Files (x86)"
+    local_app_data = values.get("LOCALAPPDATA")
+    local_root = Path(local_app_data) if local_app_data else (home or Path.home()) / "AppData" / "Local"
+    return (
+        Path(program_files) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(program_files_x86) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        local_root / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(program_files_x86) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        Path(program_files) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+    )
+
+
 def _decode_wsl_text(raw: bytes) -> str:
     cleaned = raw.replace(b"\x00", b"")
     try:
@@ -109,11 +132,13 @@ def build_launch(
     browser: str | None = None,
     wsl_distro: str | None = None,
     extra_args: list[str] | None = None,
+    browser_candidates: Iterable[str | Path] | None = None,
+    path_lookup: Callable[[str], str | None] | None = None,
 ) -> list[str]:
     extra_args = list(extra_args or [])
     if backend == "windows":
         return [
-            find_browser(browser),
+            find_browser(browser, candidates=browser_candidates, path_lookup=path_lookup),
             f"--remote-debugging-port={port}",
             f"--user-data-dir={profile}",
             "--no-first-run",
@@ -408,20 +433,34 @@ def find_meet_tab(cdp: str) -> dict[str, Any] | None:
     return None
 
 
-def find_browser(explicit: str | None) -> str:
+def find_browser(
+    explicit: str | None,
+    *,
+    candidates: Iterable[str | Path] | None = None,
+    path_lookup: Callable[[str], str | None] | None = None,
+) -> str:
+    """Find a native Windows Chrome/Edge executable for the CDP launcher."""
     if explicit:
         if Path(explicit).is_file():
-            return explicit
-        raise SystemExit(f"--browser not found: {explicit}")
-    for candidate in BROWSER_CANDIDATES:
-        if Path(candidate).is_file():
-            return candidate
+            return str(Path(explicit))
+        raise SystemExit(
+            f"Browser executable not found: {explicit}. "
+            "Correct --browser or install Chrome/Edge."
+        )
+    native_candidates = windows_browser_candidates() if candidates is None else candidates
+    for candidate in native_candidates:
+        path = Path(candidate)
+        if path.is_file():
+            return str(path)
+    lookup = path_lookup or shutil.which
     for name in ("chrome", "msedge"):
-        found = subprocess.run(["where.exe", name], capture_output=True, text=True, check=False)
-        line = (found.stdout or "").strip().splitlines()
-        if line:
-            return line[0]
-    raise SystemExit("No Chrome/Edge found -- pass --browser <path to chrome.exe>")
+        found = lookup(name)
+        if found:
+            return found
+    raise SystemExit(
+        "No native Windows Chrome or Edge executable was found. "
+        "Install Chrome/Edge or pass --browser <path-to-chrome.exe>."
+    )
 
 
 def open_url(
@@ -830,17 +869,24 @@ def launch_browser(args: Any) -> tuple[str, subprocess.Popen[bytes] | None]:
             "launch dedicated Meet browser; "
             f"remote-debugging-port={port}; user-data-dir={profile}; profile={profile}"
         )
-        argv = build_launch(
-            getattr(args, "browser_backend", "windows"),
-            port,
-            profile,
-            url,
-            browser=args.browser,
-            wsl_distro=getattr(args, "wsl_distro", None),
-            extra_args=["--autoplay-policy=no-user-gesture-required", "--new-window"],
-        )
+        argv: list[str] = []
+
+        def launch_command() -> list[str]:
+            argv.extend(
+                build_launch(
+                    getattr(args, "browser_backend", "windows"),
+                    port,
+                    profile,
+                    url,
+                    browser=args.browser,
+                    wsl_distro=getattr(args, "wsl_distro", None),
+                    extra_args=["--autoplay-policy=no-user-gesture-required", "--new-window"],
+                )
+            )
+            return argv
+
         process = navigator.launch(
-            argv,
+            launch_command,
             cdp_endpoint=cdp,
             url=url,
             profile=profile,
@@ -852,7 +898,7 @@ def launch_browser(args: Any) -> tuple[str, subprocess.Popen[bytes] | None]:
             ready_timeout=60,
             backend=_navigation_backend(),
         )
-        label = Path(find_browser(args.browser)).name if getattr(args, "browser_backend", "windows") == "windows" else "WSL Chrome/Chromium"
+        label = Path(argv[0]).name if getattr(args, "browser_backend", "windows") == "windows" else "WSL Chrome/Chromium"
         print(f"[bridge] browser window opened ({label}, profile {profile})", flush=True)
         print("[bridge] pick your Google account in that window (SSO persists for next time)...", flush=True)
         if not cdp_alive(cdp):
