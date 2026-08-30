@@ -1,7 +1,0 @@
-{
-  "id": "whisper",
-  "kind": "stt",
-  "enabled": true,
-  "requires": ["faster-whisper"],
-  "description": "Whisper via faster-whisper (recommended)."
-}

@@ -1,6 +1,0 @@
-{
-  "id": "google_meet",
-  "kind": "stt",
-  "enabled": true,
-  "description": "Google Meet caption bridge: transcribes via the servant meeting's live captions (ws_collab.meet_bridge, /captions feed on 127.0.0.1:48699)."
-}

@@ -1,7 +1,0 @@
-{
-  "agent_output_device": "dev-out-2",
-  "capture_device": "dev-mic-1",
-  "engine_devices": {
-    "whisper:tiny.en": "dev-mic-1"
-  }
-}

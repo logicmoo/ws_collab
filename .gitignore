@@ -35,4 +35,4 @@ Thumbs.db
 
 .pytest_tmp/
 
-.pytest-tmp/
+.pytest-tmp*/

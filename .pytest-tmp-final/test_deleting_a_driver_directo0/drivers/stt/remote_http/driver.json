@@ -1,7 +1,0 @@
-{
-  "id": "remote_http",
-  "kind": "stt",
-  "enabled": true,
-  "requires": ["httpx"],
-  "description": "Remote HTTP STT provider (opt-in via WS_COLLAB_STT_ALLOW_REMOTE)."
-}

@@ -1,6 +1,0 @@
-{
-  "id": "fake",
-  "kind": "tts",
-  "enabled": true,
-  "description": "Hardware-free TTS simulator (default)."
-}

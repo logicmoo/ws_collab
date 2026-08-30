@@ -1,7 +1,0 @@
-{
-  "id": "vosk",
-  "kind": "stt",
-  "enabled": true,
-  "requires": ["vosk"],
-  "description": "Independent local recognizer (Vosk)."
-}

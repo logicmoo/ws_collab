@@ -1,7 +1,0 @@
-{
-  "id": "sapi",
-  "kind": "tts",
-  "enabled": true,
-  "requires": ["pywin32"],
-  "description": "Windows SAPI speech output."
-}
