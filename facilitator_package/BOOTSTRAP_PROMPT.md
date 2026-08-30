@@ -142,7 +142,7 @@ Use at least: `Queued`, `Running`, `Done`, `Blocked`, `Failed`, and `Cancelled`.
 
 ## Status Reporting
 
-At least every 10 seconds, render in CO-IDE and overwrite `facilitator_package/FACILITATOR_STATUS.md` with:
+Whenever a new task is received, or at least every 10 seconds, render in CO-IDE and overwrite `facilitator_package/FACILITATOR_STATUS.md` with:
 
 | Task ID / Title | Agent Assigned | Status | Time Since Check | Current Cycle |
 |---|---|---|---:|---:|
