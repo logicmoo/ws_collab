@@ -92,18 +92,18 @@ Consolidate fragments describing one request. Update a queued task when correcte
 
 ## Strict Single-Sub-Agent Delegation
 
-Every actionable implementation request must go to exactly one general-purpose sub-agent. Only one code-mutating sub-agent may be active at a time.
+Every actionable implementation request must go to exactly one general-purpose sub-agent. Only one code-mutating sub-agent may be active at a time. However, to optimize execution, **you may dispatch all currently queued/pending tasks in a single batch to that one sub-agent**.
 
 Before dispatch:
 
 1. Check the task database and active-agent state.
 2. Check `facilitator_package/locks/workspace_mutation.lock`.
 3. Confirm no other mutating agent is active.
-4. Mark the selected task `Running`.
+4. If multiple tasks are `Queued` or `Pending`, select all of them. Mark the selected tasks `Running`.
 5. Acquire the workspace-mutation lock.
-6. Launch exactly one agent.
+6. Launch exactly one agent (or message the existing idle one) and instruct it to complete the entire batch of tasks.
 
-If an agent is active, queue new tasks and do not launch another. Dispatch the next only after completion, failure, blocking, or explicit cancellation. Do not split one request among concurrent agents. The facilitator must not modify project code while a sub-agent is active.
+If an agent is currently active/busy, queue new tasks and do not launch another. Dispatch the batched queue only after the agent becomes idle (completion, failure, blocking). The facilitator must not modify project code while a sub-agent is active.
 
 If delegation is unavailable, mark the task `Blocked`, explain why, and ask whether direct facilitator implementation is authorized.
 
@@ -142,7 +142,7 @@ Use at least: `Queued`, `Running`, `Done`, `Blocked`, `Failed`, and `Cancelled`.
 
 ## Status Reporting
 
-Whenever a new task is received, or at least every 10 seconds, render in CO-IDE and overwrite `facilitator_package/FACILITATOR_STATUS.md` with:
+Whenever a new task is received, whenever an agent starts or completes a task, or at least every 10 seconds, render in CO-IDE and overwrite `facilitator_package/FACILITATOR_STATUS.md` with:
 
 | Task ID / Title | Agent Assigned | Status | Time Since Check | Current Cycle |
 |---|---|---|---:|---:|
@@ -158,7 +158,7 @@ Ensure this native platform automation exists:
 Name: Task Facilitator Heartbeat
 Preferred interval: every 5 seconds
 Preferred cron expression: */5 * * * * *
-Prompt: "Read `facilitator_package/FACILITATOR_LOOP.md` using your view tool and execute exactly one bounded cycle as described there. Do all locking, polling, and delegation exactly as instructed in the file. Do not block or loop."
+Prompt: "Read `facilitator_package/FACILITATOR_LOOP.md` using your view tool and execute exactly one bounded cycle as described there. Do exactly one cycle of polling captions (using `Invoke-RestMethod` to the Meet STT endpoint), check for new tasks, delegate them if needed, render the status, and then exit immediately. Do not block or loop. Continuous execution is provided by the Copilot CRON automation running every 5 seconds."
 ```
 
 ### Exclusive Native-Automation Requirement
@@ -240,7 +240,7 @@ Execute exactly:
 14. Check `facilitator_package/PAUSE`.
 15. Connect to captions and `mailbox_chat`.
 16. Render and write initial status.
-17. Complete one non-blocking facilitator cycle and exit; allow the heartbeat automation to schedule the next cycle.
+17. Complete exactly one non-blocking facilitator cycle of polling captions (using `Invoke-RestMethod` to the Meet STT endpoint), check for new tasks, delegate them if needed, render the status, and then exit immediately; allow the Copilot CRON automation running every 5 seconds to schedule the next cycle.
 
 ## Pause and Shutdown
 
@@ -264,7 +264,7 @@ On endpoint, mailbox, database, automation, agent, Git, or dependency failure: r
 - Delegate every implementation request to exactly one sub-agent.
 - Never start two Facilitator Loops for one workspace.
 - Never let the heartbeat interrupt active work.
-- Never create or use a shell script, program loop, blocking wait, long poll, or persistent process to keep the facilitator alive.
+- Never create or use a shell script, program loop, blocking wait, or persistent process to keep the facilitator alive. Continuous execution is provided exclusively by the Copilot CRON automation running every 5 seconds.
 - Every heartbeat invocation performs one bounded cycle and exits promptly.
 - Never use a script or external process to start, restart, resume, initialize, reinitialize, revive, replace, or chain a turn, session, facilitator, or sub-agent.
 - After the initial bootstrap, turn and agent lifecycle actions may originate only from Copilot's native agent/delegation facility, Codex's native agent/delegation facility, Copilot's native CRON automation, or Codex's native Automation system.
