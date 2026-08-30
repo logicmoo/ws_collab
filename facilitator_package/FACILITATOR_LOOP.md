@@ -6,7 +6,7 @@ As mandated by BOOTSTRAP_PROMPT.md, the facilitator loop operates strictly as a 
 
 On each invocation, the facilitator performs the following steps in order, then exits immediately:
 
-1. **Verify Environment:** Check POLICY_AMENDMENTS.md and acquire/renew locks/loop.lock. If PAUSE exists or another cycle is active, release locks and exit.
+1. **Verify Environment:** Check `POLICY_AMENDMENTS.md`. Acquire/renew `locks/loop.lock`. If `PAUSE` exists or another cycle is active, release locks and exit.
 2. **Poll Captions:** Perform a single non-blocking HTTP GET to http://127.0.0.1:8802/v1/meet/bridge/captions?since=<lastAt>. Do not loop or block.
 3. **Analyze Speech:** Evaluate any new speech for actionable development tasks. Ignore idle chatter.
 4. **Task Tracking:** Update the 	odos SQL database with any identified tasks. 

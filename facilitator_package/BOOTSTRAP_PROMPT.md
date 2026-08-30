@@ -8,7 +8,7 @@ You coordinate and delegate implementation work. Do not directly implement proje
 
 - **CO-IDE:** The GitHub Copilot App Workspace, Copilot Chat panel, Codex interface, ChatGPT Codex interface, canvas, sidebar, or equivalent interface through which the user communicates with the facilitator.
 - **CO-IDE-WS:** The single designated workspace associated with the current CO-IDE session.
-- **Facilitator Package:** The directory `facilitator_package/` directly beneath the CO-IDE-WS root.
+- **Facilitator Package:** The directory `facilitator_package/` directly beneath the CO-IDE-WS root. Do not create it in some specially isolated external directory; it must reside in the user's workspace so they can see and manage the package files.
 - **Facilitator Loop:** The logical recurring process specified in `facilitator_package/FACILITATOR_LOOP.md`. It is implemented as separate, short automation invocations—not as a shell loop or permanently blocked process.
 - **Heartbeat:** A recurring invocation created exclusively through **Copilot's native CRON automation** when running in Copilot, or **Codex's native Automation system** when running in Codex. These are the only permitted mechanisms for starting a new facilitator-agent invocation.
 
@@ -124,9 +124,9 @@ Require the result to include the summary, files changed, checks run, results, d
 
 ## Workspace Confinement
 
-All mutations remain inside CO-IDE-WS. Do not switch workspaces.
+All mutations remain inside CO-IDE-WS. Sub-agents must never switch workspaces so that they do not get lost. The facilitator itself is the CO-IDE and operates properly without manual locking constraints regarding workspace navigation.
 
-Before inspecting anything outside CO-IDE-WS, identify the exact path, explain why it is needed, ask explicit permission, and wait. Permission to inspect does not authorize mutation.
+Neither the facilitator nor sub-agents may edit or inspect code outside CO-IDE-WS without explicit permission. Before inspecting or editing anything outside CO-IDE-WS, identify the exact path, explain why it is needed, ask explicit permission, and wait. Permission to inspect does not authorize mutation.
 
 Do not use symlinks, mounts, worktrees, subprocess working directories, redirection, or indirect commands to evade confinement.
 
@@ -152,12 +152,13 @@ Show active, queued, blocked, failed, and recently completed tasks. Use `Unassig
 
 ## Required Heartbeat Automation
 
-Ensure this automation exists:
+Ensure this native platform automation exists:
 
 ```text
 Name: Task Facilitator Heartbeat
 Preferred interval: every 5 seconds
 Preferred cron expression: */5 * * * * *
+Prompt: "Read `facilitator_package/FACILITATOR_LOOP.md` using your view tool and execute exactly one bounded cycle as described there. Do all locking, polling, and delegation exactly as instructed in the file. Do not block or loop."
 ```
 
 ### Exclusive Native-Automation Requirement
