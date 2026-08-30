@@ -81,6 +81,13 @@ const state = {
   meetAssignmentScope: "",
   meetKnownUrls: [...DEFAULT_DRIVER_MEETING_URLS, ...DEFAULT_CLIENT_MEETING_URLS],
   meetGlobalAssignments: null,
+  meetCompanion: {
+    meetingUrl: "",
+    config: null,
+    configMeetingUrl: "",
+    health: null,
+    loading: false,
+  },
   silences: {
     run: null,
     running: false,
@@ -101,6 +108,7 @@ const state = {
 // flags rather than to literal names, so renaming a stream never breaks the UI.
 let STREAMS = [];
 let TRANSCRIPT_STREAMS = [];
+let BROWSER_NAV_STREAMS = [];
 const ROUTINE_TYPES = new Set([
   "LISTENING_STARTED", "LISTENING_STOPPED", "SPEECH_DETECTED", "WORKER_STATUS",
   "INPUT_MUTED_DURING_TTS", "SECURITY_AUDIT",
@@ -110,6 +118,9 @@ function adoptStreams(capabilities) {
   STREAMS = Object.keys((capabilities && capabilities.streams) || {});
   const roles = (capabilities && capabilities.stream_roles) || {};
   TRANSCRIPT_STREAMS = (roles.speech_pipeline || []).filter((s) => STREAMS.includes(s));
+  const browserNavRole = roles.browser_navigation || [];
+  BROWSER_NAV_STREAMS = (Array.isArray(browserNavRole) ? browserNavRole : [browserNavRole]).filter((s) => STREAMS.includes(s));
+  if (state.views.browserNav) state.views.browserNav.streams = BROWSER_NAV_STREAMS;
   populateStreamMenu();
 }
 
@@ -638,8 +649,12 @@ function createView(opts) {
     },
     append(event, noDraw = false) {
       if (!this.filter(event)) { this.hidden += 1; if (!noDraw) this.updateCounts(); return; }
-      this.rows.push(event);
-      if (this.rows.length > MAX_BUFFER) this.rows.shift();
+      if (opts.newestFirst) this.rows.unshift(event);
+      else this.rows.push(event);
+      if (this.rows.length > MAX_BUFFER) {
+        if (opts.newestFirst) this.rows.pop();
+        else this.rows.shift();
+      }
       if (this.follow) {
         if (!noDraw) { this.draw(); this.scrollToEnd(); }
       } else {
@@ -650,6 +665,14 @@ function createView(opts) {
     },
     rebuild(source) {
       this.rows = source.filter(this.filter);
+      if (opts.newestFirst) {
+        this.rows.sort((a, b) => {
+          const at = Date.parse(a.ts || "") || 0;
+          const bt = Date.parse(b.ts || "") || 0;
+          if (at !== bt) return bt - at;
+          return (b.seq || 0) - (a.seq || 0);
+        });
+      }
       this.hidden = source.length - this.rows.length;
       this.draw();
       this.updateCounts();
@@ -659,7 +682,7 @@ function createView(opts) {
     },
     draw() {
       const cap = opts.capFn ? opts.capFn() : MAX_BUFFER;
-      const rows = this.rows.slice(-cap);
+      const rows = opts.newestFirst ? this.rows.slice(0, cap) : this.rows.slice(-cap);
       spacer.style.height = `${rows.length * ROW_H}px`;
       const top = scroll.scrollTop;
       const height = scroll.clientHeight || 400;
@@ -671,7 +694,7 @@ function createView(opts) {
         viewport.appendChild(this.render(rows[index]));
       }
     },
-    scrollToEnd() { scroll.scrollTop = scroll.scrollHeight; },
+    scrollToEnd() { scroll.scrollTop = opts.newestFirst ? 0 : scroll.scrollHeight; },
     setPaused(value) {
       const wasPaused = this.paused;
       this.manualPaused = value;
@@ -713,7 +736,7 @@ function createView(opts) {
   });
 
   scroll.addEventListener("scroll", () => {
-    const atBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 40;
+    const atBottom = opts.newestFirst ? scroll.scrollTop < 40 : scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 40;
     // Automatic pause when the operator scrolls upward; never force the view down.
     view.follow = atBottom;
     if (atBottom) {
@@ -774,6 +797,42 @@ function defaultRender(event) {
   const text = el("span", `ev-text ${summary.cls}`, summary.text);
   row.appendChild(text);
   row.appendChild(el("span", "ev-src", summary.extra || event.source_id || ""));
+  row.addEventListener("click", () => selectEvent(event, row));
+  if (state.selected && state.selected.id === event.id) row.classList.add("selected");
+  return row;
+}
+
+function renderBrowserNavRow(event) {
+  const data = event.data || {};
+  const profile = data.chrome_profile || {};
+  const row = el("div", "event-row browser-nav-row");
+  row.dataset.source = event.source_kind || "system";
+  if (["denied", "blocked", "unexpected-auth-landing"].includes(data.outcome)) row.classList.add("browser-nav-danger");
+  if (data.outcome === "awaiting-consent") row.classList.add("browser-nav-awaiting");
+  if (["approved", "consent-disabled"].includes(data.outcome)) row.classList.add("browser-nav-approved");
+  if (data.identity_mismatch) row.classList.add("browser-nav-mismatch");
+  const detail = data.detail || "";
+  row.title = [
+    detail,
+    data.caller ? `caller: ${data.caller}` : "",
+    data.cdp_endpoint ? `cdp: ${data.cdp_endpoint}` : "",
+    data.sso_intent ? `SSO intent: ${data.sso_intent}` : "",
+    data.identity_provider ? `provider: ${data.identity_provider}` : "",
+    data.tab_id ? `tab: ${data.tab_id}` : "",
+    data.error ? `error: ${data.error}` : "",
+  ].filter(Boolean).join("\n");
+  row.append(
+    el("span", "ev-ts", shortTs(data.ts || event.ts)),
+    el("span", "mono", `${data.pid || "?"} / ${data.instance || "?"}`),
+    el("span", null, data.role || "unknown"),
+    el("span", null, data.backend || "unknown"),
+    mono(`${data.resolved_endpoint || data.cdp_endpoint || "?"} / ${profile.slug || profile.display || profile.path || "unknown"}`),
+    mono(data.url || ""),
+    el("span", null, `${data.reason || "unknown"}${detail ? ` — ${detail}` : ""}`),
+    el("span", null, `${data.intended_identity || "—"} / ${data.effective_identity || "—"}`),
+    el("span", null, data.identity_mismatch ? "mismatch" : (data.ambient_identity ? "ambient" : (data.identity_mode || "—"))),
+    badge(data.outcome || "unknown", ["failed", "denied", "blocked", "unexpected-auth-landing"].includes(data.outcome) || data.identity_mismatch ? "danger" : (["approved", "consent-disabled", "opened", "navigated", "foregrounded", "reused-existing-tab"].includes(data.outcome) ? "ok" : "")),
+  );
   row.addEventListener("click", () => selectEvent(event, row));
   if (state.selected && state.selected.id === event.id) row.classList.add("selected");
   return row;
@@ -1674,7 +1733,21 @@ async function loadDevices() {
       peak: secondary.peak_level,
       clipping: secondary.clipping,
       captured: secondary.captured,
+      input_mode: secondary.input_mode,
+      browser_connected: secondary.browser_connected,
+      browser_muted: secondary.browser_muted,
+      browser_stream: secondary.browser_stream_id || "—",
+      chunks_forwarded: secondary.chunks_forwarded,
+      frames_forwarded: secondary.frames_forwarded,
+      bytes_forwarded: secondary.bytes_forwarded,
+      segments_forwarded: secondary.segments_forwarded,
+      queued_chunks: `${secondary.queued_chunks} / ${secondary.queue_capacity}`,
       dropped_frames: secondary.dropped_frames,
+      dropped_chunks: secondary.dropped_chunks,
+      dropped_bytes: secondary.dropped_bytes,
+      artifact_chunks_suppressed: secondary.dropped_artifact_chunks,
+      disconnects: secondary.browser_disconnects,
+      reconnects: secondary.browser_reconnects,
       error: secondary.error || "—",
     }));
     $("dv-secondary-capture").replaceChildren(secondaryPanel.root);
@@ -1954,7 +2027,7 @@ async function scanMeetSsoAccounts() {
   const result = $("br-result");
   result.textContent = "scanning live Google sessions...";
   try {
-    const ssoState = await api(`${V1}/meet/sso/accounts`);
+    const ssoState = await api(`${V1}/meet/sso/scan`, { method: "POST", body: {} });
     await loadBrowserSettings(ssoState);
     result.textContent = ssoState.ready_for_meet
       ? `scan complete: ${ssoState.signed_in_count} signed-in accounts; ready for Meet role assignment`
@@ -1989,6 +2062,16 @@ async function loadBrowserSettings(scannedSsoState = null) {
     profile.type = "text";
     profile.style.width = "100%";
     profile.value = data.profile_path || "";
+    const requireConsent = el("input");
+    requireConsent.type = "checkbox";
+    requireConsent.id = "br-require-sso-consent";
+    requireConsent.checked = data.require_sso_consent === true;
+    const requireConsentLabel = el("label");
+    requireConsentLabel.htmlFor = requireConsent.id;
+    requireConsentLabel.append(
+      requireConsent,
+      el("span", null, " Require confirmation before opening identity-provider sign-in pages"),
+    );
     const preview = el("div", "mono");
     const browserPanel = panel("Browser");
     const ssoPanel = panel("SSO");
@@ -2011,14 +2094,16 @@ async function loadBrowserSettings(scannedSsoState = null) {
     backend.onchange = paintPreview;
     profile.oninput = paintPreview;
     browserPanel.content.append(
-      el("div", "hint", "These settings affect the next time you run ws-collab-meet-bridge. They do not live-reconfigure an already-running bridge."),
+      el("div", "hint", "Browser backend and profile changes apply on the next bridge launch. The confirmation setting applies to subsequent navigations in running server-managed bridges."),
       table(
         ["Setting", "Value"],
         [
           ["Browser backend", backend],
           ["Profile path", profile],
+          ["Authentication confirmation", requireConsentLabel],
         ],
       ),
+      el("div", "hint", "When confirmation is off, explicitly intended SSO actions may navigate without a dialog. Typed SSO intent is still required, and every navigation is still logged."),
       el("div", "hint", "Browser launch base (choose role accounts on the Google Meet page before starting)"),
       preview,
     );
@@ -2068,10 +2153,12 @@ async function loadBrowserSettings(scannedSsoState = null) {
           body: {
             browser_backend: backend.value,
             profile_path: profile.value,
+            require_sso_consent: requireConsent.checked,
           },
         });
         result.textContent = "saved";
         profile.value = saved.profile_path || profile.value;
+        requireConsent.checked = saved.require_sso_consent === true;
         paintPreview();
         loadBrowserSettings();
       } catch (error) {
@@ -2081,6 +2168,9 @@ async function loadBrowserSettings(scannedSsoState = null) {
 
     paintPreview();
     body.replaceChildren(browserPanel.root, ssoPanel.root);
+    if (state.views.browserNav && BROWSER_NAV_STREAMS.length) {
+      backfill(BROWSER_NAV_STREAMS, state.views.browserNav);
+    }
   } catch (error) {
     body.replaceChildren(el("div", "hint", `error loading browser settings: ${error.message}`));
   }
@@ -2295,6 +2385,275 @@ async function loadMeetRoleAssignments() {
   } catch (error) {
     body.replaceChildren(el("div", "hint", `error loading Meet role assignments: ${error.message}`));
   }
+}
+
+const COMPANION_FIELD_MAP = {
+  intervalSeconds: "meet-companion-interval",
+  afterSeconds: "meet-companion-after",
+  silenceMs: "meet-companion-silence",
+  minGapSeconds: "meet-companion-gap",
+  maxWaitSeconds: "meet-companion-max-wait",
+  audioRmsThreshold: "meet-companion-rms",
+  clickMs: "meet-companion-duration",
+  gain: "meet-companion-gain",
+  f0Hz: "meet-companion-f0",
+  f1Hz: "meet-companion-f1",
+  f2Hz: "meet-companion-f2",
+};
+
+function companionMeetingKey(value) {
+  const text = String(value || "").trim();
+  const room = meetRoomId(text) || (/^[a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4}$/i.test(text) ? text.toLowerCase() : "");
+  return room ? `https://meet.google.com/${room}` : "";
+}
+
+function setCompanionResult(message, kind = "") {
+  const result = $("meet-companion-result");
+  if (!result) return;
+  result.textContent = message;
+  result.classList.toggle("error", kind === "error");
+  result.classList.toggle("ok", kind === "ok");
+}
+
+function syncCompanionMeetingOptions(currentMeeting = "") {
+  const select = $("meet-companion-meeting");
+  if (!select) return;
+  const current = companionMeetingKey(currentMeeting);
+  if (current) rememberMeetKnownUrls([current]);
+  const urls = [...new Set(state.meetKnownUrls.map(companionMeetingKey).filter(Boolean))];
+  const previous = companionMeetingKey(state.meetCompanion.meetingUrl);
+  const selected = previous || current;
+  const signature = `${selected}|${current}|${urls.join("|")}`;
+  if (select.dataset.signature !== signature) {
+    select.replaceChildren(new Option("Select a specific meeting…", ""));
+    urls.forEach((url) => {
+      const room = meetRoomId(url) || url;
+      select.appendChild(new Option(`${room}${url === current ? " (current)" : ""}`, url));
+    });
+    select.dataset.signature = signature;
+  }
+  select.value = selected;
+  if (selected && selected !== state.meetCompanion.meetingUrl) {
+    state.meetCompanion.meetingUrl = selected;
+    loadCompanionInterjectorConfig();
+  }
+}
+
+function paintCompanionConfig(config) {
+  const source = $("meet-companion-source");
+  const fields = $("meet-companion-fields");
+  if (!source || !fields) return;
+  if (!config) {
+    source.textContent = state.meetCompanion.meetingUrl ? "Loading…" : "No meeting selected";
+    source.className = "badge";
+    fields.disabled = true;
+    return;
+  }
+  $("meet-companion-enabled").checked = !!config.enabled;
+  $("meet-companion-mode").value = config.mode || "reactive";
+  $("meet-companion-trigger").value = config.trigger || "caption";
+  $("meet-companion-sound").value = ["uh", "uhuh", "hmm"].includes(config.phrase)
+    ? config.phrase
+    : (["uh", "uhuh", "hmm"].includes(config.sound) ? config.sound : "uh");
+  Object.entries(COMPANION_FIELD_MAP).forEach(([key, id]) => {
+    $(id).value = config[key] ?? "";
+  });
+  const inherited = config.source !== "override";
+  source.textContent = inherited ? "Inherited global defaults" : "Persisted meeting override";
+  source.className = `badge ${inherited ? "" : "ok"}`.trim();
+  fields.disabled = false;
+  $("meet-companion-reset").disabled = inherited;
+  updateCompanionConditionalFields();
+}
+
+function updateCompanionConditionalFields() {
+  const onSilence = $("meet-companion-mode").value === "reactive";
+  document.querySelectorAll(".companion-silence-field").forEach((field) => {
+    field.hidden = !onSilence;
+    field.querySelectorAll("input,select").forEach((control) => { control.disabled = !onSilence; });
+  });
+  document.querySelectorAll(".companion-interval-field").forEach((field) => {
+    field.hidden = onSilence;
+    field.querySelectorAll("input,select").forEach((control) => { control.disabled = onSilence; });
+  });
+  $("meet-companion-rearm-note").hidden = !onSilence;
+}
+
+async function loadCompanionInterjectorConfig() {
+  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
+  if (!meetingUrl) {
+    state.meetCompanion.config = null;
+    state.meetCompanion.configMeetingUrl = "";
+    paintCompanionConfig(null);
+    renderCompanionMetrics(state.meetCompanion.health);
+    return;
+  }
+  state.meetCompanion.loading = true;
+  paintCompanionConfig(null);
+  setCompanionResult("Loading effective settings…");
+  try {
+    const data = await api(`${V1}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`);
+    if (companionMeetingKey(state.meetCompanion.meetingUrl) !== meetingUrl) return;
+    rememberMeetKnownUrls(data.knownMeetingUrls || []);
+    state.meetCompanion.config = data;
+    state.meetCompanion.configMeetingUrl = meetingUrl;
+    paintCompanionConfig(data);
+    setCompanionResult(
+      data.source === "override"
+        ? "Showing this meeting’s persisted override."
+        : "Showing inherited defaults; saving creates an override.",
+    );
+  } catch (error) {
+    if (companionMeetingKey(state.meetCompanion.meetingUrl) !== meetingUrl) return;
+    state.meetCompanion.config = null;
+    state.meetCompanion.configMeetingUrl = "";
+    paintCompanionConfig(null);
+    $("meet-companion-source").textContent = "Settings unavailable";
+    $("meet-companion-source").className = "badge danger";
+    setCompanionResult(`Could not load settings: ${error.message}`, "error");
+  } finally {
+    state.meetCompanion.loading = false;
+  }
+}
+
+function companionPayload(meetingUrl) {
+  const form = $("meet-companion-form");
+  if (!form.checkValidity()) {
+    form.reportValidity();
+    throw new Error("Correct the highlighted setting values before saving.");
+  }
+  const values = {};
+  Object.entries(COMPANION_FIELD_MAP).forEach(([key, id]) => {
+    values[key] = $(id).valueAsNumber;
+  });
+  if (!(values.f0Hz < values.f1Hz && values.f1Hz < values.f2Hz)) {
+    throw new Error("Frequencies must be ordered f0 < F1 < F2.");
+  }
+  return {
+    meeting_url: meetingUrl,
+    enabled: $("meet-companion-enabled").checked,
+    interval_seconds: values.intervalSeconds,
+    mode: $("meet-companion-mode").value,
+    trigger: $("meet-companion-trigger").value,
+    after_seconds: values.afterSeconds,
+    silence_ms: values.silenceMs,
+    min_gap_seconds: values.minGapSeconds,
+    max_wait_seconds: values.maxWaitSeconds,
+    audio_rms_threshold: values.audioRmsThreshold,
+    click_ms: values.clickMs,
+    gain: values.gain,
+    phrase: $("meet-companion-sound").value,
+    sound: "uh",
+    f0_hz: values.f0Hz,
+    f1_hz: values.f1Hz,
+    f2_hz: values.f2Hz,
+  };
+}
+
+async function saveCompanionInterjector(event) {
+  event.preventDefault();
+  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
+  if (!meetingUrl) {
+    setCompanionResult("Select a specific meeting before saving.", "error");
+    return;
+  }
+  let body;
+  try {
+    body = companionPayload(meetingUrl);
+  } catch (error) {
+    setCompanionResult(error.message, "error");
+    return;
+  }
+  $("meet-companion-fields").disabled = true;
+  setCompanionResult(`Saving override for ${meetRoomId(meetingUrl)}…`);
+  try {
+    const data = await api(`${V1}/meet/companion-click`, { method: "POST", body });
+    if (companionMeetingKey(state.meetCompanion.meetingUrl) !== meetingUrl) return;
+    state.meetCompanion.config = data;
+    state.meetCompanion.configMeetingUrl = meetingUrl;
+    paintCompanionConfig(data);
+    setCompanionResult(`Saved override for ${meetRoomId(meetingUrl)}.`, "ok");
+  } catch (error) {
+    setCompanionResult(`Could not save ${meetRoomId(meetingUrl)}: ${error.message}`, "error");
+    paintCompanionConfig(state.meetCompanion.configMeetingUrl === meetingUrl ? state.meetCompanion.config : null);
+  }
+}
+
+async function resetCompanionInterjector() {
+  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
+  if (!meetingUrl) {
+    setCompanionResult("Select a specific meeting before resetting.", "error");
+    return;
+  }
+  const room = meetRoomId(meetingUrl);
+  if (!confirm(`Remove the companion interjector override for ${room} and use inherited defaults?`)) return;
+  $("meet-companion-fields").disabled = true;
+  setCompanionResult(`Removing override for ${room}…`);
+  try {
+    const data = await api(`${V1}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`, {
+      method: "DELETE",
+    });
+    if (companionMeetingKey(state.meetCompanion.meetingUrl) !== meetingUrl) return;
+    state.meetCompanion.config = data;
+    state.meetCompanion.configMeetingUrl = meetingUrl;
+    paintCompanionConfig(data);
+    setCompanionResult(`Override removed for ${room}; inherited defaults are active.`, "ok");
+  } catch (error) {
+    setCompanionResult(`Could not reset ${room}: ${error.message}`, "error");
+    paintCompanionConfig(state.meetCompanion.configMeetingUrl === meetingUrl ? state.meetCompanion.config : null);
+  }
+}
+
+function companionMetricValue(value, suffix = "") {
+  return value === null || value === undefined || value === "" ? "\u2014" : `${value}${suffix}`;
+}
+
+function renderCompanionMetrics(health) {
+  const target = $("meet-companion-metrics");
+  if (!target) return;
+  state.meetCompanion.health = health || null;
+  const selected = companionMeetingKey(state.meetCompanion.meetingUrl);
+  const active = companionMeetingKey(health && health.meetingUrl);
+  const sameMeeting = !!selected && selected === active;
+  const candidate = health && health.companionClick && typeof health.companionClick === "object"
+    ? health.companionClick
+    : null;
+  const runtimeMeeting = companionMeetingKey(candidate && candidate.meetingUrl);
+  const runtime = sameMeeting && candidate && (!runtimeMeeting || runtimeMeeting === selected) ? candidate : null;
+  const outbound = sameMeeting && health && health.companionAudio && typeof health.companionAudio === "object"
+    ? health.companionAudio
+    : null;
+  const queue = runtime && runtime.queue && typeof runtime.queue === "object" ? runtime.queue : outbound;
+  let status = "Select a meeting";
+  if (selected && !health) status = "Bridge unavailable";
+  else if (selected && !sameMeeting) status = active ? `Not current (${meetRoomId(active)})` : "Not currently joined";
+  else if (sameMeeting && !runtime) status = "Runtime metrics unavailable (older worker)";
+  else if (runtime && !runtime.enabled) status = "Disabled";
+  else if (runtime && runtime.lastError) status = "Error";
+  else if (runtime && runtime.installed) status = "Eligible · monitoring";
+  else if (runtime) status = "Enabled · waiting for companion";
+  const lastTime = runtime && (runtime.lastClickIso
+    || (Number.isFinite(runtime.lastClickAt) ? new Date(runtime.lastClickAt * 1000).toISOString() : null));
+  target.replaceChildren(
+    silencesMetric("Status / eligibility", status),
+    silencesMetric("Backchannels sent", companionMetricValue(runtime && runtime.clicksSent)),
+    silencesMetric("Suppressed / skipped", companionMetricValue(runtime && runtime.suppressed)),
+    silencesMetric("Row breaks observed", companionMetricValue(runtime && runtime.rowBreaksObserved)),
+    silencesMetric("Phrase last sent", companionMetricValue(runtime && (runtime.lastPhrase || runtime.phrase))),
+    silencesMetric("Last trigger mode", companionMetricValue(runtime && runtime.lastTriggerMode)),
+    silencesMetric("Last trigger reason", companionMetricValue(runtime && (runtime.lastTriggerReason || runtime.lastTrigger))),
+    silencesMetric("Last trigger time", companionMetricValue(runtime && (runtime.lastTriggerIso || lastTime))),
+    silencesMetric("Current silence", companionMetricValue(runtime && (runtime.currentSilenceMs ?? runtime.lastSilenceMs), " ms")),
+    silencesMetric("Last monologue", companionMetricValue(runtime && runtime.lastMonologueSeconds, " s")),
+    silencesMetric("Eligibility", companionMetricValue(runtime && runtime.eligibility)),
+    silencesMetric("Companion readiness", runtime
+      ? ((runtime.companionReady ?? (outbound && outbound.companionReady)) ? "Ready" : "Not ready")
+      : "\u2014"),
+    silencesMetric("Output queue", queue
+      ? `${queue.speaking ? `speaking ${queue.currentKind || ""}` : "idle"} · ${queue.queued ?? 0} queued`
+      : "\u2014"),
+  );
+  if (runtime && runtime.lastError) setCompanionResult(`Worker error: ${runtime.lastError}`, "error");
 }
 
 async function postProcessCommand(command) {
@@ -3062,6 +3421,8 @@ async function loadMeet() {
       `run "ws-collab-meet-bridge" (or "python -m ws_collab.meet_bridge")`;
     if (dot) { dot.classList.remove("ok"); dot.classList.add("danger"); }
     $("meet-bridge-card").textContent = "Bridge unreachable.";
+    syncCompanionMeetingOptions("");
+    renderCompanionMetrics(null);
     // Still show the known default driver meetings as placeholders (all
     // correctly "not current" while the bridge itself is down) so the
     // intended meetings stay visible instead of the section going blank.
@@ -3075,6 +3436,8 @@ async function loadMeet() {
   }
   if (dot) { dot.classList.toggle("ok", !!health.ok); dot.classList.toggle("danger", !health.ok); }
   statusLine.textContent = health.meetingUrl ? `bridge online — ${health.meetingUrl}` : "bridge online — no meeting";
+  syncCompanionMeetingOptions(health.meetingUrl);
+  renderCompanionMetrics(health);
   const hostProfileLabel = ssoLabel(health.hostProfile);
   const paintBridgeCard = (captionData) => {
     const transportSource = captionData || health;
@@ -3366,6 +3729,21 @@ async function silencesPollCaptions() {
   renderSilencesPage();
 }
 
+async function loadSilencesCompanionStatus() {
+  let health = null;
+  try {
+    health = await api(`${MEET_BRIDGE_BASE}/status`);
+  } catch (_error) {
+    // Older/offline workers are represented by the absence-safe metrics below.
+  }
+  syncCompanionMeetingOptions(health && health.meetingUrl);
+  renderCompanionMetrics(health);
+  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
+  if (meetingUrl && state.meetCompanion.configMeetingUrl !== meetingUrl && !state.meetCompanion.loading) {
+    await loadCompanionInterjectorConfig();
+  }
+}
+
 function resetSilencesRun() {
   const logic = silencesLogic();
   if (!logic) return;
@@ -3410,16 +3788,19 @@ function driveNextSilenceAgentTurn() {
 }
 
 function silencesPollOnce() {
-  if (!state.silences.running) {
+  if (state.page !== "silences") {
     state.silences.polling = false;
     renderSilencesPage();
     return;
   }
-  silencesPollCaptions().catch((error) => {
+  const refresh = state.silences.running
+    ? Promise.all([silencesPollCaptions(), loadSilencesCompanionStatus()])
+    : loadSilencesCompanionStatus();
+  refresh.catch((error) => {
     $("sil-status").textContent = `caption feed error: ${error.message}`;
     pushError(`silences: ${error.message}`);
   }).finally(() => {
-    if (state.page === "silences" && state.silences.running) setTimeout(silencesPollOnce, 1000);
+    if (state.page === "silences") setTimeout(silencesPollOnce, 1000);
     else state.silences.polling = false;
   });
 }
@@ -3427,7 +3808,7 @@ function silencesPollOnce() {
 async function loadSilencesWithPolling() {
   silencesRun();
   renderSilencesPage();
-  if (!state.silences.running || state.silences.polling) return;
+  if (state.silences.polling) return;
   state.silences.polling = true;
   silencesPollOnce();
 }
@@ -4219,6 +4600,14 @@ function initViews() {
     },
     render: (event) => ($("st-raw").checked ? rawRow(event) : defaultRender(event)),
   });
+  createView({
+    id: "browserNav", scrollId: "br-nav-scroll", spacerId: "br-nav-spacer", viewportId: "br-nav-viewport",
+    jumpId: "br-nav-jump", unseenId: "br-nav-unseen", countsId: "br-nav-counts",
+    streams: BROWSER_NAV_STREAMS,
+    filter: (event) => (event.data || {}).phase !== "intent",
+    render: renderBrowserNavRow,
+    newestFirst: true,
+  });
 }
 
 function rawRow(event) {
@@ -4386,6 +4775,7 @@ function wireEvents() {
   $("dv-search").addEventListener("input", loadDevices);
   $("meet-refresh").onclick = () => {
     loadMeetRoleAssignments();
+    loadCompanionInterjectorConfig();
     loadMeet();
   };
   $("meet-join-btn").onclick = () => {
@@ -4399,6 +4789,16 @@ function wireEvents() {
     if (!text) { pushError("Enter text to speak into the meeting."); return; }
     postMeetCommand(`/say ${text}`);
   };
+  $("meet-companion-meeting").onchange = () => {
+    state.meetCompanion.meetingUrl = companionMeetingKey($("meet-companion-meeting").value);
+    $("meet-companion-meeting").dataset.signature = "";
+    syncCompanionMeetingOptions(state.meetCompanion.health && state.meetCompanion.health.meetingUrl);
+    loadCompanionInterjectorConfig();
+    renderCompanionMetrics(state.meetCompanion.health);
+  };
+  $("meet-companion-form").onsubmit = saveCompanionInterjector;
+  $("meet-companion-reset").onclick = resetCompanionInterjector;
+  $("meet-companion-mode").onchange = updateCompanionConditionalFields;
   $("sil-start").onclick = startSilencesRun;
   $("sil-stop").onclick = stopSilencesRun;
   $("sil-reset").onclick = resetSilencesRun;
@@ -4429,6 +4829,13 @@ function wireEvents() {
     }
   });
   $("br-refresh").onclick = () => loadBrowserSettings();
+  $("br-nav-pause").onclick = () => {
+    const view = state.views.browserNav;
+    view.setPaused(!view.manualPaused);
+    $("br-nav-pause").textContent = view.manualPaused ? "Resume nav log" : "Pause nav log";
+  };
+  $("br-nav-backfill").onclick = () => backfill(BROWSER_NAV_STREAMS, state.views.browserNav);
+  $("br-nav-export").onclick = () => exportView(state.views.browserNav, "browser-nav-intents");
   $("ps-refresh").onclick = loadProcesses;
   $("vc-refresh").onclick = loadVoices;
   $("vc-assign").onclick = async () => {

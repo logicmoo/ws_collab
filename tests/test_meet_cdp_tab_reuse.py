@@ -1,8 +1,21 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
+import pytest
+
 from ws_collab.meet_bridge import cdp
+from ws_collab.meet_bridge import navigator
+
+
+@pytest.fixture(autouse=True)
+def approve_native_consent_for_test():
+    navigator.set_consent_required_provider(lambda: True)
+    navigator.set_consent_provider(lambda _request: navigator.ConsentDecision.ALLOW_OPERATION)
+    yield
+    navigator.set_consent_provider(None)
+    navigator.set_consent_required_provider(None)
 
 
 def test_reuse_or_open_tab_navigates_and_focuses_without_opening(monkeypatch) -> None:
@@ -11,9 +24,15 @@ def test_reuse_or_open_tab_navigates_and_focuses_without_opening(monkeypatch) ->
     class FakeTab:
         def __init__(self, ws_url: str) -> None:
             calls.append(("connect", ws_url))
+            self.url = existing["url"]
 
         def call(self, method: str, params=None, timeout: float = 10.0):
             calls.append((method, params))
+            if method == "Page.navigate":
+                self.url = params["url"]
+
+        def evaluate(self, _expression):
+            return self.url
 
         def bring_to_front(self) -> None:
             calls.append(("focus", None))
@@ -66,6 +85,10 @@ def test_reuse_or_open_tab_does_not_consume_a_tab_from_another_scope(monkeypatch
     class FakeTab:
         def __init__(self, ws_url: str) -> None:
             assert ws_url == "ws://new-scope"
+            self.url = opened["url"]
+
+        def evaluate(self, _expression):
+            return self.url
 
         def bring_to_front(self) -> None:
             return None
@@ -87,10 +110,59 @@ def test_reuse_or_open_tab_does_not_consume_a_tab_from_another_scope(monkeypatch
         "http://127.0.0.1:9223",
         opened["url"],
         existing_in_scope=None,
+        sso_intent=navigator.SsoIntent.OPERATOR_REQUEST,
     )
 
     assert reused is False
     assert info is opened
+
+
+def test_reuse_or_open_new_tab_waits_for_delayed_auth_redirect(monkeypatch) -> None:
+    redirected = threading.Event()
+    opened = {
+        "id": "new-neutral",
+        "url": "https://meet.google.com/abc-defg-hij",
+        "webSocketDebuggerUrl": "ws://new-neutral",
+    }
+
+    class FakeTab:
+        def __init__(self, _ws_url: str) -> None:
+            self.url = opened["url"]
+            threading.Timer(0.03, self._redirect).start()
+
+        def _redirect(self):
+            self.url = "https://accounts.google.com/AccountChooser?code=secret"
+            redirected.set()
+
+        def call(self, method: str, params=None, timeout: float = 10.0):
+            assert method in {"Page.enable", "Page.stopLoading"}
+
+        def drain_events(self):
+            return []
+
+        def wait_for_navigation_settled(self, *, timeout=5.0, **_kwargs):
+            assert redirected.wait(timeout)
+
+        def evaluate(self, expression):
+            if expression == "document.readyState":
+                return "loading"
+            return self.url
+
+        def bring_to_front(self):
+            raise AssertionError("unexpected auth tab must not be foregrounded as success")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(cdp, "CdpTab", FakeTab)
+    monkeypatch.setattr(cdp, "open_url", lambda *_args, **_kwargs: dict(opened))
+
+    with pytest.raises(navigator.UnexpectedAuthLandingError):
+        cdp.reuse_or_open_tab(
+            "http://127.0.0.1:9223",
+            opened["url"],
+            existing_in_scope=None,
+        )
 
 
 def test_sso_discovery_excludes_same_identity_in_other_connectors(monkeypatch) -> None:
@@ -172,9 +244,15 @@ def test_repeated_account_chooser_setup_reuses_one_scoped_tab(monkeypatch) -> No
     class FakeTab:
         def __init__(self, ws_url: str) -> None:
             assert ws_url == "ws://chooser"
+            self.url = chooser["url"]
 
         def call(self, method: str, params=None, timeout: float = 10.0):
             calls.append(method)
+            if method == "Page.navigate":
+                self.url = params["url"]
+
+        def evaluate(self, _expression):
+            return self.url
 
         def bring_to_front(self) -> None:
             calls.append("Page.bringToFront")
@@ -199,11 +277,13 @@ def test_repeated_account_chooser_setup_reuses_one_scoped_tab(monkeypatch) -> No
             "https://accounts.google.com/AccountChooser?continue=x",
             existing_in_scope=existing,
             navigate_existing=True,
+            sso_intent=navigator.SsoIntent.ADD_ACCOUNT,
         )
         assert reused is True
         assert info["id"] == "add-account"
 
     assert calls.count("Page.navigate") == 16
+    assert calls.count("Page.enable") == 16
     assert calls.count("Page.bringToFront") == 16
 
 

@@ -20,8 +20,11 @@ def _admin_source() -> tuple[str, str, str]:
     )
 
 
-def test_silences_page_is_registered_as_observation_first_harness() -> None:
+def test_silences_page_owns_backchannel_editor_and_observation_harness() -> None:
     index, app, logic = _admin_source()
+    silences_page = index.split('<section class="page" data-page="silences">', 1)[1].split(
+        '<section class="page" data-page="browser">', 1
+    )[0]
 
     assert 'data-page="silences"' in index
     assert '<span class="nav-label">Silences</span>' in index
@@ -30,6 +33,44 @@ def test_silences_page_is_registered_as_observation_first_harness() -> None:
     assert "agent voice not yet wired" in index
     assert "silences: loadSilencesWithPolling" in app
     assert "WsCollabSilencesLogic" in logic
+    assert 'id="meet-companion-form"' in silences_page
+    assert "Silences is the authoritative operator surface." in silences_page
+    assert '<option value="uh">uh</option>' in silences_page
+    assert '<option value="uhuh">uhuh</option>' in silences_page
+    assert '<option value="hmm">hmm</option>' in silences_page
+    assert '<option value="reactive">On silence</option>' in silences_page
+    assert '<option value="fixed">Every N seconds</option>' in silences_page
+    assert "one backchannel per continuous silence" in silences_page
+    assert 'id="meet-companion-enabled"' in silences_page
+    assert 'id="meet-companion-reset"' in silences_page
+    assert 'id="meet-companion-source"' in silences_page
+    assert 'id="meet-companion-result"' in silences_page
+
+
+def test_silences_backchannel_routes_conditionals_and_absence_safe_metrics() -> None:
+    _index, app, _logic = _admin_source()
+
+    assert 'api(`${V1}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`)' in app
+    assert 'api(`${V1}/meet/companion-click`, { method: "POST", body })' in app
+    assert 'method: "DELETE"' in app
+    assert 'phrase: $("meet-companion-sound").value' in app
+    assert 'sound: "uh"' in app
+    assert 'document.querySelectorAll(".companion-silence-field")' in app
+    assert 'document.querySelectorAll(".companion-interval-field")' in app
+    assert '"Runtime metrics unavailable (older worker)"' in app
+    for label in (
+        "Backchannels sent",
+        "Suppressed / skipped",
+        "Row breaks observed",
+        "Phrase last sent",
+        "Last trigger mode",
+        "Last trigger reason",
+        "Last trigger time",
+        "Current silence",
+        "Companion readiness",
+        "Output queue",
+    ):
+        assert f'silencesMetric("{label}"' in app
 
 
 def test_silences_caption_feed_filters_final_non_duplicates() -> None:

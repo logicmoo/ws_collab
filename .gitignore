@@ -14,6 +14,8 @@ dist/
 
 # Runtime writable state (JSONL logs, standalone.log, session data)
 collab_state/
+# Repo-local Chrome user-data profiles contain live browser credentials.
+chrome_profiles/
 
 # Virtualenvs
 .venv/

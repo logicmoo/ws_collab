@@ -71,3 +71,24 @@ def test_secondary_capture_start_uses_audio_endpoint(monkeypatch) -> None:
     assert captured["path"] == "/v1/audio/secondary-capture/start"
     assert captured["method"] == "POST"
     assert captured["body"] == {"device_id": "dev-1"}
+
+
+def test_companion_browser_audio_uses_shared_secondary_endpoint(monkeypatch) -> None:
+    client = MailboxClient(token="worker-token")
+    captured = {}
+
+    def call(path, *, method="GET", body=None):
+        captured.update(path=path, method=method, body=body)
+        return {"browser_connected": True}
+
+    monkeypatch.setattr(client, "_call", call)
+    payload = {"sample_rate": 48000, "connected": True, "muted": True, "chunks": []}
+
+    result = client.ingest_companion_browser_audio(payload)
+
+    assert result["browser_connected"] is True
+    assert captured == {
+        "path": "/v1/audio/secondary-capture/browser",
+        "method": "POST",
+        "body": payload,
+    }

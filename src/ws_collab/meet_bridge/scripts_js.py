@@ -404,8 +404,29 @@ SPEAK_INTO_MEETING_JS = r"""
   const source = ctx.createBufferSource();
   source.buffer = buffer;
   source.connect(window.__sapiSink);
+  window.__wsCollabOutboundSources = window.__wsCollabOutboundSources || new Set();
+  window.__wsCollabOutboundSources.add(source);
+  const done = new Promise((resolve) => {
+    source.onended = () => {
+      window.__wsCollabOutboundSources.delete(source);
+      try { source.disconnect(); } catch (_error) {}
+      resolve();
+    };
+  });
   source.start();
-  return "speaking:" + Math.round(buffer.duration * 1000);
+  await done;
+  return "completed:" + Math.round(buffer.duration * 1000);
+})()
+"""
+
+CANCEL_COMPANION_AUDIO_JS = r"""
+(() => {
+  let stopped = 0;
+  for (const source of (window.__wsCollabOutboundSources || [])) {
+    try { source.stop(); stopped += 1; } catch (_error) {}
+  }
+  if (window.__wsCollabOutboundSources) window.__wsCollabOutboundSources.clear();
+  return "stopped:" + stopped;
 })()
 """
 
@@ -488,32 +509,45 @@ COMPANION_CLICK_JS = r"""
         return;
       }
       if (ctx.state === "suspended") await ctx.resume();
-      if (state.sound === "uh") {
+      if (["uh", "uhuh", "hmm"].includes(state.sound)) {
         const startAt = ctx.currentTime + 0.01;
-        const stopAt = startAt + state.durationSeconds;
+        const phraseDuration = state.sound === "uhuh"
+          ? Math.max(state.durationSeconds, 0.28)
+          : (state.sound === "hmm" ? Math.max(state.durationSeconds, 0.22) : state.durationSeconds);
+        const stopAt = startAt + phraseDuration;
         const osc = ctx.createOscillator();
         const f1 = ctx.createBiquadFilter();
         const f2 = ctx.createBiquadFilter();
         const g1 = ctx.createGain();
         const g2 = ctx.createGain();
         const out = ctx.createGain();
-        osc.type = "sawtooth";
-        osc.frequency.setValueAtTime(state.f0, startAt);
+        window.__wsCollabOutboundSources = window.__wsCollabOutboundSources || new Set();
+        window.__wsCollabOutboundSources.add(osc);
+        osc.type = state.sound === "hmm" ? "triangle" : "sawtooth";
+        osc.frequency.setValueAtTime(state.sound === "hmm" ? state.f0 * 0.9 : state.f0, startAt);
         f1.type = "bandpass";
-        f1.frequency.setValueAtTime(state.f1, startAt);
-        f1.Q.setValueAtTime(5, startAt);
+        f1.frequency.setValueAtTime(state.sound === "hmm" ? Math.min(state.f1, 300) : state.f1, startAt);
+        f1.Q.setValueAtTime(state.sound === "hmm" ? 3 : 5, startAt);
         f2.type = "bandpass";
-        f2.frequency.setValueAtTime(state.f2, startAt);
+        f2.frequency.setValueAtTime(state.sound === "hmm" ? Math.min(state.f2, 1100) : state.f2, startAt);
         f2.Q.setValueAtTime(6, startAt);
-        g1.gain.value = 0.95;
-        g2.gain.value = 0.70;
+        g1.gain.value = state.sound === "hmm" ? 1.0 : 0.95;
+        g2.gain.value = state.sound === "hmm" ? 0.35 : 0.70;
         out.gain.setValueAtTime(0.0001, startAt);
-        out.gain.linearRampToValueAtTime(state.amplitude, startAt + Math.min(0.018, state.durationSeconds * 0.3));
+        if (state.sound === "uhuh") {
+          const middle = startAt + phraseDuration * 0.5;
+          out.gain.linearRampToValueAtTime(state.amplitude, startAt + 0.025);
+          out.gain.exponentialRampToValueAtTime(0.0001, middle - 0.018);
+          out.gain.linearRampToValueAtTime(state.amplitude * 0.9, middle + 0.025);
+        } else {
+          out.gain.linearRampToValueAtTime(state.amplitude, startAt + Math.min(0.035, phraseDuration * 0.3));
+        }
         out.gain.exponentialRampToValueAtTime(0.0001, stopAt);
         osc.connect(f1).connect(g1).connect(out);
         osc.connect(f2).connect(g2).connect(out);
         out.connect(sink);
         osc.onended = () => {
+          window.__wsCollabOutboundSources.delete(osc);
           try { osc.disconnect(); f1.disconnect(); f2.disconnect(); g1.disconnect(); g2.disconnect(); out.disconnect(); } catch (_error) {}
         };
         osc.start(startAt);
@@ -537,9 +571,12 @@ COMPANION_CLICK_JS = r"""
         data[i] = (tone + noise) * state.amplitude * envelope;
       }
       const source = ctx.createBufferSource();
+      window.__wsCollabOutboundSources = window.__wsCollabOutboundSources || new Set();
+      window.__wsCollabOutboundSources.add(source);
       source.buffer = buffer;
       source.connect(sink);
       source.onended = () => {
+        window.__wsCollabOutboundSources.delete(source);
         try { source.disconnect(); } catch (_error) {}
       };
       source.start();
@@ -572,6 +609,7 @@ COMPANION_CLICK_ONCE_JS = r"""
   return JSON.stringify({
     ok: !state.lastError,
     status: state.lastError ? "error" : "clicked",
+    phrase: state.sound || "uh",
     lastClickAt: state.lastClickAt || null,
     clickCount: state.clickCount || 0,
     lastError: state.lastError || null,
@@ -669,69 +707,154 @@ COMPANION_AUDIO_RMS_JS = r"""
 """
 
 
-ROUTE_COMPANION_AUDIO_OUTPUT_JS = r"""
+# Tap the live remote MediaStream itself, not the media element's audible output.
+# The element stays muted while a zero-gain WebAudio graph keeps PCM processing
+# active. State and the bounded queue survive bridge polls in this JS realm.
+COMPANION_AUDIO_TAP_JS = r"""
 (async () => {
-  const NEEDLE = %s;
-  const result = {
-    ok: false,
-    status: "not-run",
-    deviceId: null,
-    deviceLabel: null,
-    elementCount: 0,
-    routedCount: 0,
-    lastError: null,
-  };
+  const MAX_QUEUE = 64;
   const elements = Array.from(document.querySelectorAll("audio,video"));
-  result.elementCount = elements.length;
   const muteAll = () => {
     for (const element of elements) {
       try { element.muted = true; element.volume = 0; } catch (_error) {}
     }
   };
-  try {
-    if (!NEEDLE) {
-      muteAll();
-      result.status = "disabled";
-      return JSON.stringify(result);
-    }
-    const sample = elements.find((element) => typeof element.setSinkId === "function");
-    if (!sample) {
-      muteAll();
-      result.status = "set-sink-id-unavailable";
-      result.lastError = "browser does not expose HTMLMediaElement.setSinkId; companion audio remains muted";
-      return JSON.stringify(result);
-    }
-    if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== "function") {
-      muteAll();
-      result.status = "enumerate-devices-unavailable";
-      result.lastError = "browser cannot enumerate audio output devices; companion audio remains muted";
-      return JSON.stringify(result);
-    }
-    const outputs = (await navigator.mediaDevices.enumerateDevices()).filter((device) => device.kind === "audiooutput");
-    const match = outputs.find((device) => (device.label || "").toLowerCase().includes(NEEDLE));
-    if (!match) {
-      muteAll();
-      result.status = "output-device-not-found";
-      result.lastError = `no browser audio output device label contains "${NEEDLE}"`;
-      return JSON.stringify(result);
-    }
+  muteAll();
+  const state = window.__wsCollabCompanionAudioTap || {
+    ctx: null,
+    source: null,
+    processor: null,
+    sink: null,
+    streamId: null,
+    queue: [],
+    connected: false,
+    everConnected: false,
+    capturedChunks: 0,
+    capturedFrames: 0,
+    capturedBytes: 0,
+    droppedChunks: 0,
+    droppedFrames: 0,
+    droppedBytes: 0,
+    disconnects: 0,
+    reconnects: 0,
+    lastError: null,
+  };
+  window.__wsCollabCompanionAudioTap = state;
+  const streamKey = (tracks) => tracks.map((track) => track.id || track.label || "track").join(",");
+  const findRemoteTracks = () => {
     for (const element of elements) {
-      if (typeof element.setSinkId !== "function") continue;
-      await element.setSinkId(match.deviceId);
-      element.muted = false;
-      element.volume = 1;
-      result.routedCount += 1;
+      const stream = element.srcObject && typeof element.srcObject.getAudioTracks === "function"
+        ? element.srcObject : null;
+      if (!stream) continue;
+      const tracks = stream.getAudioTracks().filter((track) => track.readyState === "live");
+      if (tracks.length) return tracks;
     }
-    result.ok = result.routedCount > 0;
-    result.status = result.ok ? "routed" : "no-media-elements-routed";
-    result.deviceId = match.deviceId;
-    result.deviceLabel = match.label || null;
-    return JSON.stringify(result);
-  } catch (error) {
+    return [];
+  };
+  const teardown = () => {
+    try { if (state.source) state.source.disconnect(); } catch (_error) {}
+    try { if (state.processor) state.processor.disconnect(); } catch (_error) {}
+    try { if (state.sink) state.sink.disconnect(); } catch (_error) {}
+    state.source = null;
+    state.processor = null;
+    state.sink = null;
+    state.streamId = null;
+  };
+  const result = () => {
+    const chunks = state.queue.splice(0, state.queue.length);
+    return JSON.stringify({
+      ok: state.connected,
+      status: state.connected ? "capturing-muted-remote-stream" : "stream-disconnected",
+      connected: state.connected,
+      muted: elements.every((element) => element.muted === true && Number(element.volume) === 0),
+      streamId: state.streamId,
+      sampleRate: state.ctx ? state.ctx.sampleRate : null,
+      chunks,
+      capturedChunks: state.capturedChunks,
+      capturedFrames: state.capturedFrames,
+      capturedBytes: state.capturedBytes,
+      droppedChunks: state.droppedChunks,
+      droppedFrames: state.droppedFrames,
+      droppedBytes: state.droppedBytes,
+      disconnects: state.disconnects,
+      reconnects: state.reconnects,
+      lastError: state.lastError,
+    });
+  };
+  try {
+    const tracks = findRemoteTracks();
+    if (!tracks.length) {
+      if (state.connected) state.disconnects += 1;
+      state.connected = false;
+      state.lastError = "incoming-remote-media-stream-unavailable";
+      teardown();
+      return result();
+    }
+    const key = streamKey(tracks);
+    if (!state.ctx) state.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!state.processor || state.streamId !== key) {
+      const reconnecting = state.everConnected;
+      teardown();
+      const stream = new MediaStream(tracks);
+      state.source = state.ctx.createMediaStreamSource(stream);
+      state.processor = state.ctx.createScriptProcessor(4096, 2, 1);
+      state.sink = state.ctx.createGain();
+      state.sink.gain.value = 0;
+      state.processor.onaudioprocess = (event) => {
+        try {
+          const buffer = event.inputBuffer;
+          const frames = buffer.length;
+          const channels = Math.max(1, buffer.numberOfChannels);
+          const pcm = new Int16Array(frames);
+          for (let channel = 0; channel < channels; channel += 1) {
+            const input = buffer.getChannelData(channel);
+            for (let i = 0; i < frames; i += 1) {
+              const sample = Math.max(-1, Math.min(1, input[i] || 0)) / channels;
+              pcm[i] += sample < 0 ? sample * 32768 : sample * 32767;
+            }
+          }
+          const bytes = new Uint8Array(pcm.buffer);
+          let binary = "";
+          for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+          const chunk = {
+            pcm_s16le_base64: btoa(binary),
+            frames,
+            bytes: bytes.length,
+            capturedAt: Date.now(),
+          };
+          if (state.queue.length >= MAX_QUEUE) {
+            const dropped = state.queue.shift();
+            state.droppedChunks += 1;
+            state.droppedFrames += Number(dropped && dropped.frames) || 0;
+            state.droppedBytes += Number(dropped && dropped.bytes) || 0;
+          }
+          state.queue.push(chunk);
+          state.capturedChunks += 1;
+          state.capturedFrames += frames;
+          state.capturedBytes += bytes.length;
+        } catch (error) {
+          state.lastError = error && error.message ? error.message : String(error);
+        }
+      };
+      state.source.connect(state.processor);
+      state.processor.connect(state.sink);
+      state.sink.connect(state.ctx.destination);
+      state.streamId = key;
+      if (reconnecting) state.reconnects += 1;
+    }
+    if (state.ctx.state === "suspended") await state.ctx.resume();
+    state.connected = true;
+    state.everConnected = true;
+    state.lastError = null;
     muteAll();
-    result.status = "routing-error";
-    result.lastError = error && error.message ? error.message : String(error);
-    return JSON.stringify(result);
+    return result();
+  } catch (error) {
+    if (state.connected) state.disconnects += 1;
+    state.connected = false;
+    state.lastError = error && error.message ? error.message : String(error);
+    teardown();
+    muteAll();
+    return result();
   }
 })()
 """

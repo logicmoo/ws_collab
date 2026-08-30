@@ -276,6 +276,14 @@
         </div>
 
         <div class="panel">
+          <div class="panel-title">Companion backchannels</div>
+          <div class="panel-content hint">
+            Automatic companion backchannels are configured and monitored on
+            <a href="#silences">Silences</a>.
+          </div>
+        </div>
+
+        <div class="panel">
           <div class="panel-title">Meet role accounts</div>
           <div class="panel-content" id="meet-role-settings"></div>
         </div>
@@ -343,6 +351,96 @@
         <span class="mono hint" id="sil-status">ready</span>
       </div>
       <div class="panel-body">
+        <div class="panel" id="meet-companion-panel">
+          <div class="panel-title">Automatic companion backchannels</div>
+          <div class="panel-content">
+            <p class="hint companion-aid-note">
+              Silences is the authoritative operator surface. A selected phrase is queued through
+              the companion output arbiter, never over virtual-agent speech. On-silence sends once
+              per quiet event and rearms only after speech or caption growth resumes.
+            </p>
+            <div class="companion-scope-row">
+              <label for="meet-companion-meeting">Exact meeting</label>
+              <select id="meet-companion-meeting" required>
+                <option value="">Select a specific meeting…</option>
+              </select>
+              <span id="meet-companion-source" class="badge">No meeting selected</span>
+            </div>
+            <form id="meet-companion-form">
+              <fieldset id="meet-companion-fields" disabled>
+                <legend class="sr-only">Automatic companion backchannel settings</legend>
+                <div class="companion-settings-grid">
+                  <label class="companion-check">
+                    <input type="checkbox" id="meet-companion-enabled" />
+                    Enable automatic backchannels for this meeting
+                  </label>
+                  <label>Trigger mode
+                    <select id="meet-companion-mode">
+                      <option value="reactive">On silence</option>
+                      <option value="fixed">Every N seconds</option>
+                    </select>
+                  </label>
+                  <label>Phrase
+                    <select id="meet-companion-sound">
+                      <option value="uh">uh</option>
+                      <option value="uhuh">uhuh</option>
+                      <option value="hmm">hmm</option>
+                    </select>
+                  </label>
+                  <label class="companion-interval-field">Interval N (seconds)
+                    <input type="number" id="meet-companion-interval" min="0.1" max="3600" step="0.1" required />
+                  </label>
+                  <label class="companion-silence-field">Silence detector
+                    <select id="meet-companion-trigger">
+                      <option value="caption">Caption stasis</option>
+                      <option value="audio">Audio silence</option>
+                      <option value="both">Caption and audio</option>
+                    </select>
+                  </label>
+                  <label class="companion-silence-field">After monologue (seconds)
+                    <input type="number" id="meet-companion-after" min="0.1" max="3600" step="0.1" required />
+                  </label>
+                  <label class="companion-silence-field">Silence / caption stasis (ms)
+                    <input type="number" id="meet-companion-silence" min="10" max="10000" step="10" required />
+                  </label>
+                  <label>Minimum safety gap (seconds)
+                    <input type="number" id="meet-companion-gap" min="0.1" max="3600" step="0.1" required />
+                  </label>
+                  <label class="companion-silence-field">Maximum wait (seconds; 0 disables)
+                    <input type="number" id="meet-companion-max-wait" min="0" max="3600" step="0.1" required />
+                  </label>
+                  <label class="companion-silence-field">Audio RMS threshold
+                    <input type="number" id="meet-companion-rms" min="0" max="1" step="0.001" required />
+                  </label>
+                  <label>Phrase base duration (ms)
+                    <input type="number" id="meet-companion-duration" min="10" max="1000" step="1" required />
+                  </label>
+                  <label>Gain
+                    <input type="number" id="meet-companion-gain" min="0.001" max="1" step="0.001" required />
+                  </label>
+                  <label>Fundamental f0 (Hz)
+                    <input type="number" id="meet-companion-f0" min="40" max="500" step="1" required />
+                  </label>
+                  <label>Formant F1 (Hz)
+                    <input type="number" id="meet-companion-f1" min="100" max="5000" step="1" required />
+                  </label>
+                  <label>Formant F2 (Hz)
+                    <input type="number" id="meet-companion-f2" min="200" max="8000" step="1" required />
+                  </label>
+                </div>
+                <p class="hint" id="meet-companion-rearm-note">
+                  On-silence is edge-triggered: one backchannel per continuous silence, then rearm after speech or caption growth.
+                </p>
+                <div class="toolbar companion-actions">
+                  <button type="submit" class="primary" id="meet-companion-save">Save meeting override</button>
+                  <button type="button" id="meet-companion-reset">Reset to inherited defaults</button>
+                  <span id="meet-companion-result" class="mono hint" role="status" aria-live="polite"></span>
+                </div>
+              </fieldset>
+            </form>
+            <div id="meet-companion-metrics" class="silences-summary" aria-live="polite"></div>
+          </div>
+        </div>
         <div class="panel">
           <div class="panel-title">Observation-first turn-taking harness</div>
           <div class="panel-content">
@@ -376,9 +474,29 @@
       <div class="toolbar">
         <button class="primary" id="br-refresh">Refresh</button>
         <button id="br-save">Save</button>
+        <button id="br-nav-pause">Pause nav log</button>
+        <button id="br-nav-backfill">Backfill nav log</button>
+        <button id="br-nav-export">Export nav log</button>
+        <span class="mono hint" id="br-nav-counts">0 shown · 0 hidden</span>
         <span class="mono hint" id="br-result"></span>
       </div>
-      <div class="panel-body" id="br-settings"></div>
+      <div class="panel-body">
+        <div id="br-settings"></div>
+        <div class="panel">
+          <div class="panel-title">Global browser navigation intents</div>
+          <div class="panel-content">
+            <div class="hint">Newest first. Hover, select text, or scroll up to pause live updates; use Jump to latest to resume.</div>
+            <div class="browser-nav-header">
+              <span>Time</span><span>PID / Instance</span><span>Role</span><span>Backend</span><span>Endpoint / Profile</span><span>URL</span><span>Reason / Detail</span><span>Intended / Effective</span><span>Identity</span><span>Outcome</span>
+            </div>
+            <div class="event-scroll browser-nav-scroll" id="br-nav-scroll">
+              <div class="event-spacer" id="br-nav-spacer"></div>
+              <div class="event-viewport" id="br-nav-viewport"></div>
+            </div>
+            <button class="jump-latest" id="br-nav-jump">↓ Jump to latest (<span id="br-nav-unseen">0</span> unseen)</button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- ------------------------------------------------------------- processes -->

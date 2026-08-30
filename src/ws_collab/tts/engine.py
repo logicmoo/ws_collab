@@ -15,7 +15,7 @@ import asyncio
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from ..config import Config
 from ..events import (
@@ -29,6 +29,9 @@ from ..ids import new_event_id
 from ..stt.base import normalize_text
 
 PublishFn = Callable[..., dict[str, Any]]
+RoutePlayFn = Callable[["TtsItem"], Awaitable[float]]
+RouteStatusFn = Callable[[], dict[str, Any]]
+RouteCancelFn = Callable[[str], None]
 
 
 @dataclass(order=True)
@@ -45,6 +48,9 @@ class TtsItem:
     pitch: float = field(default=0.0, compare=False)
     volume: float = field(default=1.0, compare=False)
     device: str = field(default="default", compare=False)
+    destination: str = field(default="local", compare=False)
+    meeting_url: str | None = field(default=None, compare=False)
+    artifact_source: str = field(default="virtual-agent-tts", compare=False)
     correlation_id: str | None = field(default=None, compare=False)
     interrupt: bool = field(default=False, compare=False)
     cancelled: bool = field(default=False, compare=False)
@@ -64,6 +70,9 @@ class TtsItem:
             "rate": self.rate,
             "pitch": self.pitch,
             "device": self.device,
+            "destination": self.destination,
+            "meeting_url": self.meeting_url,
+            "artifact_source": self.artifact_source,
             "correlation_id": self.correlation_id,
             "cancelled": self.cancelled,
         }
@@ -109,7 +118,16 @@ def build_backend(config: Config):
 
 
 class TtsEngine:
-    def __init__(self, config: Config, publish: PublishFn, backend=None, dedupe_window_s: float = 2.0):
+    def __init__(
+        self,
+        config: Config,
+        publish: PublishFn,
+        backend=None,
+        dedupe_window_s: float = 2.0,
+        route_play: RoutePlayFn | None = None,
+        route_status: RouteStatusFn | None = None,
+        route_cancel: RouteCancelFn | None = None,
+    ):
         self.config = config
         self._publish = publish
         self._backend = backend or build_backend(config)
@@ -125,6 +143,9 @@ class TtsEngine:
         self._paused_agents: set[str] = set()
         self._recent: dict[str, float] = {}
         self._dedupe_window_s = dedupe_window_s
+        self._route_play = route_play
+        self._route_status = route_status
+        self._route_cancel = route_cancel
         # Per-agent "last actually spoken" record (text + when playback
         # STARTED, not just enqueue time) -- separate from `_recent`, which
         # is only a short dedupe window and gets pruned within seconds.
@@ -162,6 +183,9 @@ class TtsEngine:
         pitch: float = 0.0,
         volume: float = 1.0,
         device: str = "default",
+        destination: str = "local",
+        meeting_url: str | None = None,
+        artifact_source: str = "virtual-agent-tts",
         priority: int = 5,
         correlation_id: str | None = None,
         interrupt: bool = False,
@@ -190,6 +214,9 @@ class TtsEngine:
                 pitch=pitch,
                 volume=volume,
                 device=device,
+                destination=destination,
+                meeting_url=meeting_url,
+                artifact_source=artifact_source,
                 correlation_id=correlation_id,
                 interrupt=interrupt,
             )
@@ -236,6 +263,8 @@ class TtsEngine:
                     return True
             if self._current is not None and self._current.id == item_id:
                 self._current.cancelled = True
+                if self._current.destination == "companion" and self._route_cancel is not None:
+                    self._route_cancel(item_id)
                 return True
         return False
 
@@ -275,7 +304,7 @@ class TtsEngine:
     # -------------------------------------------------------------------- state
     def state(self) -> dict[str, Any]:
         with self._lock:
-            return {
+            state = {
                 "is_speaking": self._current is not None,
                 "current": self._current.public() if self._current else None,
                 "queue": [item.public() for item in self._pending if not item.cancelled],
@@ -284,6 +313,18 @@ class TtsEngine:
                 "muted_agents": sorted(self._muted_agents),
                 "backend": self._backend.name,
             }
+        if self._route_status is not None:
+            try:
+                state["destinations"] = {"companion": self._route_status()}
+            except Exception as exc:  # noqa: BLE001
+                state["destinations"] = {
+                    "companion": {
+                        "destination": "companion",
+                        "companionReady": False,
+                        "lastError": str(exc),
+                    }
+                }
+        return state
 
     def last_spoken(self, agent_id: str) -> dict[str, Any] | None:
         """The most recent {text, voice_id, at} this agent actually had
@@ -352,7 +393,12 @@ class TtsEngine:
         duration = 0.0
         try:
             if not item.cancelled:
-                duration = await self._backend.play(item)
+                if item.destination == "companion":
+                    if self._route_play is None:
+                        raise RuntimeError("companion TTS route is unavailable")
+                    duration = await self._route_play(item)
+                else:
+                    duration = await self._backend.play(item)
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
         finally:

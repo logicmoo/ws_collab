@@ -77,10 +77,13 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from . import navigator
+from .companion_audio import CompanionAudioArbiter
 from .audio_out import (
     list_audio_devices,
     play_wav_bytes_to_device,
@@ -94,8 +97,10 @@ from .cdp import (
     DEFAULT_PROFILE,
     DEFAULT_SSO_AUTHUSER_PROBE_SLOTS,
     CdpTab,
+    browser_profile_root,
     cdp_alive,
     close_tab,
+    configure_browser_nav_logging,
     ensure_default_profile_migrated,
     find_browser,
     find_add_account_tab,
@@ -107,15 +112,16 @@ from .cdp import (
     scan_signed_in_sso_accounts,
 )
 from .mailbox_client import DEFAULT_BASE_URL as DEFAULT_MAILBOX_BASE
-from .mailbox_client import MailboxClient
+from .mailbox_client import BrowserNavIntentPoster, MailboxClient
 from .scripts_js import (
     CAPTION_OBSERVER_JS,
     CAPTIONS_JS,
+    COMPANION_AUDIO_TAP_JS,
     COMPANION_AUDIO_RMS_JS,
     COMPANION_CLICK_JS,
     COMPANION_CLICK_ONCE_JS,
+    CANCEL_COMPANION_AUDIO_JS,
     GUM_PATCH_JS,
-    ROUTE_COMPANION_AUDIO_OUTPUT_JS,
     SELECT_MIC_DEVICE_JS,
     SEND_CHAT_JS_TEMPLATE,
     SPEAK_INTO_MEETING_JS,
@@ -127,7 +133,6 @@ from ..meet_browser_settings import MeetBrowserSettings
 DEFAULT_RECIPIENTS = ["conversation"]
 DEFAULT_SENDER_PREFIX = "meet-"
 DEFAULT_OUTBOX = "google-meet"
-SSO_SETUP_URL = "https://accounts.google.com/AccountChooser?continue=https://accounts.google.com/"
 CAPTION_ROLES = ("host", "companion")
 CAPTION_DUPLICATE_WINDOW_SECONDS = 15.0
 CAPTION_DUPLICATE_RECENT_LIMIT = 400
@@ -149,6 +154,11 @@ _COMPANION_CLICK_LOG_AT: dict[str, float] = {}
 _ROOM_RE = re.compile(r"meet\.google\.com/([a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4})", re.IGNORECASE)
 _ROOM_ID_RE = re.compile(r"^[a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4}$", re.IGNORECASE)
 _CAPTION_SPACE_RE = re.compile(r"\s+")
+
+
+def read_sso_consent_setting(settings_dir: Path | str) -> bool:
+    """Read the atomic shared setting afresh for each authentication navigation."""
+    return MeetBrowserSettings(settings_dir).require_sso_consent()
 
 
 def room_id(url: str | None) -> str | None:
@@ -406,6 +416,7 @@ def update_companion_click_status(status: dict[str, Any], holder: dict[str, Any]
         "meetingUrl": holder.get("companion_click_meeting_url"),
         "source": str(holder.get("companion_click_source") or "default"),
         "mode": str(holder.get("companion_click_mode") or "reactive"),
+        "triggerMode": "interval" if holder.get("companion_click_mode") == "fixed" else "on_silence",
         "trigger": str(holder.get("companion_click_trigger") or "caption"),
         "afterSeconds": float(holder.get("companion_click_after_seconds") or 10.0),
         "silenceMs": float(holder.get("companion_click_silence_ms") or 500.0),
@@ -414,12 +425,27 @@ def update_companion_click_status(status: dict[str, Any], holder: dict[str, Any]
         "clickMs": float(holder.get("companion_click_ms") or 100.0),
         "gain": float(holder.get("companion_click_gain") or 0.12),
         "sound": str(holder.get("companion_click_sound") or "uh"),
+        "phrase": str(holder.get("companion_click_phrase") or holder.get("companion_click_sound") or "uh"),
         "f0Hz": float(holder.get("companion_click_f0_hz") or 125.0),
         "f1Hz": float(holder.get("companion_click_f1_hz") or 600.0),
         "f2Hz": float(holder.get("companion_click_f2_hz") or 1300.0),
         "clicksSent": int(holder.get("companion_clicks_sent") or 0),
+        "suppressed": int(holder.get("companion_click_suppressed") or 0),
         "rowBreaksObserved": int(holder.get("companion_click_row_breaks_observed") or 0),
         "lastTrigger": holder.get("companion_click_last_trigger"),
+        "lastTriggerMode": holder.get("companion_click_last_trigger_mode"),
+        "lastTriggerReason": holder.get("companion_click_last_trigger_reason"),
+        "lastTriggerAt": holder.get("companion_click_last_trigger_at"),
+        "lastTriggerIso": holder.get("companion_click_last_trigger_iso"),
+        "lastPhrase": holder.get("companion_click_last_phrase"),
+        "currentSilenceMs": holder.get("companion_click_current_silence_ms"),
+        "eligibility": holder.get("companion_click_eligibility"),
+        "companionReady": bool(holder.get("companion_click_companion_ready")),
+        "queue": holder.get("companion_click_queue") or {
+            "queued": 0,
+            "speaking": False,
+            "currentKind": None,
+        },
         "lastSilenceMs": holder.get("companion_click_last_silence_ms"),
         "lastMonologueSeconds": holder.get("companion_click_last_monologue_seconds"),
         "audioRms": holder.get("companion_click_audio_rms"),
@@ -438,6 +464,28 @@ def update_companion_heard_stt_status(status: dict[str, Any], holder: dict[str, 
     payload = {
         "enabled": bool(holder.get("companion_heard_stt_enabled")),
         "sourceKind": "companion_heard",
+        "audioSource": "companion_heard_meeting_audio",
+        "captureMode": "muted-remote-media-stream",
+        "tapStatus": holder.get("companion_heard_stt_tap_status"),
+        "tapConnected": bool(holder.get("companion_heard_stt_tap_connected")),
+        "mediaElementsMuted": bool(holder.get("companion_heard_stt_media_muted", True)),
+        "streamId": holder.get("companion_heard_stt_stream_id"),
+        "sampleRate": holder.get("companion_heard_stt_sample_rate"),
+        "chunksCaptured": int(holder.get("companion_heard_stt_chunks_captured") or 0),
+        "framesCaptured": int(holder.get("companion_heard_stt_frames_captured") or 0),
+        "bytesCaptured": int(holder.get("companion_heard_stt_bytes_captured") or 0),
+        "chunksForwarded": int(holder.get("companion_heard_stt_chunks_forwarded") or 0),
+        "framesForwarded": int(holder.get("companion_heard_stt_frames_forwarded") or 0),
+        "bytesForwarded": int(holder.get("companion_heard_stt_bytes_forwarded") or 0),
+        "chunksDropped": int(holder.get("companion_heard_stt_chunks_dropped") or 0) + int(holder.get("companion_heard_stt_transport_chunks_dropped") or 0),
+        "framesDropped": int(holder.get("companion_heard_stt_frames_dropped") or 0) + int(holder.get("companion_heard_stt_transport_frames_dropped") or 0),
+        "bytesDropped": int(holder.get("companion_heard_stt_bytes_dropped") or 0) + int(holder.get("companion_heard_stt_transport_bytes_dropped") or 0),
+        "transportChunksDropped": int(holder.get("companion_heard_stt_transport_chunks_dropped") or 0),
+        "artifactChunksSuppressed": int(holder.get("companion_heard_stt_artifact_chunks_suppressed") or 0),
+        "lastSuppressionArtifact": holder.get("companion_say_artifact"),
+        "disconnects": int(holder.get("companion_heard_stt_disconnects") or 0),
+        "reconnects": int(holder.get("companion_heard_stt_reconnects") or 0),
+        "serverCapture": holder.get("companion_heard_stt_server_capture"),
         "outputDeviceSelector": str(holder.get("companion_heard_stt_output_device") or ""),
         "inputDeviceSelector": str(holder.get("companion_heard_stt_input_device_selector") or ""),
         "inputDeviceId": holder.get("companion_heard_stt_input_device_id"),
@@ -448,144 +496,140 @@ def update_companion_heard_stt_status(status: dict[str, Any], holder: dict[str, 
         "sinkStatus": holder.get("companion_heard_stt_sink_status"),
         "sinkDeviceLabel": holder.get("companion_heard_stt_sink_device_label"),
         "lastError": holder.get("companion_heard_stt_last_error"),
-        "selfAudioExclusion": "synthetic mic is never connected to the routed browser output sink; google_meet clickArtifact rows stay suppressed",
+        "selfAudioExclusion": "only remote media-element MediaStreams are tapped; synthetic mic is not in that graph; /say and click artifact windows are dropped",
         "engineScope": "server secondary capture excludes google_meet and feeds non-Meet STT engines",
     }
     status["companionHeardStt"] = payload
     return payload
 
 
-def _device_name(value: dict[str, Any]) -> str:
-    return str(value.get("name") or value.get("label") or "")
-
-
-def _selector_tokens(selector: str) -> list[str]:
-    ignored = {"input", "output", "playback", "recording", "side", "speakers", "speaker", "microphone", "mic", "device"}
-    lowered = str(selector or "").lower()
-    tokens = re.findall(r"[a-z0-9]+", lowered)
-    return [token for token in tokens if token not in ignored and len(token) > 1]
-
-
-def select_companion_heard_capture_device(
-    devices: list[dict[str, Any]],
-    *,
-    output_selector: str,
-    input_selector: str = "",
-) -> dict[str, Any] | None:
-    capture_devices = [
-        device for device in devices
-        if device.get("supports_input") is True
-        or (
-            "supports_input" not in device
-            and str(device.get("direction") or "").lower() in {"input", "loopback", "virtual"}
-        )
-    ]
-    selector = str(input_selector or "").strip()
-    if selector:
-        lowered = selector.lower()
-        return next(
-            (
-                device for device in capture_devices
-                if str(device.get("id") or "") == selector
-                or lowered in _device_name(device).lower()
-            ),
-            None,
-        )
-    tokens = _selector_tokens(output_selector)
-    if tokens:
-        def score(device: dict[str, Any]) -> tuple[int, int]:
-            name = _device_name(device).lower()
-            matched = sum(1 for token in tokens if token in name)
-            virtual = int("virtual" in [str(cls).lower() for cls in (device.get("classes") or [])] or str(device.get("direction") or "").lower() == "virtual")
-            return (matched, virtual)
-
-        scored = [(score(device), device) for device in capture_devices]
-        scored = [item for item in scored if item[0][0] > 0]
-        if scored:
-            scored.sort(key=lambda item: item[0], reverse=True)
-            return scored[0][1]
-    virtual_inputs = [
-        device for device in capture_devices
-        if "virtual" in [str(cls).lower() for cls in (device.get("classes") or [])]
-        or str(device.get("direction") or "").lower() == "virtual"
-    ]
-    return virtual_inputs[0] if len(virtual_inputs) == 1 else None
-
-
-def ensure_companion_heard_capture(
+def forward_companion_heard_audio(
+    tab: Any,
     mailbox: Any,
     holder: dict[str, Any],
     status: dict[str, Any],
     *,
     log: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
-    if not holder.get("companion_heard_stt_enabled"):
-        return update_companion_heard_stt_status(status, holder)
-    now = time.time()
-    last_attempt = float(holder.get("companion_heard_stt_capture_last_attempt_at") or 0.0)
-    if holder.get("companion_heard_stt_capture_listening"):
-        return update_companion_heard_stt_status(status, holder)
-    if holder.get("companion_heard_stt_capture_attempted") and now - last_attempt < 30.0:
-        return update_companion_heard_stt_status(status, holder)
-    holder["companion_heard_stt_capture_attempted"] = True
-    holder["companion_heard_stt_capture_last_attempt_at"] = now
+    """Drain muted remote-stream PCM from the companion tab into secondary capture."""
+
     try:
-        payload = mailbox.list_audio_devices()
-        devices = list(payload.get("devices") or [])
-        selected = select_companion_heard_capture_device(
-            devices,
-            output_selector=str(holder.get("companion_heard_stt_output_device") or ""),
-            input_selector=str(holder.get("companion_heard_stt_input_device_selector") or ""),
+        raw = tab.evaluate(COMPANION_AUDIO_TAP_JS, await_promise=True, timeout=5)
+        tap = json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
+        if not isinstance(tap, dict):
+            raise ValueError("companion audio tap returned a non-object payload")
+    except Exception as error:  # noqa: BLE001
+        tap = {
+            "ok": False,
+            "status": "tap-error",
+            "connected": False,
+            "muted": True,
+            "chunks": [],
+            "lastError": str(error),
+        }
+
+    holder["companion_heard_stt_tap_status"] = tap.get("status")
+    holder["companion_heard_stt_tap_connected"] = bool(tap.get("connected"))
+    holder["companion_heard_stt_media_muted"] = bool(tap.get("muted"))
+    holder["companion_heard_stt_stream_id"] = tap.get("streamId")
+    holder["companion_heard_stt_sample_rate"] = tap.get("sampleRate") or holder.get("companion_heard_stt_sample_rate") or 48000
+    for source, target in (
+        ("capturedChunks", "companion_heard_stt_chunks_captured"),
+        ("capturedFrames", "companion_heard_stt_frames_captured"),
+        ("capturedBytes", "companion_heard_stt_bytes_captured"),
+        ("droppedChunks", "companion_heard_stt_chunks_dropped"),
+        ("droppedFrames", "companion_heard_stt_frames_dropped"),
+        ("droppedBytes", "companion_heard_stt_bytes_dropped"),
+        ("disconnects", "companion_heard_stt_disconnects"),
+        ("reconnects", "companion_heard_stt_reconnects"),
+    ):
+        if isinstance(tap.get(source), (int, float)):
+            current = int(tap[source])
+            raw_key = f"{target}_raw"
+            previous = int(holder.get(raw_key) or 0)
+            holder[target] = int(holder.get(target) or 0) + (current - previous if current >= previous else current)
+            holder[raw_key] = current
+
+    chunks = list(tap.get("chunks") or [])
+    click_until = float(holder.get("companion_click_artifact_until") or 0.0)
+    say_artifact_until = float(holder.get("companion_say_artifact_until") or 0.0)
+    artifact_ranges = [
+        (max(0.0, click_until - 2.5) * 1000.0, click_until * 1000.0),
+        (
+            float(holder.get("companion_say_artifact_started_at") or 0.0) * 1000.0,
+            say_artifact_until * 1000.0,
+        ),
+    ]
+    safe_chunks: list[dict[str, Any]] = []
+    suppressed_chunks = 0
+    suppressed_frames = 0
+    suppressed_bytes = 0
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        captured_at = float(chunk.get("capturedAt") or 0.0)
+        is_artifact = captured_at > 0 and any(
+            end > 0 and start <= captured_at <= end
+            for start, end in artifact_ranges
         )
-        if not selected:
-            raise RuntimeError(
-                "no virtual/loopback capture input matched the companion output device; install a virtual audio cable "
-                "or pass --companion-heard-stt-input-device with the cable recording-side device id/name"
-            )
-        capture = mailbox.start_secondary_capture(str(selected.get("id") or ""))
-        holder["companion_heard_stt_input_device_id"] = capture.get("device_id") or selected.get("id")
-        holder["companion_heard_stt_input_device_name"] = capture.get("device_name") or selected.get("name")
+        if is_artifact or not tap.get("muted", True):
+            suppressed_chunks += 1
+            suppressed_frames += int(chunk.get("frames") or 0)
+            suppressed_bytes += int(chunk.get("bytes") or 0)
+        else:
+            safe_chunks.append(chunk)
+    holder["companion_heard_stt_artifact_chunks_suppressed"] = (
+        int(holder.get("companion_heard_stt_artifact_chunks_suppressed") or 0) + suppressed_chunks
+    )
+
+    request = {
+        "stream_id": str(tap.get("streamId") or "companion-remote-media"),
+        "sample_rate": int(holder["companion_heard_stt_sample_rate"]),
+        "channels": 1,
+        "connected": bool(tap.get("connected")),
+        "muted": bool(tap.get("muted", True)),
+        "chunks": safe_chunks,
+        "suppressed_artifact_chunks": suppressed_chunks,
+        "suppressed_artifact_frames": suppressed_frames,
+        "suppressed_artifact_bytes": suppressed_bytes,
+        "suppression_artifact": (
+            dict(holder.get("companion_say_artifact") or {})
+            if suppressed_chunks and holder.get("companion_say_artifact")
+            else None
+        ),
+    }
+    try:
+        capture = mailbox.ingest_companion_browser_audio(request)
+        holder["companion_heard_stt_server_capture"] = capture
         holder["companion_heard_stt_capture_listening"] = bool(capture.get("listening"))
         holder["companion_heard_stt_capture_live"] = bool(capture.get("live_capture"))
-        holder["companion_heard_stt_last_error"] = capture.get("error")
-        if capture.get("error"):
-            raise RuntimeError(str(capture.get("error")))
-        if log:
-            log(f"[companion-audio] secondary STT capture started on {holder['companion_heard_stt_input_device_name']}", role="companion")
+        holder["companion_heard_stt_chunks_forwarded"] = int(capture.get("chunks_forwarded") or 0)
+        holder["companion_heard_stt_frames_forwarded"] = int(capture.get("frames_forwarded") or 0)
+        holder["companion_heard_stt_bytes_forwarded"] = int(capture.get("bytes_forwarded") or 0)
+        holder["companion_heard_stt_last_error"] = capture.get("error") or tap.get("lastError")
     except Exception as error:  # noqa: BLE001
+        holder["companion_heard_stt_capture_live"] = False
         holder["companion_heard_stt_last_error"] = str(error)
-        if log:
-            log(f"[companion-audio] secondary STT capture unavailable: {error}", err=True, role="companion")
-    return update_companion_heard_stt_status(status, holder)
-
-
-def route_companion_audio_output(
-    tab: Any,
-    device_selector: str,
-    holder: dict[str, Any],
-    status: dict[str, Any],
-    *,
-    log: Callable[..., None] | None = None,
-) -> dict[str, Any]:
-    try:
-        raw = tab.evaluate(
-            ROUTE_COMPANION_AUDIO_OUTPUT_JS % json.dumps(str(device_selector or "").lower()),
-            await_promise=True,
-            timeout=5,
+        holder["companion_heard_stt_transport_chunks_dropped"] = (
+            int(holder.get("companion_heard_stt_transport_chunks_dropped") or 0) + len(safe_chunks)
         )
-        payload = json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
-    except Exception as error:  # noqa: BLE001
-        payload = {"ok": False, "status": "routing-error", "lastError": str(error)}
-    holder["companion_heard_stt_sink_status"] = payload.get("status")
-    holder["companion_heard_stt_sink_device_label"] = payload.get("deviceLabel")
-    if payload.get("ok"):
-        holder["companion_heard_stt_last_error"] = None
-    elif payload.get("lastError"):
-        holder["companion_heard_stt_last_error"] = payload.get("lastError")
+        holder["companion_heard_stt_transport_frames_dropped"] = (
+            int(holder.get("companion_heard_stt_transport_frames_dropped") or 0)
+            + sum(int(chunk.get("frames") or 0) for chunk in safe_chunks)
+        )
+        holder["companion_heard_stt_transport_bytes_dropped"] = (
+            int(holder.get("companion_heard_stt_transport_bytes_dropped") or 0)
+            + sum(int(chunk.get("bytes") or 0) for chunk in safe_chunks)
+        )
         if log:
-            _log_companion_click(log, "companion-audio-route", f"[companion-audio] output routing unavailable: {payload.get('lastError')}", err=True, interval=30.0)
-    update_companion_heard_stt_status(status, holder)
-    return payload
+            _log_companion_click(
+                log,
+                "companion-audio-forward",
+                f"[companion-audio] muted remote-stream forwarding unavailable: {error}",
+                err=True,
+                interval=30.0,
+            )
+    return update_companion_heard_stt_status(status, holder)
 
 
 def apply_companion_click_state(
@@ -600,9 +644,11 @@ def apply_companion_click_state(
     interval_ms = max(1, int(round(interval_seconds * 1000)))
     duration_seconds = max(0.001, float(holder.get("companion_click_ms") or 100.0) / 1000.0)
     gain = max(0.0, min(1.0, float(holder.get("companion_click_gain") or 0.12)))
-    fixed_interval = str(holder.get("companion_click_mode") or "reactive") == "fixed"
-    sound = str(holder.get("companion_click_sound") or "uh").lower()
-    if sound not in {"uh", "click"}:
+    # Fixed and reactive interjects are both scheduled by the Python arbiter so
+    # they share one serialized outbound track with virtual-agent speech.
+    fixed_interval = False
+    sound = str(holder.get("companion_click_phrase") or holder.get("companion_click_sound") or "uh").lower()
+    if sound not in {"uh", "uhuh", "hmm", "click"}:
         sound = "uh"
     f0 = max(1.0, float(holder.get("companion_click_f0_hz") or 125.0))
     f1 = max(1.0, float(holder.get("companion_click_f1_hz") or 600.0))
@@ -671,6 +717,7 @@ def trigger_companion_click(
     trigger_reason: str | None = None,
     silence_ms: float | None = None,
     monologue_seconds: float | None = None,
+    phrase: str | None = None,
     log: Callable[..., None] | None = None,
 ) -> bool:
     try:
@@ -691,6 +738,17 @@ def trigger_companion_click(
         if isinstance(payload.get("clickCount"), (int, float)):
             holder["companion_click_js_click_count"] = int(payload.get("clickCount"))
         holder["companion_click_last_trigger"] = trigger_reason
+        holder["companion_click_last_trigger_reason"] = trigger_reason
+        holder["companion_click_last_trigger_mode"] = (
+            "interval" if holder.get("companion_click_mode") == "fixed" else "on_silence"
+        )
+        holder["companion_click_last_trigger_at"] = now
+        holder["companion_click_last_trigger_iso"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%S", time.localtime(now)
+        )
+        holder["companion_click_last_phrase"] = str(
+            phrase or holder.get("companion_click_phrase") or holder.get("companion_click_sound") or "uh"
+        )
         holder["companion_click_last_silence_ms"] = silence_ms
         holder["companion_click_last_monologue_seconds"] = monologue_seconds
         holder["companion_click_artifact_until"] = time.time() + 2.5
@@ -765,14 +823,6 @@ def companion_click_trigger_decision(
             "silenceMs": caption_silence_ms,
             "monologueSeconds": monologue_seconds,
         }
-    if max_wait > 0 and monologue_seconds >= max_wait:
-        return {
-            "due": True,
-            "trigger": "max-wait",
-            "rowKey": row_key,
-            "silenceMs": caption_silence_ms,
-            "monologueSeconds": monologue_seconds,
-        }
     trigger_source = str(holder.get("companion_click_trigger") or "caption").lower()
     if trigger_source not in {"caption", "audio", "both"}:
         trigger_source = "caption"
@@ -802,15 +852,128 @@ def companion_click_trigger_decision(
         due = caption_quiet and audio_quiet
         trigger = "caption-stasis+audio-rms"
         chosen_silence_ms = min(caption_silence_ms, audio_quiet_ms)
+    if max_wait > 0 and monologue_seconds >= max_wait:
+        due = True
+        trigger = "max-wait"
+        chosen_silence_ms = caption_silence_ms
+    event_key = f"{row_key}:{float(last_growth_at):.6f}"
+    if due and holder.get("companion_click_fired_silence_event") == event_key:
+        due = False
+        trigger = "continuous-silence-debounced"
+    elif not due and trigger_source in {"audio", "both"} and not audio_quiet:
+        holder.pop("companion_click_fired_silence_event", None)
     return {
         "due": due,
-        "trigger": trigger if due else "waiting-for-silence",
+        "trigger": trigger if due or trigger == "continuous-silence-debounced" else "waiting-for-silence",
+        "eventKey": event_key,
         "rowKey": row_key,
         "silenceMs": chosen_silence_ms,
         "captionSilenceMs": caption_silence_ms,
         "audioSilenceMs": audio_quiet_ms,
         "monologueSeconds": monologue_seconds,
     }
+
+
+def companion_interjection_decision(
+    holder: dict[str, Any],
+    *,
+    now: float | None = None,
+    audio_probe: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return one scheduler decision for either supported operator mode."""
+
+    at = time.monotonic() if now is None else now
+    mode = str(holder.get("companion_click_mode") or "reactive").lower()
+    if mode == "fixed":
+        interval = max(0.1, float(holder.get("companion_click_interval_seconds") or 2.0))
+        anchor = holder.get("companion_click_last_trigger_monotonic")
+        minimum_gap = max(0.1, float(holder.get("companion_click_min_gap_seconds") or 6.0))
+        wait_seconds = max(interval, minimum_gap) if isinstance(anchor, (int, float)) else interval
+        if not isinstance(anchor, (int, float)):
+            anchor = holder.get("companion_click_schedule_started_monotonic")
+        if not isinstance(anchor, (int, float)):
+            holder["companion_click_schedule_started_monotonic"] = at
+            anchor = at
+        elapsed = max(0.0, at - float(anchor))
+        return {
+            "due": elapsed >= wait_seconds,
+            "trigger": "interval-elapsed" if elapsed >= wait_seconds else "interval-wait",
+            "mode": "interval",
+            "rowKey": holder.get("host_active_caption_key"),
+            "silenceMs": None,
+            "monologueSeconds": None,
+            "elapsedSeconds": elapsed,
+            "waitSeconds": wait_seconds,
+        }
+    decision = companion_click_trigger_decision(holder, now=at, audio_probe=audio_probe)
+    decision["mode"] = "on_silence"
+    return decision
+
+
+def mark_companion_interjection_queued(
+    holder: dict[str, Any],
+    decision: dict[str, Any],
+    *,
+    now: float | None = None,
+) -> None:
+    at = time.monotonic() if now is None else now
+    holder["companion_click_last_trigger_monotonic"] = at
+    if decision.get("mode") == "on_silence" and decision.get("eventKey"):
+        holder["companion_click_fired_silence_event"] = decision["eventKey"]
+
+
+def queue_companion_interjection(
+    holder: dict[str, Any],
+    companion_audio: Any,
+    decision: dict[str, Any],
+    *,
+    meeting_url: str | None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Apply readiness/serialization gates and enqueue at most one backchannel."""
+
+    at = time.monotonic() if now is None else now
+    outbound = companion_audio.status()
+    holder["companion_click_companion_ready"] = bool(outbound.get("companionReady"))
+    holder["companion_click_queue"] = {
+        "queued": int(outbound.get("queued") or 0),
+        "speaking": bool(outbound.get("speaking")),
+        "currentKind": (outbound.get("current") or {}).get("kind"),
+    }
+    holder["companion_click_current_silence_ms"] = decision.get("silenceMs")
+    if not decision.get("due"):
+        reason = str(decision.get("reason") or decision.get("trigger") or "waiting")
+        holder["companion_click_eligibility"] = reason
+        return {"accepted": False, "reason": reason}
+    if not outbound.get("companionReady"):
+        reason = "companion-not-ready"
+    elif outbound.get("speaking") or outbound.get("queued"):
+        reason = (
+            "agent-speech-active"
+            if (outbound.get("current") or {}).get("kind") == "speech"
+            else "output-queue-busy"
+        )
+    else:
+        phrase = str(holder.get("companion_click_phrase") or "uh")
+        result = companion_audio.submit(
+            kind="interject",
+            meeting_url=meeting_url,
+            source="companion-interjector",
+            metadata={"decision": decision, "phrase": phrase},
+        )
+        if result.get("accepted"):
+            mark_companion_interjection_queued(holder, decision, now=at)
+            holder["companion_click_last_suppression_key"] = None
+            holder["companion_click_eligibility"] = "queued"
+            return result
+        reason = str(result.get("reason") or "queue-rejected")
+
+    suppression_key = f"{reason}:{decision.get('eventKey') or decision.get('trigger')}"
+    if holder.get("companion_click_last_suppression_key") != suppression_key:
+        holder["companion_click_suppressed"] = int(holder.get("companion_click_suppressed") or 0) + 1
+        holder["companion_click_last_suppression_key"] = suppression_key
+    holder["companion_click_eligibility"] = reason
+    return {"accepted": False, "reason": reason}
 
 
 def active_caption_row_key(payload: dict[str, Any]) -> str | None:
@@ -1643,9 +1806,25 @@ def wait_for_sso_preflight(
     browser_process: subprocess.Popen[Any] | None,
 ) -> list[dict[str, Any]]:
     probe_slots = sorted({0, 1, *required_authusers})
+    consent_operation_id = f"sso-preflight:{uuid.uuid4().hex}"
     last_summary: tuple[int, tuple[int, ...]] | None = None
     while True:
-        accounts = scan_signed_in_sso_accounts(cdp_endpoint, authusers=probe_slots)
+        try:
+            accounts = scan_signed_in_sso_accounts(
+                cdp_endpoint,
+                authusers=probe_slots,
+                reason="sso-preflight",
+                detail=(
+                    "Meet bridge startup is verifying the assigned Google authuser slots "
+                    f"before joining; required slots={sorted(required_authusers)}"
+                ),
+                role="probe",
+                component="meet_bridge",
+                sso_satisfied=False,
+                consent_operation_id=consent_operation_id,
+            )
+        except navigator.NavigationBlockedError as error:
+            raise SystemExit(f"SSO preflight stopped before probing: {error}") from error
         signed_slots = tuple(sorted(int(account["authuser"]) for account in accounts))
         summary = (len({str(account.get("email") or "").lower() for account in accounts}), signed_slots)
         if summary != last_summary:
@@ -1698,9 +1877,9 @@ def main() -> None:
     parser.add_argument("--new", action="store_true", help="CREATE a new instant meeting (meet.google.com/new) for the signed-in account, join it, and post its link to the mailbox")
     parser.add_argument("--attach-only", action="store_true", help="Never pop a browser: only attach to an existing meet tab on --cdp")
     parser.add_argument("--companion", action="store_true", help="ALSO keep a second signed-in account in the Chrome profile sitting MUTED in the meeting so Google sees 2 participants and won't end/nag the servant meeting.")
-    parser.add_argument("--companion-listen-device", default="", help="When set, leave companion incoming audio audible so the operator can route that browser's output to a virtual cable for secondary STT capture.")
-    parser.add_argument("--companion-heard-stt", action="store_true", help="Opt in to routing companion-heard meeting audio through a virtual audio cable into server-side non-Meet STT engines.")
-    parser.add_argument("--companion-heard-stt-input-device", default=os.environ.get("WS_COLLAB_COMPANION_HEARD_STT_INPUT_DEVICE", ""), help="Optional ws_collab input device id/name for the virtual cable recording side; auto-detected from --companion-listen-device when omitted.")
+    parser.add_argument("--companion-listen-device", default="", help="Deprecated compatibility option; companion playback remains muted. Use --companion-heard-stt for direct remote-MediaStream capture.")
+    parser.add_argument("--companion-heard-stt", action="store_true", help="Opt in to tapping the muted companion's remote MediaStream into server-side Whisper and other non-Meet STT engines.")
+    parser.add_argument("--companion-heard-stt-input-device", default=os.environ.get("WS_COLLAB_COMPANION_HEARD_STT_INPUT_DEVICE", ""), help="Deprecated compatibility option; direct browser MediaStream capture does not require a virtual audio device.")
     parser.add_argument("--companion-click", action="store_true", help="Opt in to companion synthetic-mic boundary sounds; keeps the companion unmuted while enabled.")
     parser.add_argument("--companion-click-mode", choices=["reactive", "fixed"], default="reactive", help="Companion click scheduling: reactive breaks long host caption rows; fixed clicks every --companion-click-interval seconds (default %(default)s)")
     parser.add_argument("--companion-click-trigger", choices=["caption", "audio", "both"], default="caption", help="Reactive pause detector: caption stasis, incoming audio RMS, or both (default %(default)s)")
@@ -1712,7 +1891,8 @@ def main() -> None:
     parser.add_argument("--companion-click-audio-rms-threshold", type=companion_click_nonnegative_float, default=0.015, help="Incoming audio RMS threshold for --companion-click-trigger=audio|both (default %(default)s)")
     parser.add_argument("--companion-click-ms", type=companion_click_ms, default=100.0, help="Companion click burst duration in milliseconds (default %(default)s)")
     parser.add_argument("--companion-click-gain", type=companion_click_gain, default=0.12, help="Companion click WebAudio gain in (0,1]; tune empirically for Meet VAD (default %(default)s)")
-    parser.add_argument("--companion-click-sound", choices=["uh", "click"], default="uh", help="Companion boundary sound: truncated schwa onset ('uh') or non-speech click fallback (default %(default)s)")
+    parser.add_argument("--companion-click-sound", choices=["uh", "click"], default="uh", help="Legacy companion boundary sound compatibility option (default %(default)s)")
+    parser.add_argument("--companion-click-phrase", choices=["uh", "uhuh", "hmm"], default=None, help="Companion backchannel phrase; defaults to the legacy --companion-click-sound value")
     parser.add_argument("--companion-click-f0", type=companion_click_positive_float, default=125.0, help="'uh' fundamental frequency in Hz (default %(default)s)")
     parser.add_argument("--companion-click-f1", type=companion_click_positive_float, default=600.0, help="'uh' first formant bandpass center in Hz (default %(default)s)")
     parser.add_argument("--companion-click-f2", type=companion_click_positive_float, default=1300.0, help="'uh' second formant bandpass center in Hz (default %(default)s)")
@@ -1739,16 +1919,30 @@ def main() -> None:
     parser.add_argument("--ignore-speaker", action="append", default=[], help="Speaker name(s) to skip (repeatable)")
     parser.add_argument("--list-audio-devices", action="store_true", help="List Windows audio devices (index, name, in/out channels) and exit -- use this to find a virtual cable's exact name")
     parser.add_argument("--tts-output-device", default=os.environ.get("MEET_BRIDGE_TTS_OUTPUT_DEVICE"), help="Name (substring) of a real playback device to route /say speech to, e.g. a virtual cable's 'Input' side -- omit to keep using the in-page WebAudio synthetic mic (env MEET_BRIDGE_TTS_OUTPUT_DEVICE)")
+    parser.add_argument("--companion-audio-queue-max", type=int, default=int(os.environ.get("WS_COLLAB_COMPANION_AUDIO_QUEUE_MAX", "8")), help="Maximum pending companion speech/interject audio items (default %(default)s)")
     parser.add_argument("--mic-select-device", default=os.environ.get("MEET_BRIDGE_MIC_SELECT_DEVICE"), help="Name (substring) of the device Meet's own Audio Settings mic dropdown should select, e.g. a virtual cable's 'Output' side -- omit to leave Meet's mic selection alone (env MEET_BRIDGE_MIC_SELECT_DEVICE)")
     args = parser.parse_args()
     args.role_authusers = parse_role_authusers(args.role_authuser)
     args.role_emails = parse_role_emails(args.role_email)
+    mailbox = MailboxClient(args.mailbox_base)
+    nav_poster = BrowserNavIntentPoster(mailbox)
+    nav_instance_port = urlsplit(args.cdp).port if args.attach_only else args.port
+    settings_dir = Path(os.environ.get("WS_COLLAB_STATE_DIR") or DEFAULT_PROFILE.parent).expanduser()
+    navigator.set_consent_required_provider(
+        lambda: read_sso_consent_setting(settings_dir)
+    )
+    configure_browser_nav_logging(
+        nav_poster.submit,
+        instance=f"meet-bridge:{os.getpid()}:{nav_instance_port or args.port}",
+        component="meet_bridge",
+        role="host",
+        cdp_endpoint=args.cdp if args.attach_only else f"http://127.0.0.1:{args.port}",
+        chrome_profile=Path(args.profile).expanduser(),
+    )
     if args.companion_click and not args.companion:
         raise SystemExit("--companion-click requires --companion")
     if args.companion_heard_stt and not args.companion:
         raise SystemExit("--companion-heard-stt requires --companion")
-    if args.companion_heard_stt and not args.companion_listen_device:
-        raise SystemExit("--companion-heard-stt requires --companion-listen-device <virtual cable playback device>")
 
     def role_authuser(role: str) -> int | None:
         wanted = str(role or "").strip().lower()
@@ -1881,11 +2075,23 @@ def main() -> None:
     # Browser setup is account-centric. Meet automation is not initialized
     # until two distinct Google sessions are live in this one profile.
     cdp_endpoint = args.cdp
-    args.launch_url = SSO_SETUP_URL
+    # A normal startup opens the requested Meet surface. AccountChooser is only
+    # opened by an explicit setup/add-account action.
+    args.launch_url = args.meet or "https://meet.google.com/new"
     if not args.attach_only:
         cdp_endpoint, host_process = launch_browser(args)
     else:
         host_process = None
+        try:
+            browser_profile_root(
+                cdp_endpoint,
+                reason="profile-probe",
+                detail=f"attach-only bridge is resolving the live Chrome profile on {cdp_endpoint}",
+                role="probe",
+                component="meet_bridge",
+            )
+        except Exception:
+            pass
 
     if args.list_tabs:
         for tab_entry in list_tabs(cdp_endpoint):
@@ -1904,7 +2110,6 @@ def main() -> None:
         browser_process=host_process,
     )
 
-    mailbox = MailboxClient(args.mailbox_base)
     recipients = args.to or list(DEFAULT_RECIPIENTS)
     ignore = {name.strip().lower() for name in args.ignore_speaker}
 
@@ -1921,6 +2126,11 @@ def main() -> None:
             cdp_endpoint,
             str(tab_info.get("url") or ""),
             existing_in_scope=tab_info,
+            reason="reattach-lost-tab",
+            detail="attach-only mode found an existing host Meet tab and is bringing it to the foreground",
+            role="host",
+            component="meet_bridge",
+            intended_identity=role_email("host"),
         )
     else:
         wanted_url = args.meet or "https://meet.google.com/new"
@@ -1941,6 +2151,14 @@ def main() -> None:
             role_target_url(wanted_url, "host"),
             existing_in_scope=reusable_tab,
             navigate_existing=navigate_existing,
+            reason="new-meeting" if args.new or not args.meet else "join-meeting",
+            detail=(
+                f"host connector for {role_email('host')} "
+                + ("is creating a fresh Meet room" if args.new or not args.meet else f"is joining {args.meet}")
+            ),
+            role="host",
+            component="meet_bridge",
+            intended_identity=role_email("host"),
         )
         if tab_info is None:
             raise SystemExit("Could not open or reuse the host Meet connector tab.")
@@ -1975,6 +2193,7 @@ def main() -> None:
         "sso_satisfied_at": None,
         "sso_resolved_accounts": {},
         "sso_rescan_permitted": False,
+        "sso_consent_operation_id": f"bridge-account-scan:{uuid.uuid4().hex}",
         "companion_click_enabled": bool(args.companion_click),
         "companion_click_interval_seconds": float(args.companion_click_interval),
         "companion_click_mode": str(args.companion_click_mode),
@@ -1987,6 +2206,7 @@ def main() -> None:
         "companion_click_ms": float(args.companion_click_ms),
         "companion_click_gain": float(args.companion_click_gain),
         "companion_click_sound": str(args.companion_click_sound),
+        "companion_click_phrase": str(args.companion_click_phrase or args.companion_click_sound),
         "companion_click_f0_hz": float(args.companion_click_f0),
         "companion_click_f1_hz": float(args.companion_click_f1),
         "companion_click_f2_hz": float(args.companion_click_f2),
@@ -1997,12 +2217,25 @@ def main() -> None:
         "companion_click_last_install_at": None,
         "companion_click_last_error": None,
         "companion_clicks_sent": 0,
+        "companion_click_suppressed": 0,
         "companion_click_row_breaks_observed": 0,
         "companion_click_pending_breaks": [],
         "companion_click_artifact_until": 0.0,
         "companion_click_last_trigger": None,
+        "companion_click_last_trigger_mode": None,
+        "companion_click_last_trigger_reason": None,
+        "companion_click_last_trigger_at": None,
+        "companion_click_last_trigger_iso": None,
+        "companion_click_last_phrase": None,
+        "companion_click_current_silence_ms": None,
+        "companion_click_eligibility": "disabled" if not args.companion_click else "waiting-for-companion",
+        "companion_click_companion_ready": False,
+        "companion_click_queue": {"queued": 0, "speaking": False, "currentKind": None},
+        "companion_click_schedule_started_monotonic": time.monotonic(),
         "companion_click_last_silence_ms": None,
         "companion_click_last_monologue_seconds": None,
+        "companion_state": "not-attached",
+        "companion_mic_ready": False,
         "companion_heard_stt_enabled": bool(args.companion_heard_stt),
         "companion_heard_stt_output_device": str(args.companion_listen_device or ""),
         "companion_heard_stt_input_device_selector": str(args.companion_heard_stt_input_device or ""),
@@ -2015,6 +2248,29 @@ def main() -> None:
         "companion_heard_stt_sink_status": None,
         "companion_heard_stt_sink_device_label": None,
         "companion_heard_stt_last_error": None,
+        "companion_heard_stt_tap_status": "disabled",
+        "companion_heard_stt_tap_connected": False,
+        "companion_heard_stt_media_muted": True,
+        "companion_heard_stt_stream_id": None,
+        "companion_heard_stt_sample_rate": None,
+        "companion_heard_stt_chunks_captured": 0,
+        "companion_heard_stt_frames_captured": 0,
+        "companion_heard_stt_bytes_captured": 0,
+        "companion_heard_stt_chunks_forwarded": 0,
+        "companion_heard_stt_frames_forwarded": 0,
+        "companion_heard_stt_bytes_forwarded": 0,
+        "companion_heard_stt_chunks_dropped": 0,
+        "companion_heard_stt_frames_dropped": 0,
+        "companion_heard_stt_bytes_dropped": 0,
+        "companion_heard_stt_transport_chunks_dropped": 0,
+        "companion_heard_stt_transport_frames_dropped": 0,
+        "companion_heard_stt_transport_bytes_dropped": 0,
+        "companion_heard_stt_artifact_chunks_suppressed": 0,
+        "companion_heard_stt_disconnects": 0,
+        "companion_heard_stt_reconnects": 0,
+        "companion_heard_stt_server_capture": None,
+        "companion_say_artifact_started_at": 0.0,
+        "companion_say_artifact_until": 0.0,
     }
     update_sso_satisfaction(
         holder,
@@ -2031,6 +2287,38 @@ def main() -> None:
                 mailbox.send(recipient, text_line, sender="meet-bridge", metadata=metadata or {"source": "google-meet-bridge"})
             except Exception as error:  # noqa: BLE001
                 print(f"[mailbox] announce failed: {error}", file=sys.stderr, flush=True)
+
+    def nav_tab_id(role: str) -> str:
+        value = holder.get("tab_id") if role == "host" else holder.get(f"{role}_tab_id")
+        return str(value or "")
+
+    def logged_location_href(tab: CdpTab, target_url: str, *, role: str, reason: str, detail: str) -> None:
+        navigator.evaluate_location_href(
+            tab,
+            target_url,
+            cdp_endpoint=cdp_endpoint,
+            reason=reason,
+            detail=detail,
+            role=role,
+            component="meet_bridge",
+            tab_id=nav_tab_id(role),
+            intended_identity=role_email(role),
+            effective_identity=str((holder.get(f"{role}_account") or {}).get("email") or "") or None,
+        )
+
+    def logged_location_reload(tab: CdpTab, target_url: str, *, role: str, reason: str, detail: str) -> None:
+        navigator.evaluate_location_reload(
+            tab,
+            target_url,
+            cdp_endpoint=cdp_endpoint,
+            reason=reason,
+            detail=detail,
+            role=role,
+            component="meet_bridge",
+            tab_id=nav_tab_id(role),
+            intended_identity=role_email(role),
+            effective_identity=str((holder.get(f"{role}_account") or {}).get("email") or "") or None,
+        )
 
     if created_servant and "meet.google.com" in meeting_url and "/new" not in meeting_url:
         print(f"[bridge] servant meeting created: {meeting_url}", flush=True)
@@ -2050,14 +2338,27 @@ def main() -> None:
 
     def scan_sso_accounts_now(*, allow_scan: bool = False) -> list[dict[str, Any]]:
         nonlocal signed_sso_accounts
-        accounts = scan_sso_accounts_if_permitted(
-            holder,
-            lambda: scan_signed_in_sso_accounts(cdp_endpoint, authusers=sso_probe_authusers(args.role_authusers)),
-            allow_scan=allow_scan,
-            role_authusers=args.role_authusers,
-            role_emails=args.role_emails,
-            required_roles=required_roles,
-        )
+        try:
+            accounts = scan_sso_accounts_if_permitted(
+                holder,
+                lambda: scan_signed_in_sso_accounts(
+                    cdp_endpoint,
+                    authusers=sso_probe_authusers(args.role_authusers),
+                    reason="account-scan",
+                    detail="Meet bridge is refreshing cached SSO account identities after a tab/account change",
+                    role="probe",
+                    component="meet_bridge",
+                    sso_satisfied=bool(holder.get("sso_satisfied")),
+                    consent_operation_id=str(holder["sso_consent_operation_id"]),
+                ),
+                allow_scan=allow_scan,
+                role_authusers=args.role_authusers,
+                role_emails=args.role_emails,
+                required_roles=required_roles,
+            )
+        except navigator.NavigationBlockedError as error:
+            log(f"[bridge] account scan stopped before probing: {error}", role="probe")
+            return list(holder.get("sso_accounts") or [])
         signed_sso_accounts = list(accounts)
         return accounts
 
@@ -2176,7 +2477,7 @@ def main() -> None:
         if setter is not None:
             setter(lambda text, role=role: log(f"[cdp] {text}", err=True, role=role))
 
-    click_settings_dir = Path(os.environ.get("WS_COLLAB_STATE_DIR") or DEFAULT_PROFILE.parent).expanduser()
+    click_settings_dir = settings_dir
     click_profile = Path(args.profile).expanduser()
 
     def _normalize_click_setting(raw: Any, default: dict[str, Any]) -> dict[str, Any]:
@@ -2212,7 +2513,11 @@ def main() -> None:
                 value = float(default.get(name, fallback))
             return value if value >= 0 else float(default.get(name, fallback))
 
-        mode = str(row.get("mode") or default.get("mode") or "reactive").lower()
+        mode = str(
+            row.get("mode") or row.get("triggerMode") or row.get("trigger_mode")
+            or default.get("mode") or "reactive"
+        ).lower().replace("-", "_")
+        mode = {"on_silence": "reactive", "interval": "fixed"}.get(mode, mode)
         if mode not in {"reactive", "fixed"}:
             mode = "reactive"
         trigger = str(row.get("trigger") or default.get("trigger") or "caption").lower()
@@ -2221,6 +2526,9 @@ def main() -> None:
         sound = str(row.get("sound") or default.get("sound") or "uh").lower()
         if sound not in {"uh", "click"}:
             sound = "uh"
+        phrase = str(row.get("phrase") or row.get("sound") or default.get("phrase") or sound).lower()
+        if phrase not in {"uh", "uhuh", "hmm", "click"}:
+            phrase = "uh"
         return {
             "enabled": enabled,
             "intervalSeconds": positive("intervalSeconds", 2.0),
@@ -2234,6 +2542,7 @@ def main() -> None:
             "clickMs": positive("clickMs", 100.0),
             "gain": min(1.0, positive("gain", 0.12)),
             "sound": sound,
+            "phrase": phrase,
             "f0Hz": positive("f0Hz", 125.0),
             "f1Hz": positive("f1Hz", 600.0),
             "f2Hz": positive("f2Hz", 1300.0),
@@ -2254,6 +2563,7 @@ def main() -> None:
             "clickMs": float(args.companion_click_ms),
             "gain": float(args.companion_click_gain),
             "sound": str(args.companion_click_sound),
+            "phrase": str(args.companion_click_phrase or args.companion_click_sound),
             "f0Hz": float(args.companion_click_f0),
             "f1Hz": float(args.companion_click_f1),
             "f2Hz": float(args.companion_click_f2),
@@ -2310,6 +2620,7 @@ def main() -> None:
             float(setting.get("clickMs") or 100.0),
             float(setting.get("gain") or 0.12),
             str(setting.get("sound") or "uh"),
+            str(setting.get("phrase") or setting.get("sound") or "uh"),
             float(setting.get("f0Hz") or 125.0),
             float(setting.get("f1Hz") or 600.0),
             float(setting.get("f2Hz") or 1300.0),
@@ -2329,11 +2640,15 @@ def main() -> None:
         holder["companion_click_ms"] = float(setting.get("clickMs") or 100.0)
         holder["companion_click_gain"] = float(setting.get("gain") or 0.12)
         holder["companion_click_sound"] = str(setting.get("sound") or "uh")
+        holder["companion_click_phrase"] = str(setting.get("phrase") or setting.get("sound") or "uh")
         holder["companion_click_f0_hz"] = float(setting.get("f0Hz") or 125.0)
         holder["companion_click_f1_hz"] = float(setting.get("f1Hz") or 600.0)
         holder["companion_click_f2_hz"] = float(setting.get("f2Hz") or 1300.0)
         holder["companion_click_meeting_url"] = setting.get("meetingUrl")
         holder["companion_click_source"] = setting.get("source")
+        if changed:
+            holder["companion_click_schedule_started_monotonic"] = time.monotonic()
+            holder.pop("companion_click_fired_silence_event", None)
         holder["companion_click_signature"] = signature
         update_companion_click_status(status, holder)
         if changed:
@@ -2410,6 +2725,7 @@ def main() -> None:
                 "speak": speak,
                 "companionClick": update_companion_click_status(status, holder),
                 "companionHeardStt": update_companion_heard_stt_status(status, holder),
+                "companionAudio": companion_audio.status(),
                 # Set by companion_loop() when it attaches the companion tab.
                 "profile": holder.get("companion_profile"),
                 "account": companion_account or {"label": "unknown -- no live window to check", "signedIn": False, "email": None},
@@ -2452,6 +2768,51 @@ def main() -> None:
             "hostProfile": _host_profile_info(),
             "clients": _controlled_clients(),
         }
+
+    def _companion_audio_readiness(target_url: str | None) -> dict[str, Any]:
+        active = meeting_key(holder.get("url"))
+        requested = meeting_key(target_url) if target_url else active
+        tab_id = holder.get("companion_tab_id")
+        ready = bool(
+            args.companion
+            and holder.get("companion_tab") is not None
+            and tab_id
+            and holder.get("companion_state") == "in-call"
+            and holder.get("companion_mic_ready")
+            and active
+            and requested == active
+        )
+        error = None
+        if not args.companion:
+            error = "bridge was not started with a companion"
+        elif requested != active:
+            error = f"requested meeting {requested or 'none'} is not active ({active or 'none'})"
+        elif holder.get("companion_tab") is None or not tab_id:
+            error = "companion tab is not attached"
+        elif holder.get("companion_state") != "in-call":
+            error = f"companion is not in-call ({holder.get('companion_state') or 'unknown'})"
+        elif not holder.get("companion_mic_ready"):
+            error = "companion synthetic microphone is not ready"
+        return {
+            "ready": ready,
+            "meetingUrl": active,
+            "tabId": tab_id,
+            "state": holder.get("companion_state"),
+            "syntheticMicReady": bool(holder.get("companion_mic_ready")),
+            "error": error,
+        }
+
+    def _cancel_companion_audio(_reason: str) -> None:
+        tab = holder.get("companion_tab")
+        if tab is not None:
+            tab.evaluate(CANCEL_COMPANION_AUDIO_JS, timeout=3)
+
+    companion_audio = CompanionAudioArbiter(
+        _companion_audio_readiness,
+        lambda item, cancel_event: _play_companion_audio(item, cancel_event),
+        _cancel_companion_audio,
+        max_pending=args.companion_audio_queue_max,
+    )
 
     def _health_server() -> None:
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2522,6 +2883,7 @@ def main() -> None:
                         "pushFrameCount": push_frame_count, "captionTransportByRole": caption_transport_by_role,
                         "companionClick": companion_click,
                         "companionHeardStt": companion_heard_stt,
+                        "companionAudio": companion_audio.status(),
                     }).encode("utf-8")
                 else:
                     with debug_lock:
@@ -2531,6 +2893,7 @@ def main() -> None:
                     status["hostProfile"] = host_profile
                     update_companion_click_status(status, holder)
                     update_companion_heard_stt_status(status, holder)
+                    status["companionAudio"] = companion_audio.status()
                     with captions_lock:
                         _refresh_caption_transport_state(
                             status,
@@ -2570,7 +2933,8 @@ def main() -> None:
                 # -- lets a UI (the ws_collab admin's Google Meet page) drive
                 # the bridge directly over HTTP.
                 parsed = urlparse(self.path)
-                if parsed.path.rstrip("/") != "/command":
+                route = parsed.path.rstrip("/")
+                if route not in {"/command", "/speech", "/speech/cancel", "/speech/status"}:
                     self.send_response(404)
                     self.send_header("access-control-allow-origin", "*")
                     self.send_header("content-length", "0")
@@ -2580,11 +2944,51 @@ def main() -> None:
                     length = int(self.headers.get("content-length") or 0)
                     raw = self.rfile.read(length) if length else b"{}"
                     payload = json.loads(raw or b"{}")
-                    command = str(payload.get("command") or "").strip()
-                    verdict = handle_command(command) if command else "empty-command"
-                    if verdict is None:
-                        verdict = "unrecognized-command"
-                    status_code, body_obj = 200, {"ok": True, "verdict": verdict}
+                    if route == "/speech/status":
+                        utterance_id = str(payload.get("utterance_id") or "").strip()
+                        wait_seconds = float(payload.get("wait_seconds") or 0.0)
+                        body_obj = companion_audio.utterance_status(
+                            utterance_id, wait_seconds=wait_seconds
+                        )
+                        status_code = 200 if body_obj.get("ok") else 404
+                    elif route == "/speech/cancel":
+                        utterance_id = str(payload.get("utterance_id") or "").strip()
+                        cancelled = bool(utterance_id and companion_audio.cancel(utterance_id))
+                        body_obj = {"ok": True, "cancelled": cancelled, "utterance_id": utterance_id}
+                        status_code = 200
+                    elif route == "/speech":
+                        destination = str(payload.get("destination") or "companion").strip().lower()
+                        if destination != "companion":
+                            body_obj = {
+                                "ok": False,
+                                "accepted": False,
+                                "error": "bridge speech destination must be 'companion'",
+                            }
+                        else:
+                            body_obj = companion_audio.submit(
+                                kind="speech",
+                                text=str(payload.get("text") or ""),
+                                meeting_url=payload.get("meeting_url"),
+                                source=str(payload.get("artifact_source") or "virtual-agent-tts"),
+                                metadata={
+                                    "utterance_id": payload.get("utterance_id"),
+                                    "agent_id": payload.get("agent_id"),
+                                    "correlation_id": payload.get("correlation_id"),
+                                    "voice_id": payload.get("voice_id"),
+                                    "requested_voice_id": payload.get("requested_voice_id"),
+                                    "rate": payload.get("rate", 1.0),
+                                    "pitch": payload.get("pitch", 0.0),
+                                    "volume": payload.get("volume", 1.0),
+                                },
+                            )
+                        status_code = 202 if body_obj.get("ok") else 409
+                    else:
+                        command = str(payload.get("command") or "").strip()
+                        verdict = handle_command(command) if command else "empty-command"
+                        if verdict is None:
+                            verdict = "unrecognized-command"
+                        ok = not str(verdict).startswith("say-rejected:")
+                        status_code, body_obj = (200 if ok else 409), {"ok": ok, "verdict": verdict}
                 except Exception as error:  # noqa: BLE001
                     status_code, body_obj = 400, {"ok": False, "error": str(error)}
                 body = json.dumps(body_obj).encode("utf-8")
@@ -2614,8 +3018,6 @@ def main() -> None:
 
     # ---- presence companion: a second SSO keeps the meeting populated ------
     # It can also TALK: /say and /click route audio through its synthetic mic.
-    speech_lock = threading.Lock()
-
     def companion_loop() -> None:
         companion_cdp = cdp_endpoint
         companion_profile = Path(args.profile).expanduser()
@@ -2629,7 +3031,7 @@ def main() -> None:
         told_waiting = False
         companion_tab: CdpTab | None = None
         # Synthetic-mic patch state for the CURRENT tab/JS-realm. A full
-        # navigation (reload, location.href=) wipes window.* state, so this
+        # page navigations wipe window.* state, so this
         # must be re-applied any time the realm resets.
         mic_ready = False
         reloaded_for_mic = False
@@ -2664,8 +3066,11 @@ def main() -> None:
                     told_sso = True
                     print("[companion] using its assigned authuser tab in the browser profile", flush=True)
                 if companion_tab is not None and holder.get("companion_tab_id") is None:
+                    companion_audio.invalidate("companion tab closed")
                     invalidate_sso_satisfaction(holder, "companion-tab-closed", clear_roles=("companion",))
                     companion_tab = None
+                    holder["companion_state"] = "not-attached"
+                    holder["companion_mic_ready"] = False
                     holder["companion_click_installed"] = False
                     update_companion_click_status(status, holder)
                 info = find_role_meet_tab(
@@ -2688,6 +3093,7 @@ def main() -> None:
                             role="companion",
                         )
                     if companion_tab is not None:
+                        companion_audio.invalidate("companion tab relaunched")
                         invalidate_sso_satisfaction(holder, "companion-tab-relaunched", clear_roles=("companion",))
                         companion_tab.close()
                     info, reused_tab = reuse_or_open_tab(
@@ -2695,10 +3101,20 @@ def main() -> None:
                         role_target_url(target, "companion"),
                         existing_in_scope=reusable_tab,
                         navigate_existing=reusable_tab is not None,
+                        reason="join-meeting",
+                        detail=(
+                            f"companion connector for {role_email('companion')} is joining "
+                            f"{target} so Meet keeps two participants present"
+                        ),
+                        role="companion",
+                        component="meet_bridge",
+                        intended_identity=role_email("companion"),
                     )
                     companion_tab = None
                     holder["companion_tab"] = None
                     holder["companion_tab_id"] = None
+                    holder["companion_state"] = "not-attached"
+                    holder["companion_mic_ready"] = False
                     holder["companion_click_installed"] = False
                     update_companion_click_status(status, holder)
                     if not operator_joined and not reused_tab:
@@ -2711,6 +3127,11 @@ def main() -> None:
                         companion_cdp,
                         str(info.get("url") or ""),
                         existing_in_scope=info,
+                        reason="reattach-lost-tab",
+                        detail="companion tab was found but local CDP handle was missing; reattaching and foregrounding it",
+                        role="companion",
+                        component="meet_bridge",
+                        intended_identity=role_email("companion"),
                     )
                     if not (info and info.get("webSocketDebuggerUrl")):
                         stop.wait(3)
@@ -2735,6 +3156,7 @@ def main() -> None:
                     record_role_verified("companion", holder["companion_account"])
                     holder["companion_tab"] = companion_tab
                     holder["companion_tab_id"] = info.get("id")
+                    holder["companion_state"] = "attached"
                     install_caption_push(companion_tab, role="companion", log=log)
                     mic_ready = False
                     reloaded_for_mic = False
@@ -2750,8 +3172,10 @@ def main() -> None:
                     try:
                         companion_tab.evaluate(GUM_PATCH_JS)
                         mic_ready = True
+                        holder["companion_mic_ready"] = True
                     except Exception as error:  # noqa: BLE001
                         mic_ready = False
+                        holder["companion_mic_ready"] = False
                         print(f"[companion] mic patch failed: {error}", file=sys.stderr, flush=True)
                 if mic_ready and (holder.get("companion_click_enabled") or holder.get("companion_click_installed")):
                     apply_companion_click_state(companion_tab, holder, status, log=log)
@@ -2763,11 +3187,12 @@ def main() -> None:
                     " : location.hostname.includes('accounts.google') ? 'signin'"
                     " : [...document.querySelectorAll('button')].some(b => /join now|ask to join|join anyway|rejoin/i.test((b.textContent||'') + (b.getAttribute('aria-label')||''))) ? 'prejoin-ready'"
                     " : 'elsewhere'"))
+                holder["companion_state"] = state
                 if state == "in-call" and not operator_joined:
                     operator_joined = True
                     log(
                         "[companion] you're in -- taking over: "
-                        + ("incoming audio intentionally left audible for companion-listen-device capture." if args.companion_listen_device else "staying muted, deaf, and present."),
+                        + "staying muted and deaf; remote audio is tapped without speaker playback when enabled.",
                         role="companion",
                     )
                 if state == "signin" and not operator_joined:
@@ -2781,8 +3206,15 @@ def main() -> None:
                     # sign-in page) but not looking at our room -- e.g. still
                     # on the post-leave-call home screen. Safe to steer there
                     # regardless of operator_joined: no OAuth flow to disturb.
-                    companion_tab.evaluate("location.href = %s" % json.dumps(role_target_url(target, "companion")))
+                    logged_location_href(
+                        companion_tab,
+                        role_target_url(target, "companion"),
+                        role="companion",
+                        reason="join-meeting",
+                        detail=f"companion tab was signed in but not at {target}; steering it to the meeting",
+                    )
                     mic_ready = False
+                    holder["companion_mic_ready"] = False
                     reloaded_for_mic = False
                     mic_selected = False
                     holder["companion_click_installed"] = False
@@ -2796,14 +3228,28 @@ def main() -> None:
                     # the very next getUserMedia call sees the patched version.
                     reloaded_for_mic = True
                     mic_ready = False
+                    holder["companion_mic_ready"] = False
                     holder["companion_click_installed"] = False
                     update_companion_click_status(status, holder)
-                    companion_tab.evaluate("location.reload()")
+                    logged_location_reload(
+                        companion_tab,
+                        str(info.get("url") or role_target_url(target, "companion")),
+                        role="companion",
+                        reason="join-meeting",
+                        detail="reload companion prejoin page so the synthetic-mic patch applies before joining",
+                    )
                     stop.wait(3)
                     continue
                 if operator_joined and target.split("?")[0] not in str(info.get("url") or ""):
-                    companion_tab.evaluate("location.href = %s" % json.dumps(role_target_url(target, "companion")))
+                    logged_location_href(
+                        companion_tab,
+                        role_target_url(target, "companion"),
+                        role="companion",
+                        reason="switch-meeting",
+                        detail=f"companion had joined but drifted away from {target}; navigating back to the assigned room",
+                    )
                     mic_ready = False
+                    holder["companion_mic_ready"] = False
                     reloaded_for_mic = False
                     mic_selected = False
                     holder["companion_click_installed"] = False
@@ -2834,39 +3280,35 @@ def main() -> None:
                         _log_companion_click(log, "unmuted", "[click] companion unmuted for synthetic ticker", interval=60.0)
                     if verdict in ("join-clicked", "stayed-in-call", "muted", "admitted"):
                         log(f"[companion] {verdict}", role="companion")
-                if (
-                    state == "in-call"
-                    and holder.get("companion_click_enabled")
-                    and str(holder.get("companion_click_mode") or "reactive") == "reactive"
-                    and time.time() >= float(holder.get("speaking_until") or 0)
-                ):
+                if state == "in-call" and holder.get("companion_click_enabled"):
                     audio_probe = None
-                    if str(holder.get("companion_click_trigger") or "caption") in {"audio", "both"}:
-                        audio_probe = measure_companion_audio_silence(companion_tab, holder, status, log=log)
                     now_mono = time.monotonic()
-                    decision = companion_click_trigger_decision(holder, now=now_mono, audio_probe=audio_probe)
-                    if decision.get("due"):
-                        holder["companion_click_last_trigger_monotonic"] = now_mono
-                        if trigger_companion_click(
-                            companion_tab,
-                            holder,
-                            status,
-                            prior_host_key=str(decision.get("rowKey") or ""),
-                            trigger_reason=str(decision.get("trigger") or ""),
-                            silence_ms=float(decision.get("silenceMs") or 0.0),
-                            monologue_seconds=float(decision.get("monologueSeconds") or 0.0),
-                            log=log,
-                        ):
-                            _log_companion_click(
-                                log,
-                                "reactive-click",
-                                f"[click] sent companion boundary sound via {decision.get('trigger')} after {float(decision.get('monologueSeconds') or 0.0):.1f}s host row and {float(decision.get('silenceMs') or 0.0):.0f}ms silence",
-                                interval=10.0,
-                            )
+                    mode = str(holder.get("companion_click_mode") or "reactive")
+                    if mode != "fixed":
+                        if str(holder.get("companion_click_trigger") or "caption") in {"audio", "both"}:
+                            audio_probe = measure_companion_audio_silence(companion_tab, holder, status, log=log)
+                    decision = companion_interjection_decision(holder, now=now_mono, audio_probe=audio_probe)
+                    queued = queue_companion_interjection(
+                        holder,
+                        companion_audio,
+                        decision,
+                        meeting_url=holder.get("url"),
+                        now=now_mono,
+                    )
+                    if queued.get("accepted"):
+                        _log_companion_click(
+                            log,
+                            "reactive-click",
+                            (
+                                f"[backchannel] queued companion "
+                                f"{holder.get('companion_click_phrase') or 'uh'!r} "
+                                f"via {decision.get('trigger')}"
+                            ),
+                            interval=10.0,
+                        )
+                    update_companion_click_status(status, holder)
                 if state == "in-call" and args.companion_heard_stt:
-                    ensure_companion_heard_capture(mailbox, holder, status, log=log)
-                if args.companion_listen_device:
-                    route_companion_audio_output(companion_tab, args.companion_listen_device, holder, status, log=log)
+                    forward_companion_heard_audio(companion_tab, mailbox, holder, status, log=log)
                 else:
                     companion_tab.evaluate('document.querySelectorAll("audio,video").forEach((m) => { m.muted = true; m.volume = 0; })')
             except Exception as error:  # noqa: BLE001
@@ -2874,18 +3316,99 @@ def main() -> None:
                 companion_tab = None
                 holder["companion_tab"] = None
                 holder["companion_tab_id"] = None
+                holder["companion_state"] = "not-attached"
+                holder["companion_mic_ready"] = False
+                companion_audio.invalidate("companion CDP attachment lost")
                 holder["companion_click_installed"] = False
                 update_companion_click_status(status, holder)
                 log(f"[companion] {error}", err=True, role="companion")
                 stop.wait(3)
             stop.wait(3)
 
-    if args.companion:
-        threading.Thread(target=companion_loop, daemon=True).start()
-        print("[companion] armed: a muted second authuser tab in the browser will sit in the meeting so Google keeps it alive", flush=True)
+    def _play_companion_audio(item: dict[str, Any], cancel_event: threading.Event) -> None:
+        """Play one already-arbitrated speech/interject item on its bound tab."""
 
-    def say_into_meeting(text: str) -> None:
-        """/say <text>: SAPI-speak through the companion's synthetic mic.
+        tab = holder.get("companion_tab")
+        if tab is None or holder.get("companion_tab_id") != item.get("tabId"):
+            raise RuntimeError("companion tab changed before playback")
+        if item.get("kind") == "interject":
+            decision = (item.get("metadata") or {}).get("decision") or {}
+            phrase = str((item.get("metadata") or {}).get("phrase") or "uh")
+            if not trigger_companion_click(
+                tab,
+                holder,
+                status,
+                prior_host_key=str(decision.get("rowKey") or ""),
+                trigger_reason=str(decision.get("trigger") or "interject"),
+                silence_ms=decision.get("silenceMs"),
+                monologue_seconds=decision.get("monologueSeconds"),
+                phrase=phrase,
+                log=log,
+            ):
+                raise RuntimeError(str(holder.get("companion_click_last_error") or "interject failed"))
+            duration_ms = float(holder.get("companion_click_ms") or 100.0)
+            if phrase == "uhuh":
+                duration_ms = max(duration_ms, 280.0)
+            elif phrase == "hmm":
+                duration_ms = max(duration_ms, 220.0)
+            cancel_event.wait(max(0.001, duration_ms / 1000.0))
+            return
+
+        metadata = item.get("metadata") or {}
+        b64, duration = sapi_wav_base64(
+            str(item.get("text") or ""),
+            voice_id=str(metadata.get("voice_id") or ""),
+            rate=float(metadata.get("rate") or 1.0),
+            pitch=float(metadata.get("pitch") or 0.0),
+            volume=float(metadata.get("volume") if metadata.get("volume") is not None else 1.0),
+        )
+        companion_audio.report_duration(str(item.get("id") or ""), duration)
+        if cancel_event.is_set() or not _companion_audio_readiness(item.get("meetingUrl")).get("ready"):
+            raise RuntimeError("companion speech cancelled before playback")
+        artifact_started = time.time()
+        holder["companion_say_artifact_started_at"] = artifact_started
+        holder["companion_say_artifact_until"] = artifact_started + duration + 2.0
+        holder["companion_say_artifact"] = {
+            "id": item.get("id"),
+            "source": item.get("source"),
+            "agentId": metadata.get("agent_id"),
+            "correlationId": metadata.get("correlation_id"),
+            "expectedText": item.get("text"),
+            "meetingUrl": item.get("meetingUrl"),
+        }
+        holder["speaking_until"] = holder["companion_say_artifact_until"]
+        try:
+            unmute_verdict = tab.evaluate(autojoin_js("speaking"))
+            if cancel_event.wait(0.3):
+                raise RuntimeError("companion speech cancelled before playback")
+            if tts_output_device_index is not None:
+                import base64 as _base64
+
+                play_wav_bytes_to_device(
+                    _base64.b64decode(b64),
+                    tts_output_device_index,
+                    cancellation=cancel_event,
+                )
+                verdict = f"completed-via-device-{tts_output_device_index}"
+            else:
+                verdict = tab.evaluate(
+                    SPEAK_INTO_MEETING_JS % json.dumps(b64),
+                    await_promise=True,
+                    timeout=max(30, int(duration + 10)),
+                )
+            if not isinstance(verdict, str) or not verdict.startswith("completed"):
+                raise RuntimeError(str(verdict or "synthetic microphone playback failed"))
+            log(f"[say] {unmute_verdict}/{verdict}: {str(item.get('text') or '')[:80]}", role="companion")
+        finally:
+            holder["speaking_until"] = 0.0
+            if holder.get("companion_tab_id") == item.get("tabId"):
+                try:
+                    tab.evaluate(autojoin_js("speaking" if holder.get("companion_click_enabled") else "muted"))
+                except Exception as error:  # noqa: BLE001
+                    log(f"[say] re-mute failed: {error}", err=True, role="companion")
+
+    def say_into_meeting(text: str, *, meeting_url: str | None = None) -> dict[str, Any]:
+        """/say <text>: queue SAPI speech through the companion synthetic mic.
 
         Never touches the real host mic -- this only works once --companion
         is running, has joined, and its getUserMedia patch has landed (or,
@@ -2895,42 +3418,25 @@ def main() -> None:
         verify Google's own captions (Emit/Phrases/Transcribe) come back
         matching it.
         """
-        tab = holder.get("companion_tab")
-        if not tab:
-            print("[say] no companion tab yet -- start with --companion and let it join first", file=sys.stderr, flush=True)
-            return
-        with speech_lock:
-            try:
-                b64, duration = sapi_wav_base64(text)
-                holder["speaking_until"] = time.time() + duration + 2.0
-                unmute_verdict = tab.evaluate(autojoin_js("speaking"))
-                time.sleep(0.3)  # let the UI settle before playing
-                if tts_output_device_index is not None:
-                    # Real virtual-cable path: play straight to the configured
-                    # Windows device, bypassing the in-page WebAudio patch --
-                    # Meet is already capturing from the cable's other side.
-                    import base64 as _base64
+        result = companion_audio.submit(
+            kind="speech",
+            text=text,
+            meeting_url=meeting_url,
+            source="legacy-say",
+            metadata={"agent_id": "legacy-say"},
+        )
+        if not result.get("accepted"):
+            log(f"[say] rejected: {result.get('error')}", err=True, role="companion")
+        return result
 
-                    play_wav_bytes_to_device(_base64.b64decode(b64), tts_output_device_index)
-                    verdict = f"spoke-via-device-{tts_output_device_index}"
-                    log(f"[say] {unmute_verdict}/{verdict}: {text[:80]}", role="companion")
-                    stop.wait(duration + 0.2)
-                else:
-                    verdict = tab.evaluate(SPEAK_INTO_MEETING_JS % json.dumps(b64), await_promise=True, timeout=30)
-                    log(f"[say] {unmute_verdict}/{verdict}: {text[:80]}", role="companion")
-                    if isinstance(verdict, str) and verdict.startswith("speaking"):
-                        stop.wait(duration + 0.2)
-            except Exception as error:  # noqa: BLE001
-                log(f"[say] failed: {error}", err=True, role="companion")
-            finally:
-                holder["speaking_until"] = 0.0
-                try:
-                    tab.evaluate(autojoin_js("speaking" if holder.get("companion_click_enabled") else "muted"))
-                except Exception as error:  # noqa: BLE001
-                    log(f"[say] re-mute failed: {error}", err=True, role="companion")
+    companion_audio.start()
+    if args.companion:
+        threading.Thread(target=companion_loop, daemon=True).start()
+        print("[companion] armed: a muted second authuser tab in the browser will sit in the meeting so Google keeps it alive", flush=True)
 
     def switch_to(target_url: str | None) -> None:
         """Leave for another meeting: /join <url> or /new (fresh servant room)."""
+        companion_audio.invalidate("meeting switch")
         old_id = holder.get("tab_id")
         old_url = str(holder.get("url") or "")
         host_target = role_target_url(target_url or "https://meet.google.com/new", "host")
@@ -2954,6 +3460,14 @@ def main() -> None:
                 host_target,
                 existing_in_scope=existing,
                 navigate_existing=bool(existing and navigate_existing),
+                reason="new-meeting" if target_url is None else "switch-meeting",
+                detail=(
+                    f"host tab lost or switching from {old_url or 'unknown'} "
+                    + ("to a freshly-created Meet room" if target_url is None else f"to {target_url}")
+                ),
+                role="host",
+                component="meet_bridge",
+                intended_identity=role_email("host"),
             )
         except Exception as error:  # noqa: BLE001
             print(f"[bridge] switch failed: could not reuse connector tab ({error})", file=sys.stderr, flush=True)
@@ -3027,7 +3541,19 @@ def main() -> None:
                     failed.append("host (backend=wsl, no OS window to foreground by design)")
                 else:
                     try:
-                        tab.bring_to_front()
+                        navigator.foreground(
+                            tab,
+                            str(holder.get("url") or ""),
+                            cdp_endpoint=cdp_endpoint,
+                            reason="operator-foreground",
+                            detail="operator requested foregrounding the host browser tab",
+                            role="host",
+                            component="meet_bridge",
+                            tab_id=nav_tab_id("host"),
+                            intended_identity=role_email("host"),
+                            effective_identity=str((holder.get("host_account") or {}).get("email") or "") or None,
+                            origin="operator",
+                        )
                         raised.append("host")
                     except Exception as error:  # noqa: BLE001
                         failed.append(f"host ({error})")
@@ -3040,7 +3566,19 @@ def main() -> None:
                     failed.append("companion (backend=wsl, no OS window to foreground by design)")
                 else:
                     try:
-                        companion_tab.bring_to_front()
+                        navigator.foreground(
+                            companion_tab,
+                            str(holder.get("url") or ""),
+                            cdp_endpoint=cdp_endpoint,
+                            reason="operator-foreground",
+                            detail="operator requested foregrounding the companion browser tab",
+                            role="companion",
+                            component="meet_bridge",
+                            tab_id=nav_tab_id("companion"),
+                            intended_identity=role_email("companion"),
+                            effective_identity=str((holder.get("companion_account") or {}).get("email") or "") or None,
+                            origin="operator",
+                        )
                         raised.append("companion")
                     except Exception as error:  # noqa: BLE001
                         failed.append(f"companion ({error})")
@@ -3087,6 +3625,21 @@ def main() -> None:
                 target,
                 existing_in_scope=existing,
                 navigate_existing=navigate_existing,
+                reason="add-account" if wanted == "add-account" else "operator-request",
+                detail=(
+                    "operator requested add-account SSO page in the bridge browser"
+                    if wanted == "add-account"
+                    else f"operator requested SSO authuser {authuser} in the bridge browser"
+                ),
+                role="server",
+                component="meet_bridge",
+                sso_intent=(
+                    navigator.SsoIntent.ADD_ACCOUNT
+                    if wanted == "add-account"
+                    else navigator.SsoIntent.OPERATOR_REQUEST
+                ),
+                intended_identity=None if wanted == "add-account" else email,
+                origin="operator",
             )
         except Exception as error:  # noqa: BLE001
             return f"{verdict} failed: could not reuse account page ({error})"
@@ -3115,8 +3668,11 @@ def main() -> None:
                 holder["tab_id"] = None
                 holder["url"] = None
             else:
+                companion_audio.invalidate("companion process killed")
                 holder["companion_tab"] = None
                 holder["companion_tab_id"] = None
+                holder["companion_state"] = "not-attached"
+                holder["companion_mic_ready"] = False
                 holder["companion_click_installed"] = False
                 update_companion_click_status(status, holder)
             verdict = f"killed:{wanted}"
@@ -3165,6 +3721,7 @@ def main() -> None:
             companion_tab_id = holder.get("companion_tab_id")
             companion_cdp = holder.get("companion_cdp")
             if companion_tab is not None and companion_tab_id and companion_cdp:
+                companion_audio.invalidate("companion disconnected")
                 invalidate_sso_satisfaction(holder, "companion-tab-disconnected", clear_roles=("companion",))
                 close_tab(companion_cdp, companion_tab_id)
                 try:
@@ -3173,6 +3730,8 @@ def main() -> None:
                     pass
                 holder["companion_tab"] = None
                 holder["companion_tab_id"] = None
+                holder["companion_state"] = "not-attached"
+                holder["companion_mic_ready"] = False
                 holder["companion_click_installed"] = False
                 update_companion_click_status(status, holder)
                 closed.append("companion")
@@ -3208,8 +3767,10 @@ def main() -> None:
             parts = command.split(None, 1)
             spoken = parts[1].strip() if len(parts) > 1 else ""
             if spoken:
-                threading.Thread(target=say_into_meeting, args=(spoken,), daemon=True).start()
-                return "speaking"
+                queued = say_into_meeting(spoken)
+                if queued.get("accepted"):
+                    return "speaking"
+                return f"say-rejected:{queued.get('reason')}:{queued.get('error')}"
             return "say-empty"
         click_command = parse_companion_click_command(command)
         if click_command is not None:

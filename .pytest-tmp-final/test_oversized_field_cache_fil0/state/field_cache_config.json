@@ -1,0 +1,11 @@
+{
+  "default_limit": 16,
+  "observations": {
+    "chat_bubble": {
+      "description": "Fields observed in chat message records."
+    },
+    "mailbox_definition": {
+      "description": "Fields observed in mailbox JSON definitions."
+    }
+  }
+}

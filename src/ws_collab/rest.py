@@ -11,6 +11,7 @@ bounded long polling.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from .context import AppContext
-from .errors import AuthenticationError, WsCollabError
+from .errors import AuthenticationError, ValidationError, WsCollabError
 from .security import Principal, Session
 
 _ADMIN_DIR = Path(__file__).resolve().parent / "admin"
@@ -47,6 +48,13 @@ def guarded(fn, *args, **kwargs):
 async def guarded_async(coro):
     try:
         return await coro
+    except WsCollabError as error:
+        raise HTTPException(status_code=error.http_status, detail=error.to_dict()["error"])
+
+
+async def guarded_thread(fn, *args, **kwargs):
+    try:
+        return await asyncio.to_thread(fn, *args, **kwargs)
     except WsCollabError as error:
         raise HTTPException(status_code=error.http_status, detail=error.to_dict()["error"])
 
@@ -307,6 +315,31 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             source_id=source_id,
             source_kind=source_kind,
             correlation_id=body.get("correlation_id"),
+            idempotency_key=body.get("idempotency_key") or idempotency_key,
+        )
+
+    @router.get(f"{mount}/browser/nav-intents")
+    async def browser_nav_intents(
+        request: Request,
+        after: str | None = Query(None),
+        limit: int = Query(100, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.read_browser_nav_intents, after=after, limit=limit)
+
+    @router.post(f"{mount}/browser/nav-intents")
+    async def post_browser_nav_intent(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+        idempotency_key: str | None = Header(None),
+    ) -> dict[str, Any]:
+        auth = await _require(request, "worker", mutating=True)
+        source_id, source_kind = _source(auth, body)
+        return guarded(
+            service.record_browser_nav_intent,
+            body,
+            source_id=source_id,
+            source_kind=source_kind,
             idempotency_key=body.get("idempotency_key") or idempotency_key,
         )
 
@@ -606,6 +639,11 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         await _require(request, "operator", mutating=True)
         return guarded(service.stop_secondary_capture)
 
+    @router.post(f"{mount}/audio/secondary-capture/browser")
+    async def secondary_capture_browser(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "worker", mutating=True)
+        return guarded(service.ingest_companion_browser_audio, body)
+
     @router.post(f"{mount}/audio/echo-policy")
     async def set_echo_policy(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
@@ -700,18 +738,20 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             priority=body.get("priority"),
             interrupt=bool(body.get("interrupt", False)),
             correlation_id=body.get("correlation_id"),
+            destination=body.get("destination"),
+            meeting_url=body.get("meeting_url"),
         )
 
     @router.get(f"{mount}/tts")
     async def tts_state(request: Request) -> dict[str, Any]:
         await _require(request, "viewer")
-        return service.tts.state()
+        return service.tts_state()
 
     @router.post(f"{mount}/tts/cancel")
     async def tts_cancel(request: Request, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
         if body.get("id"):
-            return {"cancelled": service.tts.cancel(body["id"])}
+            return service.cancel_speech(body["id"])
         if body.get("agent_id"):
             return {"cancelled_count": service.tts.cancel_agent(body["agent_id"])}
         return {"cancelled": False}
@@ -780,6 +820,11 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         await _require(request, "viewer")
         return guarded(service.list_meet_sso_accounts)
 
+    @router.post(f"{mount}/meet/sso/scan")
+    async def meet_sso_scan(request: Request) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return await guarded_thread(service.scan_meet_sso_accounts)
+
     @router.get(f"{mount}/meet/browser-settings")
     async def meet_browser_settings(request: Request) -> dict[str, Any]:
         await _require(request, "viewer")
@@ -788,10 +833,21 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     @router.post(f"{mount}/meet/browser-settings")
     async def set_meet_browser_settings(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
+        require_sso_consent = body.get("require_sso_consent")
+        if (
+            "require_sso_consent" in body
+            and type(require_sso_consent) is not bool
+        ):
+            error = ValidationError("require_sso_consent must be a boolean")
+            raise HTTPException(
+                status_code=error.http_status,
+                detail=error.to_dict()["error"],
+            ) from error
         return guarded(
             service.set_meet_browser_settings,
             body.get("browser_backend", "windows"),
             body.get("profile_path", ""),
+            require_sso_consent,
         )
 
     @router.get(f"{mount}/meet/role-assignments")
@@ -835,7 +891,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             body.get("enabled", False),
             body.get("interval_seconds", body.get("intervalSeconds")),
             body.get("meeting_url", ""),
-            mode=body.get("mode"),
+            mode=body.get("mode", body.get("trigger_mode", body.get("triggerMode"))),
             trigger=body.get("trigger"),
             after_seconds=body.get("after_seconds", body.get("afterSeconds")),
             silence_ms=body.get("silence_ms", body.get("silenceMs")),
@@ -845,6 +901,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             click_ms=body.get("click_ms", body.get("clickMs")),
             gain=body.get("gain"),
             sound=body.get("sound"),
+            phrase=body.get("phrase"),
             f0_hz=body.get("f0_hz", body.get("f0Hz")),
             f1_hz=body.get("f1_hz", body.get("f1Hz")),
             f2_hz=body.get("f2_hz", body.get("f2Hz")),
@@ -864,7 +921,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         body: dict[str, Any] = Body(default_factory=dict),
     ) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
-        return guarded(
+        return await guarded_thread(
             service.start_meet_bridge,
             body.get("meeting_url", ""),
             new=bool(body.get("new", False)),
@@ -890,12 +947,12 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         body: dict[str, Any] = Body(...),
     ) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
-        return guarded(service.meet_bridge_command, body.get("command", ""))
+        return await guarded_thread(service.meet_bridge_command, body.get("command", ""))
 
     @router.post(f"{mount}/meet/sso/open")
     async def meet_sso_open(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
-        return guarded(
+        return await guarded_thread(
             service.open_meet_sso_account,
             body.get("account_id", ""),
             bool(body.get("add_account", False)),

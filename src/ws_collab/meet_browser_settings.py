@@ -13,8 +13,10 @@ from typing import Any
 class MeetBrowserSettings:
     """A small atomic JSON store for Meet browser launch preferences."""
 
+    REQUIRE_SSO_CONSENT_KEY = "require_sso_consent"
     _PROFILES_KEY = "profiles"
     _LEGACY_PROFILES_KEY = "shared_profiles"
+    _PROFILE_REGISTRY_KEY = "profile_registry"
 
     def __init__(self, directory: Path | str):
         self.directory = Path(directory)
@@ -62,6 +64,44 @@ class MeetBrowserSettings:
             else:
                 self._data[key] = value
             self._save()
+
+    def require_sso_consent(self) -> bool:
+        """Return the global opt-in for native authentication confirmations."""
+        return self.get(self.REQUIRE_SSO_CONSENT_KEY, False) is True
+
+    def profile_registry(self) -> dict[str, dict[str, Any]]:
+        """Return operator-configured profile metadata keyed by stable slug."""
+        with self._lock:
+            raw = self._data.get(self._PROFILE_REGISTRY_KEY, {})
+            return json.loads(json.dumps(raw)) if isinstance(raw, dict) else {}
+
+    def register_profile(
+        self,
+        slug: str,
+        profile_path: Path | str,
+        *,
+        display_name: str | None = None,
+        intended_default_account: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = str(slug or "").strip().lower()
+        if not normalized or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789._-" for char in normalized):
+            raise ValueError("invalid browser profile slug")
+        record = {
+            "slug": normalized,
+            "path": str(Path(profile_path).expanduser()),
+            "display_name": str(display_name or normalized),
+            "intended_default_account": (
+                str(intended_default_account).strip().lower()
+                if intended_default_account
+                else None
+            ),
+        }
+        with self._lock:
+            registry = self.profile_registry()
+            registry[normalized] = record
+            self._data[self._PROFILE_REGISTRY_KEY] = registry
+            self._save()
+        return json.loads(json.dumps(record))
 
     def _profiles_copy(self) -> dict[str, Any]:
         raw = self.get(self._PROFILES_KEY, self.get(self._LEGACY_PROFILES_KEY, {}))

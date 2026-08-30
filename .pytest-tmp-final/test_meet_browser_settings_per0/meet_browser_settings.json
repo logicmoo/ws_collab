@@ -1,0 +1,11 @@
+{
+  "browser_backend": "wsl",
+  "profile_path": "C:\\snet\\PeTTa\\repos\\symbolic_learner_workbench\\workbench\\plugins\\ws_collab\\.pytest-tmp-final\\test_meet_browser_settings_per0\\profile",
+  "profiles": {
+    "C:\\snet\\PeTTa\\repos\\symbolic_learner_workbench\\workbench\\plugins\\ws_collab\\.pytest-tmp-final\\test_meet_browser_settings_per0\\profile": {
+      "known_meeting_urls": [
+        "https://meet.google.com/tbz-gxzr-wwv"
+      ]
+    }
+  }
+}

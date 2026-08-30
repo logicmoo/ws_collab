@@ -1,0 +1,16 @@
+{
+  "profile_registry": {
+    "account-a": {
+      "display_name": "Douglas Miles",
+      "intended_default_account": "first@example.test",
+      "path": "C:\\snet\\PeTTa\\repos\\symbolic_learner_workbench\\workbench\\plugins\\ws_collab\\.pytest-tmp-final\\test_profile_registry_is_accou0\\chrome_profiles\\account-a",
+      "slug": "account-a"
+    },
+    "account-b": {
+      "display_name": "Douglas Miles",
+      "intended_default_account": "second@example.test",
+      "path": "C:\\snet\\PeTTa\\repos\\symbolic_learner_workbench\\workbench\\plugins\\ws_collab\\.pytest-tmp-final\\test_profile_registry_is_accou0\\chrome_profiles\\account-b",
+      "slug": "account-b"
+    }
+  }
+}

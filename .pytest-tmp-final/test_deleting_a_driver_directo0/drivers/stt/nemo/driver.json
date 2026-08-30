@@ -1,0 +1,7 @@
+{
+  "id": "nemo",
+  "kind": "stt",
+  "enabled": true,
+  "requires": ["nemo_toolkit"],
+  "description": "NVIDIA NeMo ASR (Parakeet/Canary/Nemotron-speech family)."
+}

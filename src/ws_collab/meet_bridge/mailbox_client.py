@@ -30,8 +30,11 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 import urllib.error
 import urllib.request
+from collections import deque
 from typing import Any
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8802/ws_collab"
@@ -145,3 +148,64 @@ class MailboxClient:
             method="POST",
             body={"device_id": device_id},
         )
+
+    def ingest_companion_browser_audio(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Push muted companion remote-media PCM into shared secondary capture."""
+        return self._call(
+            "/v1/audio/secondary-capture/browser",
+            method="POST",
+            body=payload,
+        )
+
+    def post_browser_nav_intent(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._call("/v1/browser/nav-intents", method="POST", body=payload)
+
+
+class BrowserNavIntentPoster:
+    """Fault-tolerant, non-blocking sender for bridge browser navigation logs."""
+
+    def __init__(self, client: MailboxClient, *, max_buffer: int = 200, retry_seconds: float = 2.0):
+        self.client = client
+        self.max_buffer = max(1, int(max_buffer))
+        self.retry_seconds = max(0.1, float(retry_seconds))
+        self._queue: deque[dict[str, Any]] = deque(maxlen=self.max_buffer)
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def submit(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            if len(self._queue) >= self.max_buffer:
+                self._queue.popleft()
+            self._queue.append(dict(payload))
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="browser-nav-intent-poster", daemon=True)
+                self._thread.start()
+        self._wake.set()
+
+    def _pop(self) -> dict[str, Any] | None:
+        with self._lock:
+            return self._queue.popleft() if self._queue else None
+
+    def _requeue_front(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            if len(self._queue) >= self.max_buffer:
+                return
+            self._queue.appendleft(payload)
+
+    def _run(self) -> None:
+        while True:
+            payload = self._pop()
+            if payload is None:
+                self._wake.wait(30.0)
+                self._wake.clear()
+                with self._lock:
+                    if not self._queue:
+                        self._thread = None
+                        return
+                continue
+            try:
+                self.client.post_browser_nav_intent(payload)
+            except Exception:
+                self._requeue_front(payload)
+                time.sleep(self.retry_seconds)

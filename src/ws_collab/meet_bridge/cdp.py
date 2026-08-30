@@ -20,11 +20,15 @@ import sys
 import threading
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
 from websocket import create_connection  # websocket-client
 from websocket import WebSocketTimeoutException
+
+from . import navigator
+from .navigator import configure_browser_nav_logging, set_browser_nav_profile
 
 DEFAULT_CDP = "http://127.0.0.1:9222"
 DEFAULT_POPUP_PORT = 9223
@@ -35,17 +39,6 @@ DEFAULT_PROFILE = Path(
     or (_PLUGIN_ROOT / "collab_state" / "meet_bridge_profile")
 )
 DEFAULT_SSO_AUTHUSER_PROBE_SLOTS = (0, 1)
-
-BROWSER_CANDIDATES = [
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    str(Path.home() / r"AppData\Local\Google\Chrome\Application\chrome.exe"),
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-]
-WSL_BROWSER_CANDIDATES = ["google-chrome", "google-chrome-stable", "chromium-browser", "chromium"]
-
-
 def _decode_wsl_text(raw: bytes) -> str:
     cleaned = raw.replace(b"\x00", b"")
     try:
@@ -174,10 +167,26 @@ def _http_json(url: str, *, method: str = "GET", timeout: float = 5.0) -> Any:
 
 
 def _http_touch(url: str, *, method: str = "GET", timeout: float = 5.0) -> None:
-    """Fire a request whose body we don't need (CDP's /json/new, /json/close)."""
+    """Fire a request whose body we don't need (for example, CDP tab close)."""
     request = urllib.request.Request(url, method=method)
     with urllib.request.urlopen(request, timeout=timeout):  # noqa: S310 - local trusted CDP endpoint
         pass
+
+
+def _navigation_backend(
+    *,
+    open_tab: Callable[[str, str], dict[str, Any] | None] | None = None,
+) -> navigator.BrowserBackend:
+    selected = navigator.get_browser_backend()
+    if not isinstance(selected, navigator.CdpBrowserBackend):
+        return selected
+    return navigator.CdpBrowserBackend(
+        http_json=_http_json,
+        tab_factory=CdpTab,
+        list_tabs=list_tabs,
+        open_tab=open_tab,
+        popen=subprocess.Popen,
+    )
 
 
 class CdpTab:
@@ -289,6 +298,41 @@ class CdpTab:
             self._events.clear()
             return events
 
+    def wait_for_navigation_settled(
+        self,
+        *,
+        timeout: float = 5.0,
+        settle_seconds: float = 0.5,
+        require_event: bool = False,
+    ) -> None:
+        """Wait for a committed main-frame load and a short event-quiet period."""
+        deadline = time.monotonic() + max(0.05, timeout)
+        quiet_deadline = time.monotonic() + settle_seconds
+        with self._condition:
+            while True:
+                now = time.monotonic()
+                events = list(self._events)
+                self._events.clear()
+                relevant = any(
+                    str(event.get("method") or "") in {
+                        "Page.frameNavigated",
+                        "Page.loadEventFired",
+                        "Page.lifecycleEvent",
+                        "Page." "navigatedWithinDocument",
+                    }
+                    for event in events
+                )
+                if relevant:
+                    quiet_deadline = now + settle_seconds
+                if now >= quiet_deadline and (relevant or not require_event):
+                    return
+                if relevant:
+                    require_event = False
+                if now >= deadline:
+                    return
+                wake_at = min(deadline, quiet_deadline if not require_event else deadline)
+                self._condition.wait(max(0.0, wake_at - now))
+
     def call(self, method: str, params: dict[str, Any] | None = None, timeout: float = 10.0) -> Any:
         with self._send_lock:
             with self._condition:
@@ -380,14 +424,45 @@ def find_browser(explicit: str | None) -> str:
     raise SystemExit("No Chrome/Edge found -- pass --browser <path to chrome.exe>")
 
 
-def open_url(cdp_endpoint: str, target: str) -> dict[str, Any] | None:
-    try:
-        return _http_json(f"{cdp_endpoint}/json/new?{target}", method="PUT")
-    except Exception:
-        try:
-            return _http_json(f"{cdp_endpoint}/json/new?{target}", method="GET")
-        except Exception:
-            return None
+def open_url(
+    cdp_endpoint: str,
+    target: str,
+    *,
+    reason: str = "compatibility-open-url",
+    detail: str = "legacy CDP open_url compatibility shim",
+    role: str | None = None,
+    component: str | None = None,
+    chrome_profile: str | Path | dict[str, Any] | None = None,
+    _log_nav_intent: bool = True,
+    sso_intent: navigator.SsoIntent | str | None = None,
+    identity_mode: navigator.IdentityMode | str | None = None,
+    intended_identity: str | None = None,
+    effective_identity: str | None = None,
+    origin: str = "machine",
+    consent_operation_id: str | None = None,
+    allow_operation_scope: bool = False,
+) -> dict[str, Any] | None:
+    info = navigator.open_url(
+        cdp_endpoint,
+        target,
+        reason=reason,
+        detail=detail,
+        role=role or "unknown",
+        component=component or "cdp",
+        chrome_profile=chrome_profile,
+        log_nav_intent=_log_nav_intent,
+        sso_intent=sso_intent,
+        identity_mode=identity_mode,
+        intended_identity=intended_identity,
+        effective_identity=effective_identity,
+        origin=origin,
+        consent_operation_id=consent_operation_id,
+        allow_operation_scope=allow_operation_scope,
+        backend=_navigation_backend(),
+    )
+    setattr(open_url, "_last_error", getattr(navigator.open_url, "_last_error", None))
+    setattr(open_url, "_last_action", getattr(navigator.open_url, "_last_action", None))
+    return info
 
 
 def reuse_or_open_tab(
@@ -396,43 +471,73 @@ def reuse_or_open_tab(
     *,
     existing_in_scope: dict[str, Any] | None = None,
     navigate_existing: bool = False,
+    reason: str = "compatibility-reuse-or-open",
+    detail: str = "legacy CDP reuse_or_open_tab compatibility shim",
+    role: str | None = None,
+    component: str | None = None,
+    chrome_profile: str | Path | dict[str, Any] | None = None,
+    sso_intent: navigator.SsoIntent | str | None = None,
+    identity_mode: navigator.IdentityMode | str | None = None,
+    intended_identity: str | None = None,
+    effective_identity: str | None = None,
+    origin: str = "machine",
+    consent_operation_id: str | None = None,
+    allow_operation_scope: bool = False,
 ) -> tuple[dict[str, Any] | None, bool]:
     """Reuse only a caller-selected connector+SSO tab, never globally dedupe."""
-    controlled = existing_in_scope
-    if (
-        existing_in_scope
-        and not existing_in_scope.get("webSocketDebuggerUrl")
-        and existing_in_scope.get("id")
-    ):
-        controlled = next(
-            (
-                tab
-                for tab in list_tabs(cdp_endpoint)
-                if str(tab.get("id") or "") == str(existing_in_scope.get("id") or "")
-            ),
-            existing_in_scope,
-        )
-    if controlled and controlled.get("webSocketDebuggerUrl"):
-        tab = CdpTab(controlled["webSocketDebuggerUrl"])
-        try:
-            if navigate_existing:
-                tab.call("Page.navigate", {"url": target})
-            tab.bring_to_front()
-        finally:
-            tab.close()
-        result = dict(controlled)
-        if navigate_existing:
-            result["url"] = target
-        return result, True
+    auth_target = navigator.classify_url(target) in {
+        navigator.UrlKind.GOOGLE_AUTH,
+        navigator.UrlKind.DISCORD_AUTH,
+    }
+    operation_id = consent_operation_id or (
+        f"browser-operation:{uuid.uuid4().hex}" if auth_target else None
+    )
+    scoped_operation = allow_operation_scope or auth_target
 
-    info = open_url(cdp_endpoint, target)
-    if info and info.get("webSocketDebuggerUrl"):
-        tab = CdpTab(info["webSocketDebuggerUrl"])
+    def open_for_reuse(endpoint: str, url: str) -> dict[str, Any] | None:
         try:
-            tab.bring_to_front()
-        finally:
-            tab.close()
-    return info, False
+            return open_url(
+                endpoint,
+                url,
+                reason=reason,
+                detail=detail,
+                role=role,
+                component=component,
+                chrome_profile=chrome_profile,
+                _log_nav_intent=False,
+                sso_intent=sso_intent,
+                identity_mode=identity_mode,
+                intended_identity=intended_identity,
+                effective_identity=effective_identity,
+                origin=origin,
+                consent_operation_id=operation_id,
+                allow_operation_scope=scoped_operation,
+            )
+        except TypeError:
+            # Supports old embedders that monkeypatch the compatibility shim.
+            return open_url(endpoint, url)
+
+    return navigator.reuse_or_open(
+        cdp_endpoint,
+        target,
+        existing_in_scope=existing_in_scope,
+        navigate_existing=navigate_existing,
+        reason=reason,
+        detail=detail,
+        role=role or "unknown",
+        component=component or "cdp",
+        chrome_profile=chrome_profile,
+        tab_factory=CdpTab,
+        list_tabs_func=list_tabs,
+        sso_intent=sso_intent,
+        identity_mode=identity_mode,
+        intended_identity=intended_identity,
+        effective_identity=effective_identity,
+        origin=origin,
+        consent_operation_id=operation_id,
+        allow_operation_scope=scoped_operation,
+        backend=_navigation_backend(open_tab=open_for_reuse),
+    )
 
 
 def close_tab(cdp_endpoint: str, tab_id: str) -> None:
@@ -474,12 +579,22 @@ def scan_signed_in_sso_accounts(
     *,
     authusers: list[int] | None = None,
     timeout: float = 5.0,
+    reason: str = "account-scan",
+    detail: str = "probe signed-in Google account slots without automating sign-in",
+    role: str | None = "probe",
+    component: str | None = "cdp",
+    chrome_profile: str | Path | dict[str, Any] | None = None,
+    sso_satisfied: bool | None = None,
+    consent_operation_id: str | None = None,
+    origin: str = "machine",
 ) -> list[dict[str, Any]]:
-    """Probe Google authuser slots and return only distinct live sign-ins."""
+    """Probe Google slots under one exact, short-lived provider/profile scan consent."""
     accounts: list[dict[str, Any]] = []
     seen_emails: set[str] = set()
     automatic_slots = authusers is None
     slots = list(authusers) if authusers is not None else list(DEFAULT_SSO_AUTHUSER_PROBE_SLOTS)
+    sso_state = "unknown" if sso_satisfied is None else str(bool(sso_satisfied)).lower()
+    operation_id = consent_operation_id or f"account-scan:{uuid.uuid4().hex}"
     try:
         existing_ids = {str(tab.get("id")) for tab in list_tabs(cdp_endpoint) if tab.get("id")}
     except Exception:
@@ -489,16 +604,53 @@ def scan_signed_in_sso_accounts(
     try:
         for authuser in slots:
             target = f"https://myaccount.google.com/?authuser={authuser}"
+            slot_detail = f"{detail}; authuser={authuser}; slots={slots}; ssoSatisfied={sso_state}"
             if probe is None:
-                probe_info = open_url(cdp_endpoint, target)
+                try:
+                    probe_info = open_url(
+                        cdp_endpoint,
+                        target,
+                        reason=reason,
+                        detail=slot_detail,
+                        role=role or "probe",
+                        component=component or "cdp",
+                        chrome_profile=chrome_profile,
+                        sso_intent=navigator.SsoIntent.PREFLIGHT_SCAN,
+                        consent_operation_id=operation_id,
+                        allow_operation_scope=True,
+                        origin=origin,
+                    )
+                except TypeError:
+                    # Supports old embedders that monkeypatch the compatibility shim.
+                    probe_info = open_url(cdp_endpoint, target)
                 if not probe_info or not probe_info.get("webSocketDebuggerUrl"):
-                    break
+                    continue
                 probe = CdpTab(probe_info["webSocketDebuggerUrl"])
             else:
                 try:
-                    probe.call("Page.navigate", {"url": target})
+                    navigator.navigate(
+                        probe,
+                        target,
+                        cdp_endpoint=cdp_endpoint,
+                        reason=reason,
+                        detail=slot_detail,
+                        role=role or "probe",
+                        component=component or "cdp",
+                        chrome_profile=chrome_profile,
+                        tab_info=probe_info,
+                        sso_intent=navigator.SsoIntent.PREFLIGHT_SCAN,
+                        consent_operation_id=operation_id,
+                        allow_operation_scope=True,
+                        origin=origin,
+                        backend=_navigation_backend(),
+                    )
                 except Exception:
-                    break
+                    try:
+                        probe.close()
+                    finally:
+                        probe = None
+                        probe_info = None
+                    continue
             account: dict[str, Any] | None = None
             deadline = time.time() + timeout
             while time.time() < deadline:
@@ -532,13 +684,30 @@ def scan_signed_in_sso_accounts(
     return accounts
 
 
-def browser_profile_root(cdp_endpoint: str, *, timeout: float = 3.0) -> Path | None:
+def browser_profile_root(
+    cdp_endpoint: str,
+    *,
+    timeout: float = 3.0,
+    reason: str = "profile-probe",
+    detail: str = "open chrome://version once to resolve the live Chrome user-data directory",
+    role: str | None = "probe",
+    component: str | None = "cdp",
+    chrome_profile: str | Path | dict[str, Any] | None = None,
+) -> Path | None:
     """Return the user-data directory of the Chrome instance on a CDP port."""
     try:
         existing_ids = {str(tab.get("id")) for tab in list_tabs(cdp_endpoint) if tab.get("id")}
     except Exception:
         return None
-    info = open_url(cdp_endpoint, "chrome://version/")
+    info = open_url(
+        cdp_endpoint,
+        "chrome://version/",
+        reason=reason,
+        detail=detail,
+        role=role,
+        component=component,
+        chrome_profile=chrome_profile,
+    )
     if not info or not info.get("webSocketDebuggerUrl"):
         return None
     tab = CdpTab(info["webSocketDebuggerUrl"])
@@ -549,7 +718,9 @@ def browser_profile_root(cdp_endpoint: str, *, timeout: float = 3.0) -> Path | N
             for line in text.splitlines():
                 label, separator, value = line.partition("\t")
                 if separator and label.strip() == "Profile Path" and value.strip():
-                    return Path(value.strip()).parent
+                    root = Path(value.strip()).parent
+                    set_browser_nav_profile(cdp_endpoint, root)
+                    return root
             time.sleep(0.1)
     finally:
         tab.close()
@@ -616,12 +787,32 @@ def find_add_account_tab(cdp_endpoint: str) -> dict[str, Any] | None:
     return None
 
 
-def foreground_sso_tab(cdp_endpoint: str, email: str) -> dict[str, Any] | None:
+def foreground_sso_tab(
+    cdp_endpoint: str,
+    email: str,
+    *,
+    reason: str = "foreground-sso",
+    detail: str = "",
+    role: str | None = "server",
+    component: str | None = None,
+    chrome_profile: str | Path | dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Foreground an existing account page without creating a tab."""
     found = find_sso_tab(cdp_endpoint, email)
     if found is None:
         return None
-    reuse_or_open_tab(cdp_endpoint, str(found.get("url") or ""), existing_in_scope=found)
+    reuse_or_open_tab(
+        cdp_endpoint,
+        str(found.get("url") or ""),
+        existing_in_scope=found,
+        reason=reason,
+        detail=detail or f"foreground existing SSO tab for {email}",
+        role=role,
+        component=component,
+        chrome_profile=chrome_profile,
+        sso_intent=navigator.SsoIntent.FOREGROUND_EXISTING,
+        intended_identity=email,
+    )
     return found
 
 
@@ -631,9 +822,14 @@ def launch_browser(args: Any) -> tuple[str, subprocess.Popen[bytes] | None]:
     port = args.port
     cdp = f"http://127.0.0.1:{port}"
     profile = Path(args.profile).expanduser()
+    set_browser_nav_profile(cdp, profile)
     profile.mkdir(parents=True, exist_ok=True)
     if not cdp_alive(cdp):
         url = getattr(args, "launch_url", None) or args.meet or ("https://meet.google.com/new" if args.new else "https://accounts.google.com/")
+        detail = (
+            "launch dedicated Meet browser; "
+            f"remote-debugging-port={port}; user-data-dir={profile}; profile={profile}"
+        )
         argv = build_launch(
             getattr(args, "browser_backend", "windows"),
             port,
@@ -643,13 +839,22 @@ def launch_browser(args: Any) -> tuple[str, subprocess.Popen[bytes] | None]:
             wsl_distro=getattr(args, "wsl_distro", None),
             extra_args=["--autoplay-policy=no-user-gesture-required", "--new-window"],
         )
-        process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        process = navigator.launch(
+            argv,
+            cdp_endpoint=cdp,
+            url=url,
+            profile=profile,
+            reason="browser-launch",
+            detail=detail,
+            role="host",
+            component="meet_bridge",
+            wait_until_ready=lambda: cdp_alive(cdp),
+            ready_timeout=60,
+            backend=_navigation_backend(),
+        )
         label = Path(find_browser(args.browser)).name if getattr(args, "browser_backend", "windows") == "windows" else "WSL Chrome/Chromium"
         print(f"[bridge] browser window opened ({label}, profile {profile})", flush=True)
         print("[bridge] pick your Google account in that window (SSO persists for next time)...", flush=True)
-        deadline = time.time() + 60
-        while time.time() < deadline and not cdp_alive(cdp):
-            time.sleep(0.5)
         if not cdp_alive(cdp):
             raise SystemExit("The launched browser never opened its DevTools port -- is another instance using the profile?")
         return cdp, process

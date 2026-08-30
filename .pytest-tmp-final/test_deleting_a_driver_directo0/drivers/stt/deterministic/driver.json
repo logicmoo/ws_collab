@@ -1,0 +1,6 @@
+{
+  "id": "deterministic",
+  "kind": "stt",
+  "enabled": true,
+  "description": "Hardware-free deterministic STT doubles (default engine set)."
+}

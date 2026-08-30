@@ -38,6 +38,7 @@ STREAM_DIAGNOSTICS = "system_diagnostics"
 STREAM_WS_EVENTS = "ws_event_log"
 STREAM_WORKBENCH_EVENTS = "workbench_event_log"
 STREAM_PROMPT = "prompt"
+STREAM_BROWSER_NAV_INTENTS = "browser_nav_intents"
 
 STREAMS: dict[str, str] = {
     STREAM_CONVERSATION: "conversation.jsonl",
@@ -53,6 +54,7 @@ STREAMS: dict[str, str] = {
     STREAM_WS_EVENTS: "ws_event_log.jsonl",
     STREAM_WORKBENCH_EVENTS: "workbench_event_log.jsonl",
     STREAM_PROMPT: "prompt_history.jsonl",
+    STREAM_BROWSER_NAV_INTENTS: "browser_nav_intents.jsonl",
 }
 
 # Human-readable purpose of each mailbox/stream, surfaced in the mailbox
@@ -71,6 +73,7 @@ STREAM_PURPOSES: dict[str, str] = {
     STREAM_WS_EVENTS: "WebSocket protocol events and errors (e.g. unknown message types).",
     STREAM_WORKBENCH_EVENTS: "Workbench server events and lifecycle log (workbench-origin stream).",
     STREAM_PROMPT: "Prompt and version history.",
+    STREAM_BROWSER_NAV_INTENTS: "Global Chrome page open/navigation intent and outcome log across server and Meet bridge processes.",
 }
 
 # Names of client-created ("dynamic") mailboxes the server has begun hosting.
@@ -94,6 +97,7 @@ STREAM_ROLES: dict[str, list[str] | str] = {
     "audit": STREAM_AUDIT,
     "diagnostics": STREAM_DIAGNOSTICS,
     "prompt_history": STREAM_PROMPT,
+    "browser_navigation": STREAM_BROWSER_NAV_INTENTS,
 }
 
 
@@ -130,6 +134,7 @@ WORKER_STATUS = "WORKER_STATUS"
 WORKER_STATE_CHANGED = "WORKER_STATE_CHANGED"
 ALERT_RAISED = "ALERT_RAISED"
 ALERT_RECOVERED = "ALERT_RECOVERED"
+BROWSER_NAV_INTENT = "BROWSER_NAV_INTENT"
 
 VALID_SOURCE_KINDS = {
     "operator",

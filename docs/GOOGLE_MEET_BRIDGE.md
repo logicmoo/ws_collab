@@ -143,6 +143,27 @@ the authenticated `/ws_collab/v1/meet/bridge` routes:
   `updated_at` is newer than `since`.
 - `POST /command {"command": "/join <url>" | "/new" | "/say <text>"}`.
   Join and New start the worker when it is offline.
+- `POST /speech` is the structured virtual-agent route. It requires
+  `destination: "companion"` plus text and accepts meeting, utterance, agent,
+  voice, correlation, and artifact-source metadata. It returns HTTP 409 rather
+  than claiming success if the companion/tab/meeting/synthetic mic is not ready.
+- `POST /speech/cancel` cancels a queued or active utterance by ID.
+
+Agent speech and automatic `uh`, `uhuh`, or `hmm` backchannels share one bounded FIFO arbiter,
+so their outbound synthetic-mic audio never overlaps. The default pending limit
+is 8 (`--companion-audio-queue-max`); overflow is rejected and counted. Meeting
+switch, companion disconnect, or tab reattach clears queued audio and stops
+active in-page sources. `/health` exposes this as `companionAudio`, including
+readiness, queued/speaking state, capacity, counters, and last output/error.
+Speech artifact IDs, agent/source markers, expected text, and the playback
+window are also carried into companion-heard STT suppression.
+
+The Silences admin page owns per-meeting backchannel configuration. **On
+silence** uses caption stasis and/or incoming-audio quiet detection, emits once
+on the quiet edge, and rearms after caption growth or speech resumes. **Every N
+seconds** runs only while the assigned companion is active and ready; both
+modes honor the minimum safety gap and queue state. Switching meetings or
+reattaching a tab invalidates queued output and resets scheduling state.
 
 Meet frequently revises the punctuation and wording at the end of its active
 caption row. The bridge therefore keeps the entire active row buffered until it
@@ -167,6 +188,60 @@ the page WebSocket client.
 Each finalized caption is pushed into `/ws_collab/v1/stt/ingest` with engine
 `google_meet`, so the STT page and durable transcript stream identify Meet as
 the source. Browser Web Speech remains a separate optional microphone test.
+
+### Repeatable turn-taking trials
+
+The hardware-free end-to-end scenarios alternate agent/user turns for counting
+(`one` through `twenty`, odd turns spoken by the agent) and the alphabet (`A`
+through `Z`, odd positions spoken by the agent):
+
+```
+.\.venv\Scripts\python.exe -m pytest -q tests\test_realtime_turn_taking.py
+```
+
+They are simulations, not claims of a live meeting. They route production TTS
+to the companion destination and bounded companion arbiter, play it through a
+fake companion backend, then feed fake companion remote-media segments through
+the production STT/disambiguation/classifier/event path. Marked agent echoes are
+ingested and must be rejected. Reports are JSON-serializable and contain each
+expected/observed actor and token, latency and error category, p50/p95/max, and
+drop/duplicate/misattribution/echo counts.
+
+An operator can later run the same scenario against an **already running** Meet:
+
+```
+$env:WS_COLLAB_TOKEN = "<worker-or-admin-token>"
+.\.venv\Scripts\python.exe -m ws_collab.realtime_live count `
+  --meeting-url "https://meet.google.com/..." `
+  --user-caption-name "Exact Meet caption display name" --confirm-live
+```
+
+Use `alphabet` instead of `count` for A-Z. The command never launches or joins
+a meeting. It refuses to proceed unless the URL matches, bridge SSO preflight is
+satisfied, configured HOST and COMPANION identities are verified, the companion
+is in-call, and companion audio is ready. It never derives role assignment from
+an account name: bridge configuration supplies roles, while
+`--user-caption-name` is an explicit caption filter. On every human turn it
+prints exactly which named person should say which token and waits for operator
+input before checking the live caption.
+
+### Companion-heard audio into Whisper and other STT drivers
+
+This route is experimental and remains **off by default**. Enable it for a
+manual bridge with `--companion-heard-stt`, or for server-managed bridge
+launches with `WS_COLLAB_COMPANION_HEARD_STT=1` (audio capture must also be
+enabled with `WS_COLLAB_AUDIO_ENABLED=1`).
+
+The companion's `audio`/`video` elements remain muted at volume zero. The
+bridge taps their underlying remote `MediaStream`, sends bounded PCM batches to
+the shared secondary-capture input, and that input fans out to every configured
+non-Meet STT engine (for example Whisper and Vosk). It never feeds Meet caption
+text into this route. `/audio/secondary-capture`, bridge `/health` under
+`companionHeardStt`, and the existing Devices secondary-capture panel expose
+connection, frame/byte/segment, drop, disconnect, and reconnect counters.
+Companion synthetic-mic `/say` and click windows are excluded before ingestion.
+The old virtual-cable `--companion-listen-device` options are retained only for
+CLI compatibility and no longer make companion playback audible.
 
 The Chrome/CDP automation remains in a child worker because it has blocking
 browser and audio loops. Its loopback-only port (`48699` by default) is an
@@ -203,3 +278,24 @@ instead of silently dropped.
   names, but Google can still change behavior between releases; the admin
   UI's debug/"other things" log surfaces autojoin/mic-select verdicts so a
   regression is visible quickly rather than silently dropping captions.
+## Authentication consent
+
+All Google or Discord authentication navigation is classified and gated in the
+central browser navigator, regardless of whether CDP or a future browser backend
+performs the action. Explicit typed SSO intent is always required. Native
+confirmation is disabled by default and can be enabled globally with **Require
+confirmation before opening identity-provider sign-in pages** on the SSO /
+Browser admin page. When disabled, explicitly intended SSO actions can navigate
+without a dialog and emit a `consent-disabled` lifecycle record; all navigation
+remains logged. When enabled, the operator must approve the native Python dialog.
+Closing the dialog, its 30-second timeout, a dialog failure, or a noninteractive
+session denies the action without opening a page.
+
+Account scans use one short-lived approval scoped to the exact provider, Chrome
+profile, typed scan intent, and scan operation. That approval covers the scan's
+bounded `authuser` probes only; it cannot authorize another profile, provider,
+intent, or later scan. Routine health/status reads use cached SSO state and
+never scan or prompt. In the admin UI, **Scan signed-in accounts** is the
+explicit operator action that can request this bounded consent when confirmation
+is enabled. Running server-managed bridges read the persisted setting before
+each authentication navigation, so toggles apply without restarting the bridge.

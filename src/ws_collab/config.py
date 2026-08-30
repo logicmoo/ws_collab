@@ -185,6 +185,7 @@ class Config:
     vad_threshold: float = 0.02
     vad_silence_ms: int = 600
     echo_policy: str = "listen_and_filter_tts"
+    companion_heard_stt: bool = False
 
     # STT. Real engines are preferred when their libraries/models are installed;
     # each falls back to a deterministic double (with a reported warning) so the
@@ -204,6 +205,8 @@ class Config:
     # TTS
     tts_backend: str = "auto"
     tts_policy: str = "unique_when_possible"
+    tts_output_destination: str = "local"
+    companion_audio_queue_max: int = 8
 
     # Agents
     agents: list[str] = field(default_factory=list)
@@ -362,6 +365,7 @@ class Config:
         cfg.audio_backend = get("AUDIO_BACKEND") or cfg.audio_backend
         cfg.audio_input_device = get("AUDIO_INPUT_DEVICE") or ""
         cfg.echo_policy = get("ECHO_POLICY") or cfg.echo_policy
+        cfg.companion_heard_stt = _as_bool(get("COMPANION_HEARD_STT"), cfg.companion_heard_stt)
 
         stt_engines = _as_list(get("STT_ENGINES"))
         if stt_engines:
@@ -378,6 +382,10 @@ class Config:
 
         cfg.tts_backend = get("TTS_BACKEND") or cfg.tts_backend
         cfg.tts_policy = get("TTS_POLICY") or cfg.tts_policy
+        cfg.tts_output_destination = get("TTS_OUTPUT_DESTINATION") or cfg.tts_output_destination
+        cfg.companion_audio_queue_max = _as_int(
+            get("COMPANION_AUDIO_QUEUE_MAX"), cfg.companion_audio_queue_max
+        )
 
         cfg.agents = _collect_agents(env)
         cfg.global_name = get("GLOBAL_NAME") if get("GLOBAL_NAME") is not None else cfg.global_name
@@ -389,6 +397,15 @@ class Config:
     # --------------------------------------------------------------- validation
     def validate(self) -> "Config":
         self.warnings = []
+
+        if self.tts_output_destination not in {"local", "companion"}:
+            raise ConfigurationError(
+                "WS_COLLAB_TTS_OUTPUT_DESTINATION must be 'local' or 'companion'"
+            )
+        if self.companion_audio_queue_max < 1 or self.companion_audio_queue_max > 100:
+            raise ConfigurationError(
+                "WS_COLLAB_COMPANION_AUDIO_QUEUE_MAX must be between 1 and 100"
+            )
 
         if self.https_port and not (self.tls_cert_file and self.tls_key_file):
             raise ConfigurationError(

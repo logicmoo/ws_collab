@@ -1,6 +1,55 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+
+import httpx
+import pytest
+
+from ws_collab.errors import ValidationError
+from ws_collab.meet_bridge import navigator
+
 V1 = "/ws_collab/v1"
+
+
+@pytest.mark.parametrize("denied", (False, True))
+def test_blocking_sso_consent_scan_does_not_block_async_health(
+    client, admin_headers, app_context, monkeypatch, denied
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_scan():
+        entered.set()
+        release.wait(1)
+        if denied:
+            raise ValidationError("operator denied authentication consent")
+        return {"accounts": [{"email": "approved@example.test"}], "signed_in_count": 1}
+
+    monkeypatch.setattr(app_context.service, "scan_meet_sso_accounts", blocking_scan)
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=client.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as api:
+            scan = asyncio.create_task(api.post(f"{V1}/meet/sso/scan", headers=admin_headers))
+            assert await asyncio.to_thread(entered.wait, 1)
+            health = await asyncio.wait_for(api.get(f"{V1}/health"), timeout=0.25)
+            assert health.status_code == 200
+            assert not scan.done()
+            release.set()
+            response = await asyncio.wait_for(scan, timeout=1)
+            assert response.status_code == (400 if denied else 200)
+            assert ("denied" in str(response.json())) if denied else response.json()["signed_in_count"] == 1
+
+    asyncio.run(exercise())
+
+
+@pytest.fixture(autouse=True)
+def approve_native_consent_for_test():
+    navigator.set_consent_provider(lambda _request: navigator.ConsentDecision.ALLOW_OPERATION)
+    yield
+    navigator.set_consent_provider(None)
+    navigator.set_consent_required_provider(None)
 
 
 def test_list_meet_sso_accounts_is_account_centric_when_bridge_offline(client, admin_headers, monkeypatch, tmp_path):
@@ -35,14 +84,67 @@ def test_open_meet_sso_account_launches_sign_in_page(client, admin_headers, monk
             launched["argv"] = argv
             self.pid = 4321
 
-    monkeypatch.setattr(service_mod.subprocess, "Popen", FakePopen)
+    def fake_launch(argv, **kwargs):
+        launched["wait_until_ready"] = kwargs["wait_until_ready"]
+        launched["ready_timeout"] = kwargs["ready_timeout"]
+        return FakePopen(argv)
+
+    monkeypatch.setattr(service_mod.navigator, "launch", fake_launch)
     body = client.post(f"{V1}/meet/sso/open", headers=admin_headers, json={"add_account": True}).json()
     assert body["ok"] is True
     assert body["pid"] == 4321
     assert any(str(host) in arg for arg in launched["argv"])
     assert "--remote-debugging-port=9223" in launched["argv"]
     assert launched["argv"][-1] == "https://accounts.google.com/AccountChooser?continue=https://accounts.google.com/"
+    assert callable(launched["wait_until_ready"])
+    assert launched["ready_timeout"] == 60.0
     assert body["reused_bridge_window"] is False
+
+
+def test_open_meet_sso_account_denial_never_launches(
+    client, admin_headers, app_context, monkeypatch, tmp_path
+):
+    from ws_collab import service as service_mod
+
+    host = tmp_path / "meet_profile"
+    monkeypatch.setattr(service_mod, "DEFAULT_PROFILE", host)
+    monkeypatch.setattr(service_mod.WsCollabService, "_meet_bridge_health", lambda self, timeout=0.5: None)
+    monkeypatch.setattr(service_mod, "find_browser", lambda explicit: r"C:\Chrome\chrome.exe")
+    monkeypatch.setattr(service_mod, "cdp_alive", lambda _endpoint: False)
+    app_context.service.meet_browser_settings.set("require_sso_consent", True)
+    navigator.set_consent_provider(lambda _request: navigator.ConsentDecision.DENY)
+    launched = []
+    monkeypatch.setattr(service_mod.subprocess, "Popen", lambda *args, **kwargs: launched.append(args))
+
+    response = client.post(
+        f"{V1}/meet/sso/open", headers=admin_headers, json={"add_account": True},
+    )
+
+    assert response.status_code >= 400
+    assert launched == []
+
+
+@pytest.mark.parametrize("require_consent", (False, True))
+def test_status_polling_uses_cached_state_and_never_prompts(
+    client, admin_headers, app_context, monkeypatch, tmp_path, require_consent
+):
+    from ws_collab import service as service_mod
+
+    host = tmp_path / "meet_profile"
+    monkeypatch.setattr(service_mod, "DEFAULT_PROFILE", host)
+    monkeypatch.setattr(service_mod.WsCollabService, "_meet_bridge_health", lambda self, timeout=0.5: None)
+    monkeypatch.setattr(
+        service_mod, "cdp_alive",
+        lambda _endpoint: (_ for _ in ()).throw(AssertionError("status must not probe CDP")),
+    )
+    app_context.service.meet_browser_settings.set("require_sso_consent", require_consent)
+    navigator.set_consent_provider(
+        lambda _request: (_ for _ in ()).throw(AssertionError("status must not prompt")),
+    )
+
+    for _ in range(3):
+        response = client.get(f"{V1}/meet/sso/accounts", headers=admin_headers)
+        assert response.status_code == 200
 
 
 def test_list_meet_sso_accounts_reports_only_live_sign_ins_as_ready(
@@ -218,9 +320,14 @@ def test_sso_scan_reuses_one_probe_tab_and_bounds_default_slots(monkeypatch):
             self.url = opened[-1]
 
         def call(self, method: str, params=None, timeout: float = 10.0):
-            assert method == "Page.navigate"
-            self.url = params["url"]
-            navigated.append(self.url)
+            if method == "Page.navigate":
+                self.url = params["url"]
+                navigated.append(self.url)
+            else:
+                assert method == "Page.enable"
+
+        def evaluate(self, _expression):
+            return self.url
 
         def close(self) -> None:
             closed.append(self.ws_url)

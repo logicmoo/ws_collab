@@ -86,6 +86,8 @@ See [AUDIO.md](AUDIO.md) for the full treatment.
 | `WS_COLLAB_DISAMBIGUATOR_LLM_ENDPOINT` | — | Strict-schema resolver endpoint |
 | `WS_COLLAB_TTS_BACKEND` | `auto` | `auto` (real, falling back), `sapi`, or `fake` |
 | `WS_COLLAB_TTS_POLICY` | `unique_when_possible` | Voice assignment policy |
+| `WS_COLLAB_TTS_OUTPUT_DESTINATION` | `local` | Safe default for legacy speech; set `companion` to require active Meet companion routing |
+| `WS_COLLAB_COMPANION_AUDIO_QUEUE_MAX` | `8` | Pending speech/interject limit (1–100); overflow is rejected and counted |
 
 Install the real audio stack with:
 

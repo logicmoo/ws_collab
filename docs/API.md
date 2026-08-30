@@ -134,6 +134,24 @@ Generic form: `POST /ws_collab/v1/events` with `{"stream", "type", "data",
 | GET | `/ws_collab/v1/conversation` | viewer |
 | POST | `/ws_collab/v1/conversation/events` | worker |
 
+### Browser navigation
+| Method | Path | Role |
+| --- | --- | --- |
+| GET | `/ws_collab/v1/browser/nav-intents?after=<cursor>&limit=100` | viewer |
+| POST | `/ws_collab/v1/browser/nav-intents` | worker |
+| GET | `/ws_collab/v1/meet/browser-settings` | viewer |
+| POST | `/ws_collab/v1/meet/browser-settings` | operator |
+
+The POST route ingests redacted intent/outcome records from browser worker
+processes. Both phases share a `nav_id`; GET returns the durable `events` page
+and a newest-first `records` view merged by that identifier.
+
+Meet browser settings include the global boolean `require_sso_consent` (default
+`false`). The settings POST validates it as a JSON boolean. When enabled,
+explicitly typed SSO navigation requires native operator confirmation; when
+disabled, typed SSO navigation proceeds with a `consent-disabled` log record.
+The typed-intent classifier remains mandatory in both modes.
+
 ### Workers
 | Method | Path | Role |
 | --- | --- | --- |
@@ -148,6 +166,9 @@ Generic form: `POST /ws_collab/v1/events` with `{"stream", "type", "data",
 | --- | --- | --- |
 | GET | `/ws_collab/v1/audio/capture` | viewer |
 | POST | `/ws_collab/v1/audio/capture/start` · `/stop` | operator |
+| GET | `/ws_collab/v1/audio/secondary-capture` | viewer |
+| POST | `/ws_collab/v1/audio/secondary-capture/start` · `/stop` | operator |
+| POST | `/ws_collab/v1/audio/secondary-capture/browser` | operator |
 | POST | `/ws_collab/v1/audio/utterance` | operator |
 | GET | `/ws_collab/v1/audio/devices` | viewer |
 | POST | `/ws_collab/v1/audio/devices/refresh` | operator |
@@ -182,6 +203,31 @@ curl -X POST http://127.0.0.1:8802/ws_collab/v1/stt/ingest \
 | GET | `/ws_collab/v1/voices` | viewer |
 | POST | `/ws_collab/v1/voices/{agent_id}` | operator |
 | POST | `/ws_collab/v1/voices/assign` | operator |
+
+`POST /tts/speak` accepts `destination: "local" | "companion"` and optional
+`meeting_url`. The default remains `local` for compatibility unless
+`WS_COLLAB_TTS_OUTPUT_DESTINATION=companion` is configured. A companion request
+is rejected unless the assigned COMPANION tab is attached, in the requested
+active meeting, and its synthetic microphone is ready. The response includes the
+resolved destination. `GET /tts` includes `destinations.companion` readiness,
+queue/speaking state, bounded capacity, sent/completed/dropped/rejected counters,
+and last utterance/error/destination. `POST /tts/cancel {"id": ...}` cancels both
+the server queue and any matching companion output.
+
+### Meet companion backchannels
+
+`GET`, `POST`, and `DELETE /ws_collab/v1/meet/companion-click` retain the
+historical route name. The Silences admin page is the sole editor. Pass
+`meeting_url` to select an exact room; GET reports `source: "override"` or
+`"default"` plus `globalDefault`.
+
+POST accepts `enabled`, `phrase` (`uh`, `uhuh`, or `hmm`), legacy
+`mode` (`reactive` for **on silence**, `fixed` for **every N seconds**),
+`interval_seconds`, `trigger` (`caption`, `audio`, or `both`),
+`after_seconds`, `silence_ms`, `min_gap_seconds`, `max_wait_seconds`,
+`audio_rms_threshold`, `click_ms`, `gain`, and formants `f0_hz`, `f1_hz`,
+`f2_hz`. Legacy `sound` remains accepted. DELETE with `meeting_url` removes
+that room's override and restores inherited defaults.
 
 ### Cursors
 | Method | Path | Role |

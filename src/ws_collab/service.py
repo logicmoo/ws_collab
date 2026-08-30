@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import re
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -35,10 +36,12 @@ from .disambiguator import build_disambiguator
 from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError
 from .events import (
     AGENT_SPEECH_STARTED,
+    BROWSER_NAV_INTENT,
     CONVERSATION_MESSAGE,
     DYNAMIC_STREAMS,
     HEARD_SPEECH,
     STREAM_AUDIT,
+    STREAM_BROWSER_NAV_INTENTS,
     STREAM_CONVERSATION,
     STREAM_DIAGNOSTICS,
     STREAM_STT_TRANSCRIPTS,
@@ -74,6 +77,7 @@ from .meet_bridge.cdp import (
     DEFAULT_PROFILE,
     browser_profile_root,
     cdp_alive,
+    configure_browser_nav_logging,
     find_browser,
     find_add_account_tab,
     find_sso_tab,
@@ -81,12 +85,18 @@ from .meet_bridge.cdp import (
     foreground_sso_tab,
     reuse_or_open_tab,
     scan_signed_in_sso_accounts,
+    set_browser_nav_profile,
 )
+from .meet_bridge import navigator
 from .meet_browser_settings import MeetBrowserSettings
 
 
 # The canonical capture source that STT engine routes hang off.
 DEFAULT_ROUTE_SOURCE = "microphone"
+_COMPANION_TTS_BASE_TIMEOUT_SECONDS = 45.0
+_COMPANION_TTS_SAFETY_CAP_SECONDS = 300.0
+_COMPANION_TTS_STATUS_POLL_SECONDS = 10.0
+_COMPANION_TTS_DURATION_GRACE_SECONDS = 15.0
 
 # Safety ceiling for a single read scan. `limit` is meant to bound the PRODUCED
 # stream, not the pre-filter read window, so virtual/merge streams scan sources up
@@ -187,6 +197,15 @@ class WsCollabService:
         self.routing = RoutingManager(config.state_dir, audit_sink=self._audit_sink)
         self.sound_settings = SoundSettings(config.state_dir)
         self.meet_browser_settings = MeetBrowserSettings(config.state_dir)
+        navigator.set_consent_required_provider(self.meet_browser_settings.require_sso_consent)
+        configure_browser_nav_logging(
+            lambda payload: self.record_browser_nav_intent(payload, source_id="server", source_kind="system"),
+            instance=f"server:{os.getpid()}:{self.boot_id[:8]}",
+            component="service",
+            role="server",
+            cdp_endpoint=f"http://127.0.0.1:{DEFAULT_POPUP_PORT}",
+            chrome_profile=self._meet_profile_path(),
+        )
         self._known_meeting_scan_at = 0.0
         self._known_meeting_scan_cache: list[str] = []
         self.admin_ui_state = AdminUIState(config.state_dir)
@@ -196,7 +215,18 @@ class WsCollabService:
         self.classifier = SourceClassifier(config.echo_policy)
         self.disambiguator = build_disambiguator(config)
         self.stt_engines, self.stt_warnings = build_engines(config)
-        self.tts = TtsEngine(config, self.publish)
+        self._companion_tts_status_cache: dict[str, Any] = {
+            "destination": "companion",
+            "companionReady": False,
+            "lastError": "Meet bridge status has not been refreshed",
+        }
+        self.tts = TtsEngine(
+            config,
+            self.publish,
+            route_play=self._play_tts_route,
+            route_status=self._companion_tts_status,
+            route_cancel=self._cancel_companion_tts,
+        )
         self.capture = CaptureService(
             config, self.devices, self.publish, self.process_segment, is_tts_speaking=lambda: self.tts.is_speaking
         )
@@ -687,6 +717,7 @@ class WsCollabService:
             "clickMs": 100.0,
             "gain": 0.12,
             "sound": "uh",
+            "phrase": "uh",
             "f0Hz": 125.0,
             "f1Hz": 600.0,
             "f2Hz": 1300.0,
@@ -723,7 +754,11 @@ class WsCollabService:
                 value = float(baseline.get(name, fallback))
             return value if value >= 0 else float(baseline.get(name, fallback))
 
-        mode = str(row.get("mode") or baseline.get("mode") or "reactive").lower()
+        mode = str(
+            row.get("mode") or row.get("triggerMode") or row.get("trigger_mode")
+            or baseline.get("mode") or "reactive"
+        ).lower().replace("-", "_")
+        mode = {"on_silence": "reactive", "interval": "fixed"}.get(mode, mode)
         if mode not in {"reactive", "fixed"}:
             mode = "reactive"
         trigger = str(row.get("trigger") or baseline.get("trigger") or "caption").lower()
@@ -732,10 +767,14 @@ class WsCollabService:
         sound = str(row.get("sound") or baseline.get("sound") or "uh").lower()
         if sound not in {"uh", "click"}:
             sound = "uh"
+        phrase = str(row.get("phrase") or row.get("sound") or baseline.get("phrase") or sound).lower()
+        if phrase not in {"uh", "uhuh", "hmm", "click"}:
+            phrase = "uh"
         return {
             "enabled": enabled,
             "intervalSeconds": positive("intervalSeconds", 2.0),
             "mode": mode,
+            "triggerMode": "interval" if mode == "fixed" else "on_silence",
             "trigger": trigger,
             "afterSeconds": positive("afterSeconds", 10.0),
             "silenceMs": positive("silenceMs", 500.0),
@@ -745,6 +784,7 @@ class WsCollabService:
             "clickMs": positive("clickMs", 100.0),
             "gain": min(1.0, positive("gain", 0.12)),
             "sound": sound,
+            "phrase": phrase,
             "f0Hz": positive("f0Hz", 125.0),
             "f1Hz": positive("f1Hz", 600.0),
             "f2Hz": positive("f2Hz", 1300.0),
@@ -806,26 +846,46 @@ class WsCollabService:
     def _meet_bridge_health_for_settings(self) -> dict[str, Any] | None:
         return self._meet_bridge_health()
 
-    def _meet_browser_live_accounts(self) -> list[dict[str, Any]] | None:
+    def _meet_browser_live_accounts(self, *, allow_consent: bool = False) -> list[dict[str, Any]] | None:
+        if not allow_consent:
+            return None
         cdp_endpoint = self._meet_browser_cdp_for_profile(self._meet_profile_path())
         if cdp_endpoint is None:
             return None
-        return scan_signed_in_sso_accounts(cdp_endpoint, timeout=2.0)
+        return scan_signed_in_sso_accounts(
+            cdp_endpoint,
+            timeout=2.0,
+            reason="account-scan",
+            detail="admin SSO/Browser scan is probing signed-in Google accounts",
+            role="probe",
+            component="service",
+            chrome_profile=self._meet_profile_path(),
+            consent_operation_id=f"admin-account-scan:{uuid.uuid4().hex}",
+            origin="operator",
+        )
 
     def _meet_browser_cdp_for_profile(self, profile_path: Path) -> str | None:
         cdp_endpoint = f"http://127.0.0.1:{DEFAULT_POPUP_PORT}"
         if not cdp_alive(cdp_endpoint):
             return None
-        live_profile = browser_profile_root(cdp_endpoint)
+        live_profile = browser_profile_root(
+            cdp_endpoint,
+            reason="profile-probe",
+            detail=f"verify DevTools port {DEFAULT_POPUP_PORT} is using configured Meet profile {profile_path}",
+            role="probe",
+            component="service",
+            chrome_profile=profile_path,
+        )
         if live_profile is None or live_profile.resolve() != profile_path.resolve():
             return None
+        set_browser_nav_profile(cdp_endpoint, live_profile)
         return cdp_endpoint
 
-    def list_meet_sso_accounts(self) -> dict[str, Any]:
-        health = self._meet_bridge_health_for_settings()
-        live_accounts = (health or {}).get("ssoAccounts")
-        if live_accounts is None:
-            live_accounts = self._meet_browser_live_accounts()
+    def _meet_sso_accounts_response(
+        self,
+        health: dict[str, Any] | None,
+        live_accounts: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
         account_health = health
         if account_health is None and live_accounts is not None:
             account_health = {
@@ -848,13 +908,35 @@ class WsCollabService:
             "ready_for_meet": len(signed_in_emails) >= 2,
         }
 
+    def list_meet_sso_accounts(self) -> dict[str, Any]:
+        """Return cached/worker state only; routine UI polling never opens auth pages."""
+        health = self._meet_bridge_health_for_settings()
+        live_accounts = (health or {}).get("ssoAccounts")
+        if live_accounts is None:
+            # Kept as a seam for existing embedders/tests, but the production
+            # implementation above deliberately returns without scanning.
+            live_accounts = self._meet_browser_live_accounts()
+        return self._meet_sso_accounts_response(health, live_accounts)
+
+    def scan_meet_sso_accounts(self) -> dict[str, Any]:
+        """Run one operator-approved scan whose consent covers its authuser slots."""
+        health = self._meet_bridge_health_for_settings()
+        try:
+            live_accounts = self._meet_browser_live_accounts(allow_consent=True)
+        except navigator.NavigationBlockedError as error:
+            raise ValidationError(str(error)) from error
+        return self._meet_sso_accounts_response(health, live_accounts)
+
     def get_meet_browser_settings(self) -> dict[str, Any]:
         backend = str(self.meet_browser_settings.get("browser_backend") or "windows")
         profile_path = self._meet_profile_path()
         command = ["ws-collab-meet-bridge", "--profile", str(profile_path), "--browser-backend", backend, "--companion"]
+        if self.config.companion_heard_stt:
+            command.append("--companion-heard-stt")
         return {
             "browser_backend": backend,
             "profile_path": str(profile_path),
+            "require_sso_consent": self.meet_browser_settings.require_sso_consent(),
             "next_launch_command": " ".join(f'"{part}"' if " " in part else part for part in command),
         }
 
@@ -862,13 +944,21 @@ class WsCollabService:
         self,
         browser_backend: str,
         profile_path: str,
+        require_sso_consent: bool | None = None,
     ) -> dict[str, Any]:
         backend = str(browser_backend or "windows").strip().lower()
         if backend not in {"windows", "wsl"}:
             raise ValidationError(f"invalid browser backend: {backend!r}")
+        if require_sso_consent is not None and type(require_sso_consent) is not bool:
+            raise ValidationError("require_sso_consent must be a boolean")
         path = str(profile_path or "").strip() or str(DEFAULT_PROFILE)
         self.meet_browser_settings.set("browser_backend", backend)
         self.meet_browser_settings.set("profile_path", path)
+        if require_sso_consent is not None:
+            self.meet_browser_settings.set(
+                MeetBrowserSettings.REQUIRE_SSO_CONSENT_KEY,
+                require_sso_consent,
+            )
         return self.get_meet_browser_settings()
 
     def get_meet_role_assignments(self, meeting_url: str = "") -> dict[str, Any]:
@@ -891,6 +981,8 @@ class WsCollabService:
             backend,
             "--companion",
         ]
+        if self.config.companion_heard_stt:
+            command.append("--companion-heard-stt")
         if meeting_url:
             command.extend(["--meet", self._meet_assignment_key(meeting_url)])
         for role, authuser in self._meet_role_authusers(accounts, role_account_map).items():
@@ -1047,6 +1139,7 @@ class WsCollabService:
         click_ms: float | int | str | None = None,
         gain: float | int | str | None = None,
         sound: str | None = None,
+        phrase: str | None = None,
         f0_hz: float | int | str | None = None,
         f1_hz: float | int | str | None = None,
         f2_hz: float | int | str | None = None,
@@ -1072,15 +1165,28 @@ class WsCollabService:
                 raise ValidationError(f"{label} must be a non-negative number")
             return parsed
 
-        parsed_mode = str(mode or current.get("mode") or "reactive").lower()
+        parsed_mode = str(mode or current.get("mode") or "reactive").lower().replace("-", "_")
+        parsed_mode = {"on_silence": "reactive", "interval": "fixed"}.get(parsed_mode, parsed_mode)
         if parsed_mode not in {"reactive", "fixed"}:
-            raise ValidationError("mode must be 'reactive' or 'fixed'")
+            raise ValidationError("mode must be 'on_silence'/'reactive' or 'interval'/'fixed'")
         parsed_trigger = str(trigger or current.get("trigger") or "caption").lower()
         if parsed_trigger not in {"caption", "audio", "both"}:
             raise ValidationError("trigger must be 'caption', 'audio', or 'both'")
         parsed_sound = str(sound or current.get("sound") or "uh").lower()
         if parsed_sound not in {"uh", "click"}:
-            raise ValidationError("sound must be 'uh' or 'click'")
+            if parsed_sound in {"uhuh", "hmm"}:
+                phrase = phrase or parsed_sound
+                parsed_sound = "uh"
+            else:
+                raise ValidationError("legacy sound must be 'uh' or 'click'")
+        parsed_phrase = str(
+            phrase if phrase is not None else (parsed_sound if sound is not None else current.get("phrase") or parsed_sound)
+        ).lower()
+        if parsed_phrase not in {"uh", "uhuh", "hmm"}:
+            if phrase is None and parsed_phrase == "click":
+                parsed_phrase = "click"
+            else:
+                raise ValidationError("phrase must be 'uh', 'uhuh', or 'hmm'")
         setting = {
             "enabled": bool(enabled),
             "intervalSeconds": positive(interval_seconds, "intervalSeconds", "interval_seconds"),
@@ -1092,12 +1198,31 @@ class WsCollabService:
             "maxWaitSeconds": nonnegative(max_wait_seconds, "maxWaitSeconds", "max_wait_seconds"),
             "audioRmsThreshold": nonnegative(audio_rms_threshold, "audioRmsThreshold", "audio_rms_threshold"),
             "clickMs": positive(click_ms, "clickMs", "click_ms"),
-            "gain": min(1.0, positive(gain, "gain", "gain")),
+            "gain": positive(gain, "gain", "gain"),
             "sound": parsed_sound,
+            "phrase": parsed_phrase,
             "f0Hz": positive(f0_hz, "f0Hz", "f0_hz"),
             "f1Hz": positive(f1_hz, "f1Hz", "f1_hz"),
             "f2Hz": positive(f2_hz, "f2Hz", "f2_hz"),
         }
+        limits = {
+            "intervalSeconds": (0.1, 3600.0),
+            "afterSeconds": (0.1, 3600.0),
+            "silenceMs": (10.0, 10000.0),
+            "minGapSeconds": (0.1, 3600.0),
+            "maxWaitSeconds": (0.0, 3600.0),
+            "audioRmsThreshold": (0.0, 1.0),
+            "clickMs": (10.0, 1000.0),
+            "gain": (0.001, 1.0),
+            "f0Hz": (40.0, 500.0),
+            "f1Hz": (100.0, 5000.0),
+            "f2Hz": (200.0, 8000.0),
+        }
+        for key, (minimum, maximum) in limits.items():
+            if not minimum <= setting[key] <= maximum:
+                raise ValidationError(f"{key} must be between {minimum:g} and {maximum:g}")
+        if not setting["f0Hz"] < setting["f1Hz"] < setting["f2Hz"]:
+            raise ValidationError("frequencies must be ordered f0_hz < f1_hz < f2_hz")
         if meeting_url:
             key = self._meet_assignment_key(meeting_url)
             overrides = dict(overrides)
@@ -1133,6 +1258,7 @@ class WsCollabService:
                 "clickMs": 100.0,
                 "gain": 0.12,
                 "sound": "uh",
+                "phrase": "uh",
                 "f0Hz": 125.0,
                 "f1Hz": 600.0,
                 "f2Hz": 1300.0,
@@ -1189,7 +1315,11 @@ class WsCollabService:
             "--browser-backend",
             str(self.meet_browser_settings.get("browser_backend") or "windows"),
             "--companion",
+            "--companion-audio-queue-max",
+            str(self.config.companion_audio_queue_max),
         ]
+        if self.config.companion_heard_stt:
+            argv.append("--companion-heard-stt")
         if target:
             argv.extend(["--meet", target])
         elif new:
@@ -1208,6 +1338,7 @@ class WsCollabService:
             argv.extend(["--companion-click-ms", f"{float(click.get('clickMs') or 100.0):g}"])
             argv.extend(["--companion-click-gain", f"{float(click.get('gain') or 0.12):g}"])
             argv.extend(["--companion-click-sound", str(click.get("sound") or "uh")])
+            argv.extend(["--companion-click-phrase", str(click.get("phrase") or click.get("sound") or "uh")])
             argv.extend(["--companion-click-f0", f"{float(click.get('f0Hz') or 125.0):g}"])
             argv.extend(["--companion-click-f1", f"{float(click.get('f1Hz') or 600.0):g}"])
             argv.extend(["--companion-click-f2", f"{float(click.get('f2Hz') or 1300.0):g}"])
@@ -1223,6 +1354,7 @@ class WsCollabService:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         process_env = os.environ.copy()
         process_env["PYTHONUNBUFFERED"] = "1"
+        process_env["WS_COLLAB_STATE_DIR"] = str(Path(self.config.state_dir).resolve())
         if not self.config.auth_disabled:
             token = ""
             for preferred_role in ("admin", "operator", "worker"):
@@ -1283,6 +1415,213 @@ class WsCollabService:
                 return json.loads(response.read().decode("utf-8"))
         except Exception:
             return None
+
+    def _meet_bridge_speech(
+        self,
+        payload: dict[str, Any],
+        timeout: float = 2.0,
+        *,
+        path: str = "/speech",
+    ) -> dict[str, Any] | None:
+        import urllib.error
+        import urllib.request
+
+        request = urllib.request.Request(
+            f"http://127.0.0.1:48699{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            try:
+                return json.loads(error.read().decode("utf-8"))
+            except Exception:
+                return {"ok": False, "error": str(error)}
+        except Exception:
+            return None
+
+    def _companion_tts_status(self) -> dict[str, Any]:
+        return dict(self._companion_tts_status_cache)
+
+    def _refresh_companion_tts_status(self, timeout: float = 0.05) -> dict[str, Any]:
+        health = self._meet_bridge_health(timeout=timeout)
+        if health is None:
+            payload = {
+                "destination": "companion",
+                "companionReady": False,
+                "lastError": "Meet bridge worker is offline",
+            }
+        else:
+            payload = dict(health.get("companionAudio") or {})
+            payload.setdefault("destination", "companion")
+            payload.setdefault("companionReady", False)
+            payload.setdefault("meetingUrl", health.get("meetingUrl"))
+        self._companion_tts_status_cache = payload
+        return dict(payload)
+
+    def tts_state(self) -> dict[str, Any]:
+        self._refresh_companion_tts_status()
+        return self.tts.state()
+
+    def _require_companion_tts_ready(self, meeting_url: str | None) -> str:
+        health = self._meet_bridge_health(timeout=0.75)
+        if health is None:
+            raise ConflictError("companion output unavailable: Meet bridge worker is offline")
+        outbound = health.get("companionAudio") or {}
+        self._companion_tts_status_cache = {
+            **dict(outbound),
+            "destination": "companion",
+            "meetingUrl": health.get("meetingUrl"),
+        }
+        if not outbound.get("companionReady"):
+            detail = outbound.get("lastError") or "companion is not attached, in-call, and synthetic-mic ready"
+            raise ConflictError(f"companion output unavailable: {detail}")
+        active = self._normal_meet_url(health.get("meetingUrl"))
+        requested = self._normal_meet_url(meeting_url) if meeting_url else active
+        if not active or not requested or active != requested:
+            raise ConflictError(
+                f"companion output meeting mismatch: active={active or 'none'} requested={requested or 'none'}"
+            )
+        return requested
+
+    async def _play_tts_route(self, item: Any) -> float:
+        if item.destination != "companion":
+            raise RuntimeError(f"unsupported TTS destination: {item.destination}")
+        payload = {
+            "destination": "companion",
+            "meeting_url": item.meeting_url,
+            "text": item.text,
+            "agent_id": item.agent_id,
+            "utterance_id": item.id,
+            "correlation_id": item.correlation_id,
+            "voice_id": item.voice_id,
+            "requested_voice_id": item.requested_voice_id,
+            "rate": item.rate,
+            "pitch": item.pitch,
+            "volume": item.volume,
+            "artifact_source": item.artifact_source,
+        }
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: self._meet_bridge_speech(payload, timeout=2.0)
+        )
+        if result is None:
+            raise RuntimeError("companion output unavailable: Meet bridge worker is offline")
+        if not result.get("ok") or not result.get("accepted"):
+            raise RuntimeError(str(result.get("error") or result.get("reason") or "companion speech rejected"))
+        def duration_hint(payload: dict[str, Any] | None) -> float:
+            if not payload:
+                return 0.0
+            values = (
+                payload.get("audioDurationSeconds"),
+                payload.get("durationSeconds"),
+                payload.get("estimatedDurationSeconds"),
+            )
+            return max(
+                (float(value) for value in values if isinstance(value, (int, float)) and value > 0),
+                default=0.0,
+            )
+
+        started_wait = time.monotonic()
+        firm_deadline = started_wait + _COMPANION_TTS_SAFETY_CAP_SECONDS
+        queue_hint = float(result.get("estimatedQueueDelaySeconds") or 0.0)
+        initial_hint = duration_hint(result)
+        soft_budget = max(
+            _COMPANION_TTS_BASE_TIMEOUT_SECONDS,
+            queue_hint + initial_hint + _COMPANION_TTS_DURATION_GRACE_SECONDS,
+        )
+        soft_deadline = min(firm_deadline, started_wait + soft_budget)
+        last_progress: tuple[Any, ...] | None = None
+
+        async def timeout_remote() -> None:
+            await asyncio.to_thread(
+                self._meet_bridge_speech,
+                {"utterance_id": item.id},
+                1.0,
+                path="/speech/cancel",
+            )
+            raise RuntimeError("companion playback completion acknowledgement timed out")
+
+        while True:
+            now = time.monotonic()
+            if now >= firm_deadline or now >= soft_deadline:
+                await timeout_remote()
+            wait_seconds = min(
+                _COMPANION_TTS_STATUS_POLL_SECONDS,
+                firm_deadline - now,
+                soft_deadline - now,
+            )
+            status = await asyncio.to_thread(
+                self._meet_bridge_speech,
+                {"utterance_id": item.id, "wait_seconds": max(0.01, wait_seconds)},
+                max(1.0, wait_seconds + 2.0),
+                path="/speech/status",
+            )
+            if status is None:
+                if time.monotonic() >= soft_deadline:
+                    await timeout_remote()
+                await asyncio.sleep(0.05)
+                continue
+            state = str(status.get("state") or "")
+            if status.get("terminal"):
+                if state == "cancelled":
+                    item.cancelled = True
+                    return 0.0
+                if state != "completed":
+                    raise RuntimeError(
+                        str(status.get("error") or f"companion playback {state or 'failed'}")
+                    )
+                started = float(status.get("startedAt") or status.get("enqueuedAt") or 0.0)
+                completed = float(status.get("completedAt") or started)
+                return max(0.0, completed - started)
+
+            progress = (
+                state,
+                status.get("startedAt"),
+                status.get("queuePosition"),
+                status.get("audioDurationSeconds"),
+                status.get("updatedAt"),
+            )
+            now = time.monotonic()
+            if progress != last_progress:
+                hint = duration_hint(status)
+                extension = max(
+                    _COMPANION_TTS_BASE_TIMEOUT_SECONDS,
+                    hint + _COMPANION_TTS_DURATION_GRACE_SECONDS,
+                )
+                soft_deadline = min(firm_deadline, max(soft_deadline, now + extension))
+                last_progress = progress
+            if state == "playing":
+                # Playback is acknowledged and may legitimately exceed the base
+                # deadline. The absolute cap remains immutable.
+                soft_deadline = firm_deadline
+            await asyncio.sleep(0.05)
+
+    def _cancel_companion_tts(self, utterance_id: str) -> None:
+        threading.Thread(
+            target=lambda: self._meet_bridge_speech(
+                {"utterance_id": utterance_id},
+                timeout=1.0,
+                path="/speech/cancel",
+            ),
+            name=f"companion-tts-cancel-{utterance_id[:8]}",
+            daemon=True,
+        ).start()
+
+    def cancel_speech(self, utterance_id: str) -> dict[str, Any]:
+        local = self.tts.cancel(utterance_id)
+        companion = self._meet_bridge_speech(
+            {"utterance_id": utterance_id},
+            timeout=1.0,
+            path="/speech/cancel",
+        )
+        return {
+            "cancelled": bool(local or (companion or {}).get("cancelled")),
+            "local": local,
+            "companion": companion,
+        }
 
     def meet_bridge_health(self) -> dict[str, Any]:
         health = self._meet_bridge_health(timeout=15.0)
@@ -1363,27 +1702,52 @@ class WsCollabService:
         path.mkdir(parents=True, exist_ok=True)
         health = self._meet_bridge_health()
         warning = self._meet_sso_in_use_warning(path)
+        accounts = self._sso_accounts(health, profile_path=path)
+        intended_email = (
+            None if add_account else str((accounts.get(account_id) or {}).get("email") or "") or None
+        )
         target_url, authuser = self._sso_target(account_id, add_account, health)
         reuse_command = "/sso add-account" if add_account else f"/sso {authuser}"
         if (add_account or authuser is not None) and self._meet_bridge_can_reuse_sso(health, path):
-            result = self._meet_bridge_command(reuse_command)
+            # The worker may be synchronously waiting on the native consent
+            # dialog (30-second bounded timeout).
+            result = self._meet_bridge_command(reuse_command, timeout=35.0)
             verdict = str((result or {}).get("verdict") or "")
             if result and result.get("ok") and verdict.startswith("sso:"):
                 return {"ok": True, "account_id": account_id or None, "path": str(path), "reused_bridge_window": True, "warning": warning}
+        popup_cdp_endpoint = f"http://127.0.0.1:{DEFAULT_POPUP_PORT}"
         cdp_endpoint = self._meet_browser_cdp_for_profile(path)
         if cdp_endpoint is not None:
             if add_account:
                 existing = find_add_account_tab(cdp_endpoint)
             else:
-                accounts = self._sso_accounts(health, profile_path=path)
-                email = str((accounts.get(account_id) or {}).get("email") or "")
+                email = str(intended_email or "")
                 existing = find_sso_connector_tab(cdp_endpoint, email) if email else None
-            info, _ = reuse_or_open_tab(
-                cdp_endpoint,
-                target_url,
-                existing_in_scope=existing,
-                navigate_existing=bool(add_account and existing),
-            )
+            try:
+                info, _ = reuse_or_open_tab(
+                    cdp_endpoint,
+                    target_url,
+                    existing_in_scope=existing,
+                    navigate_existing=bool(add_account and existing),
+                    reason="add-account" if add_account else "operator-request",
+                    detail=(
+                        "operator requested Google add-account sign-in tab"
+                        if add_account
+                        else f"operator requested SSO account {account_id} (authuser={authuser})"
+                    ),
+                    role="server",
+                    component="service",
+                    chrome_profile=path,
+                    sso_intent=(
+                        navigator.SsoIntent.ADD_ACCOUNT
+                        if add_account
+                        else navigator.SsoIntent.OPERATOR_REQUEST
+                    ),
+                    intended_identity=intended_email,
+                    origin="operator",
+                )
+            except navigator.NavigationBlockedError as error:
+                raise ValidationError(str(error)) from error
             if info and info.get("webSocketDebuggerUrl"):
                 return {
                     "ok": True,
@@ -1402,7 +1766,32 @@ class WsCollabService:
             "--new-window",
             target_url,
         ]
-        process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            process = navigator.launch(
+                argv,
+                cdp_endpoint=popup_cdp_endpoint,
+                url=target_url,
+                profile=path,
+                reason="add-account" if add_account else "operator-request",
+                detail=(
+                    f"operator requested a new Chrome window for Google add-account; remote-debugging-port={DEFAULT_POPUP_PORT}; user-data-dir={path}; profile={path}"
+                    if add_account
+                    else f"operator requested a new Chrome window for SSO account {account_id}; remote-debugging-port={DEFAULT_POPUP_PORT}; user-data-dir={path}; profile={path}"
+                ),
+                role="server",
+                component="service",
+                sso_intent=(
+                    navigator.SsoIntent.ADD_ACCOUNT
+                    if add_account
+                    else navigator.SsoIntent.OPERATOR_REQUEST
+                ),
+                intended_identity=intended_email,
+                origin="operator",
+                wait_until_ready=lambda: cdp_alive(popup_cdp_endpoint),
+                ready_timeout=60.0,
+            )
+        except navigator.NavigationBlockedError as error:
+            raise ValidationError(str(error)) from error
         return {"ok": True, "account_id": account_id or None, "path": str(path), "pid": process.pid, "reused_bridge_window": False, "warning": warning}
 
     def foreground_meet_sso_account(self, account_id: str) -> dict[str, Any]:
@@ -1429,7 +1818,20 @@ class WsCollabService:
                 "tab_exists": False,
                 "verdict": "the configured browser profile is not open",
             }
-        tab = foreground_sso_tab(cdp_endpoint, email)
+        try:
+            tab = foreground_sso_tab(
+                cdp_endpoint,
+                email,
+                reason="foreground-sso",
+                detail=f"operator requested foregrounding the SSO tab for {email}",
+                role="server",
+                component="service",
+                chrome_profile=profile_path,
+            )
+        except TypeError as error:
+            if "unexpected keyword" not in str(error):
+                raise
+            tab = foreground_sso_tab(cdp_endpoint, email)
         if tab is None:
             return {
                 "ok": False,
@@ -2019,6 +2421,68 @@ class WsCollabService:
             "event_type": type,
             "server_time": utc_now_iso(),
         }
+
+    def record_browser_nav_intent(
+        self,
+        payload: dict[str, Any] | None,
+        *,
+        source_id: str = "system",
+        source_kind: str = "system",
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        data = navigator.sanitize_intent_payload(payload)
+        data.setdefault("pid", os.getpid())
+        data.setdefault("instance", f"server:{os.getpid()}:{self.boot_id[:8]}")
+        data.setdefault("component", "service")
+        data.setdefault("role", "unknown")
+        data.setdefault("url", "")
+        data.setdefault("reason", "unknown")
+        data.setdefault("detail", "")
+        data.setdefault("caller", "unknown")
+        data.setdefault("outcome", "awaiting-consent")
+        data.setdefault("ts", utc_now_iso())
+        data.setdefault("ts_epoch", time.time())
+        key = idempotency_key
+        if key is None and data.get("nav_id") and data.get("outcome"):
+            key = (
+                f"browser-nav:{data.get('nav_id')}:{data.get('phase') or 'intent'}:"
+                f"{data.get('outcome')}:{data.get('tab_id') or data.get('target_id') or ''}"
+            )
+        return self.publish(
+            stream=STREAM_BROWSER_NAV_INTENTS,
+            type=BROWSER_NAV_INTENT,
+            data=data,
+            source_id=source_id,
+            source_kind=source_kind,
+            correlation_id=str(data.get("nav_id") or "") or None,
+            idempotency_key=key,
+        )
+
+    def read_browser_nav_intents(self, *, after: str | None = None, limit: int = 100) -> dict[str, Any]:
+        page = self.read_events(STREAM_BROWSER_NAV_INTENTS, after=after, limit=limit)
+        merged: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for event in page["events"]:
+            data = dict(event.get("data") or {})
+            nav_id = str(data.get("nav_id") or event.get("id") or "")
+            if nav_id not in merged:
+                merged[nav_id] = {
+                    "nav_id": nav_id,
+                    "event_id": event.get("id"),
+                    "seq": event.get("seq"),
+                    "source_id": event.get("source_id"),
+                    "source_kind": event.get("source_kind"),
+                }
+                order.append(nav_id)
+            merged[nav_id].update(data)
+            merged[nav_id]["last_event_id"] = event.get("id")
+            merged[nav_id]["last_seq"] = event.get("seq")
+        page["records"] = sorted(
+            (merged[nav_id] for nav_id in order),
+            key=lambda record: (float(record.get("ts_epoch") or 0), int(record.get("last_seq") or 0)),
+            reverse=True,
+        )
+        return page
 
     def read_events(
         self,
@@ -3260,6 +3724,8 @@ class WsCollabService:
         priority: int | None = None,
         interrupt: bool = False,
         correlation_id: str | None = None,
+        destination: str | None = None,
+        meeting_url: str | None = None,
     ) -> dict[str, Any]:
         profile = self.voices.get_profile(agent_id)
         if profile and not profile.speaking_permission:
@@ -3272,6 +3738,14 @@ class WsCollabService:
         base_rate = profile.rate if profile else 1.0
         base_pitch = profile.pitch if profile else 0.0
         base_volume = profile.volume if profile else 1.0
+        selected_destination = str(destination or self.config.tts_output_destination or "local").strip().lower()
+        if selected_destination not in {"local", "companion"}:
+            raise ValidationError("destination must be 'local' or 'companion'")
+        target_meeting = (
+            self._require_companion_tts_ready(meeting_url)
+            if selected_destination == "companion"
+            else None
+        )
         result = self.tts.speak(
             agent_id,
             text,
@@ -3281,11 +3755,19 @@ class WsCollabService:
             pitch=base_pitch + params.get("pitch", 0.0),
             volume=base_volume * params.get("volume", 1.0),
             device=profile.output_device if profile else "default",
+            destination=selected_destination,
+            meeting_url=target_meeting,
+            artifact_source="virtual-agent-tts",
             priority=effective_priority,
             correlation_id=correlation_id,
             interrupt=interrupt,
         )
         result["voice_resolution"] = resolution
+        result["destination"] = {
+            "type": selected_destination,
+            "meeting_url": target_meeting,
+            "companion_ready": selected_destination == "companion",
+        }
         return result
 
     async def measure_tts_accuracy(self, agent_id: str, text: str) -> dict[str, Any]:
@@ -3616,6 +4098,9 @@ class WsCollabService:
     def secondary_capture_state(self) -> dict[str, Any]:
         return self.secondary_capture.state()
 
+    def ingest_companion_browser_audio(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.secondary_capture.ingest_browser_audio(payload)
+
     def set_echo_policy(self, policy: str) -> dict[str, Any]:
         """Change how captured audio is reconciled against our own TTS, live.
 
@@ -3719,6 +4204,8 @@ class WsCollabService:
             "echo_policy": cfg.echo_policy,
             "stt_engines": cfg.stt_engines,
             "tts_policy": cfg.tts_policy,
+            "tts_output_destination": cfg.tts_output_destination,
+            "companion_audio_queue_max": cfg.companion_audio_queue_max,
             "agents": cfg.agents,
             "warnings": self._warnings,
         }
@@ -4052,7 +4539,9 @@ class WsCollabService:
     # --------------------------------------------------------------- lifecycle
     async def startup(self) -> None:
         # Let capture threads dispatch finished utterances onto the server loop.
-        self.capture.bind_loop(asyncio.get_running_loop())
+        loop = asyncio.get_running_loop()
+        self.capture.bind_loop(loop)
+        self.secondary_capture.bind_loop(loop)
         await self.tts.start()
         self._seed_prompt()
         self._seed_voices()
@@ -4060,6 +4549,8 @@ class WsCollabService:
         self._monitor_task = asyncio.create_task(self._monitor_loop())
 
     async def shutdown(self) -> None:
+        if self.secondary_capture.state()["listening"]:
+            self.secondary_capture.stop()
         if self._monitor_task is not None:
             self._monitor_task.cancel()
             try:

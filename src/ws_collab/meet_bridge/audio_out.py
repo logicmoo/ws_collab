@@ -17,7 +17,13 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
+from typing import Callable
+
+
+class AudioPlaybackCancelled(RuntimeError):
+    """Raised when cancellable physical-device playback is interrupted."""
 
 
 def speak_windows(text: str) -> None:
@@ -37,18 +43,29 @@ def speak_windows(text: str) -> None:
         print(f"[tts] {error}", file=sys.stderr, flush=True)
 
 
-def sapi_wav_base64(text: str) -> tuple[str, float]:
+def sapi_wav_base64(
+    text: str,
+    *,
+    voice_id: str = "",
+    rate: float = 1.0,
+    volume: float = 1.0,
+    pitch: float = 0.0,
+) -> tuple[str, float]:
     """Synthesize text to a WAV with Windows SAPI; return (base64, seconds)."""
     import base64
-    import tempfile
     import wave
 
-    handle, path = tempfile.mkstemp(suffix=".wav", prefix="meet_say_")
-    os.close(handle)
+    path = str(Path.cwd() / f".meet_say_{uuid.uuid4().hex}.wav")
     try:
+        wanted_voice = (voice_id or "").split(":", 1)[-1].strip() if voice_id.lower().startswith("sapi:") else ""
+        sapi_rate = int(max(-10, min(10, round((float(rate) - 1.0) * 10))))
+        sapi_volume = int(max(0, min(100, round(float(volume) * 100))))
         script = (
             "Add-Type -AssemblyName System.Speech;"
             "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+            f"$s.Rate={sapi_rate};$s.Volume={sapi_volume};"
+            + (f"try{{$s.SelectVoice({wanted_voice!r})}}catch{{}};" if wanted_voice else "")
+            +
             f"$s.SetOutputToWaveFile('{path}');"
             "$s.Speak([Console]::In.ReadToEnd());"
             "$s.Dispose()"
@@ -128,7 +145,11 @@ def resolve_audio_device(name_substring: str, *, want: str) -> int:
     return matches[0][0]
 
 
-def play_wav_bytes_to_device(wav_bytes: bytes, device_index: int) -> float:
+def play_wav_bytes_to_device(
+    wav_bytes: bytes,
+    device_index: int,
+    cancellation: object | Callable[[], bool] | None = None,
+) -> float:
     """Play a synthesized WAV out to a specific device (e.g. a cable's
     playback side) instead of decoding it into the in-page WebAudio patch.
     Returns the clip duration in seconds. Blocks until playback finishes.
@@ -157,6 +178,17 @@ def play_wav_bytes_to_device(wav_bytes: bytes, device_index: int) -> float:
 
     import numpy as np
     import sounddevice as sd
+
+    def cancelled() -> bool:
+        if cancellation is None:
+            return False
+        if callable(cancellation):
+            return bool(cancellation())
+        is_set = getattr(cancellation, "is_set", None)
+        return bool(is_set()) if callable(is_set) else False
+
+    if cancelled():
+        raise AudioPlaybackCancelled("physical audio playback cancelled")
 
     with wave.open(io.BytesIO(wav_bytes), "rb") as reader:
         frames = reader.readframes(reader.getnframes())
@@ -189,10 +221,20 @@ def play_wav_bytes_to_device(wav_bytes: bytes, device_index: int) -> float:
     with sd.OutputStream(samplerate=target_rate, device=device_index, channels=out_channels, dtype="float32", blocksize=blocksize) as stream:
         index = 0
         while index < frame_count:
+            if cancelled():
+                abort = getattr(stream, "abort", None)
+                if callable(abort):
+                    abort()
+                raise AudioPlaybackCancelled("physical audio playback cancelled")
             chunk = samples[index:index + blocksize]
             if len(chunk) < blocksize:
                 pad = np.zeros((blocksize - len(chunk), out_channels), dtype="float32")
                 chunk = np.vstack([chunk, pad])
             stream.write(chunk)
             index += blocksize
+        if cancelled():
+            abort = getattr(stream, "abort", None)
+            if callable(abort):
+                abort()
+            raise AudioPlaybackCancelled("physical audio playback cancelled")
     return duration
