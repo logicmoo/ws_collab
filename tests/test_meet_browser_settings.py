@@ -218,6 +218,8 @@ def test_start_meet_bridge_uses_persisted_runtime_role_bindings(
     assert captured["argv"].count("host=0") == 1
     assert captured["argv"].count("companion=0") == 1
     assert "https://meet.google.com/abc-defg-hij" in captured["argv"]
+    assert "WS_COLLAB_TOKEN" not in " ".join(captured["argv"])
+    assert captured["kwargs"]["env"]["WS_COLLAB_TOKEN"] in service.config.tokens
 
 
 def test_server_managed_join_starts_offline_bridge(service, monkeypatch) -> None:

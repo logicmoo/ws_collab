@@ -21,15 +21,15 @@ Two honest simplifications versus the original in-process mailbox client:
   used a named durable cursor via the mailbox_chat client). This client
   tracks "highest message id seen" purely in memory for the lifetime of one
   bridge process, which is sufficient for a live control channel (/join,
-  /new, /say) -- those are one-off commands, not a transcript of record. The
-  actual transcript of record is the STT pipeline via ``/captions``, which
-  ws_collab's own ``google_meet`` STT driver already resolves through the
-  normal disambiguator/timeline machinery with full durability.
+  /new, /say) -- those are one-off commands, not a transcript of record.
+  Finalized captions are pushed into ws_collab's STT ingest route as
+  ``google_meet`` and resolved through the normal durable transcript pipeline.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from typing import Any
@@ -38,9 +38,16 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8802/ws_collab"
 
 
 class MailboxClient:
-    def __init__(self, base_url: str = DEFAULT_BASE_URL, *, timeout: float = 5.0):
+    def __init__(
+        self,
+        base_url: str = DEFAULT_BASE_URL,
+        *,
+        timeout: float = 5.0,
+        token: str | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.token = token if token is not None else os.environ.get("WS_COLLAB_TOKEN", "")
         self._last_seen_id: dict[str, str | None] = {}
 
     def _call(self, path: str, *, method: str = "GET", body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -49,6 +56,8 @@ class MailboxClient:
         request = urllib.request.Request(url, data=data, method=method)
         if data is not None:
             request.add_header("content-type", "application/json")
+        if self.token:
+            request.add_header("authorization", f"Bearer {self.token}")
         with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - local trusted ws_collab server
             return json.loads(response.read().decode("utf-8"))
 
@@ -95,3 +104,28 @@ class MailboxClient:
         if messages:
             self._last_seen_id[mailbox] = messages[-1].get("id")
         return fresh
+
+    def ingest_transcript(
+        self,
+        text: str,
+        *,
+        correlation_id: str,
+        source_kind: str,
+        audio_meta: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Push one finalized Meet caption into ws_collab's STT pipeline."""
+        return self._call(
+            "/v1/stt/ingest",
+            method="POST",
+            body={
+                "engine": "google_meet",
+                "text": text,
+                "correlation_id": correlation_id,
+                "confidence": 0.75,
+                "is_final": True,
+                "language": "en",
+                "source_kind": source_kind,
+                "resolve": True,
+                "audio_meta": audio_meta,
+            },
+        )

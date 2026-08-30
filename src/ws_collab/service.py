@@ -726,6 +726,21 @@ class WsCollabService:
             ])
         log_path = Path(self.config.state_dir) / "meet_bridge.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        process_env = None
+        if not self.config.auth_disabled:
+            import os
+
+            token = next(
+                (
+                    value
+                    for value, descriptor in self.config.tokens.items()
+                    if descriptor.get("role") in {"worker", "operator", "admin"}
+                ),
+                "",
+            )
+            if token:
+                process_env = os.environ.copy()
+                process_env["WS_COLLAB_TOKEN"] = token
         with log_path.open("ab") as log:
             self._meet_bridge_process = subprocess.Popen(
                 argv,
@@ -733,6 +748,7 @@ class WsCollabService:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                env=process_env,
             )
         return {
             "ok": True,

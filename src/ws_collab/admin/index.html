@@ -432,7 +432,7 @@
     <section class="page" data-page="stt">
       <div class="toolbar">
         <button class="primary" id="stt-refresh">Refresh</button>
-        <button id="stt-mic" title="Use the browser's Web Speech API to recognize your mic in real time">🎤 Start listening</button>
+        <button id="stt-mic" title="Run a separate browser Web Speech microphone test; this does not use the Google Meet driver">🎤 Start browser Web Speech</button>
         <select id="stt-mic-mode" title="Whether the recognizer is allowed to stop itself">
           <option value="continuous" selected>Continuous (never stops itself; auto-restarts)</option>
           <option value="single">Single utterance (stops itself when done)</option>
@@ -456,7 +456,7 @@
       </div>
       <div class="panel-body">
         <div class="panel">
-          <div class="panel-title">Live engine hypotheses (server-side capture → each engine → disambiguator, updates in real time)</div>
+          <div class="panel-title">Server STT drivers (server audio → configured drivers such as google_meet → disambiguator)</div>
           <div class="panel-content">
             <div id="stt-engine-hint" class="hint">Waiting for server capabilities…</div>
             <div id="stt-engine-body"></div>
@@ -465,15 +465,16 @@
       </div>
       <div class="panel-body">
         <div class="panel">
-          <div class="panel-title">Live recognition (browser mic → external ingest bridge, real-time)</div>
+          <div class="panel-title">Browser Web Speech (separate browser mic recognizer → server ingest as web_speech)</div>
           <div class="panel-content">
             <div id="stt-live-log" style="max-height:180px;overflow-y:auto"></div>
-            <div id="stt-live-partial" class="hint" style="min-height:1.4em;font-style:italic;margin-top:6px">Click "Start listening" and speak…</div>
+            <div id="stt-live-partial" class="hint" style="min-height:1.4em;font-style:italic;margin-top:6px">Click "Start browser Web Speech" and speak…</div>
           </div>
         </div>
       </div>
       <div class="toolbar">
-        <input type="text" id="stt-engine" placeholder="engine" value="external" style="width:120px" />
+        <span class="hint">Manual/API transcript:</span>
+        <input type="text" id="stt-engine" placeholder="engine" value="manual" style="width:120px" />
         <input type="text" id="stt-lang" placeholder="language" value="en" style="width:80px" />
         <input type="number" id="stt-conf" placeholder="confidence" value="0.9" min="0" max="1" step="0.05" style="width:90px" />
         <label class="hint"><input type="checkbox" id="stt-final" checked /> final</label>

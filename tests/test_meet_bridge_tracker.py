@@ -43,6 +43,37 @@ def test_empty_poll_does_not_consume_the_cold_start_baseline() -> None:
     assert emits == []
 
 
+def test_cold_start_waits_for_incremental_caption_history_to_finish_loading() -> None:
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    tracker = CaptionTracker(settle=1.2, clock=clock)
+    emits, emit = _recorder()
+    old = [
+        _row("row1", "Old sentence one."),
+        _row("row2", "Old sentence two."),
+        _row("row3", "Old sentence three."),
+    ]
+
+    tracker.update(old[:1], ["row1"], emit)
+    now = 0.2
+    tracker.update(old[:2], ["row1", "row2"], emit)
+    now = 0.4
+    tracker.update(old, ["row1", "row2", "row3"], emit)
+    now = 1.7
+    tracker.update(old, ["row1", "row2", "row3"], emit)
+    assert emits == []
+
+    now = 1.8
+    current = [*old, _row("row4", "A new task.")]
+    tracker.update(current, ["row1", "row2", "row3", "row4"], emit)
+    now = 3.1
+    tracker.update(current, ["row1", "row2", "row3", "row4"], emit)
+    assert emits == [("row4", "Alice", "A new task.", True, None)]
+
+
 def test_growth_waits_for_a_complete_sentence() -> None:
     tracker = _tracker()
     emits, emit = _recorder()

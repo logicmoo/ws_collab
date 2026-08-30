@@ -84,6 +84,31 @@ class CaptionTracker:
         # newly said -- baseline it silently instead of relaying it as a
         # wall of "new" updates every single time the bridge restarts.
         self.baselined = False
+        self._baseline_warming = False
+        self._baseline_changed_at = 0.0
+        self._baseline_snapshot: tuple[tuple[str, str, str], ...] = ()
+
+    @staticmethod
+    def _snapshot(rows: list[dict[str, str]]) -> tuple[tuple[str, str, str], ...]:
+        return tuple(
+            (row["key"], row["speaker"], row["text"].strip())
+            for row in rows
+        )
+
+    def _replace_baseline(self, rows: list[dict[str, str]], now: float) -> None:
+        self.raw.clear()
+        self.settled_len.clear()
+        self.active_key.clear()
+        self.clone_seq.clear()
+        self.speakers.clear()
+        self.changed_at.clear()
+        self.replaces.clear()
+        for row in rows:
+            text = row["text"].strip()
+            self.raw[row["key"]] = text
+            self.settled_len[row["key"]] = len(text)
+            self.speakers[row["key"]] = row["speaker"]
+            self.changed_at[row["key"]] = now
 
     def _queue_completed(
         self,
@@ -111,20 +136,30 @@ class CaptionTracker:
         self.replaces[dom_key] = replaces
 
     def update(self, rows: list[dict[str, str]], live_keys: list[str], emit) -> None:
+        now = self._clock()
         if not self.baselined:
             if not rows:
                 return
             self.baselined = True
-            now = self._clock()
-            for row in rows:
-                self.raw[row["key"]] = row["text"]
-                self.settled_len[row["key"]] = len(row["text"])
-                self.speakers[row["key"]] = row["speaker"]
-                self.changed_at[row["key"]] = now
+            self._baseline_snapshot = self._snapshot(rows)
+            self._baseline_changed_at = now
+            self._baseline_warming = self.settle > 0 and any(
+                text for _, _, text in self._baseline_snapshot
+            )
+            self._replace_baseline(rows, now)
             return
+        if self._baseline_warming:
+            snapshot = self._snapshot(rows)
+            if snapshot != self._baseline_snapshot:
+                self._baseline_snapshot = snapshot
+                self._baseline_changed_at = now
+                self._replace_baseline(rows, now)
+                return
+            if now - self._baseline_changed_at < self.settle:
+                return
+            self._baseline_warming = False
         seen_keys = set()
         active_dom_key = live_keys[-1] if live_keys else (rows[-1]["key"] if rows else None)
-        now = self._clock()
         for row in rows:
             dom_key, speaker, text = row["key"], row["speaker"], row["text"]
             text = text.strip()

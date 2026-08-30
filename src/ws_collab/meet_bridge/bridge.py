@@ -566,6 +566,16 @@ def main() -> None:
             "source": "google-meet-captions", "speaker": speaker, "key": key,
             "final": final, "replaces": replaces, "meetingUrl": meeting_url_now,
         }
+        if final:
+            try:
+                mailbox.ingest_transcript(
+                    text,
+                    correlation_id=f"meet-caption:{room_id(meeting_url_now) or 'unknown'}:{key}",
+                    source_kind="operator" if speaker == args.self_name else "unknown",
+                    audio_meta=dict(full_meta),
+                )
+            except Exception as error:  # noqa: BLE001
+                print(f"[stt] google_meet ingest failed: {error}", file=sys.stderr)
         for recipient in recipients:
             try:
                 mailbox.send(recipient, line, sender=sender, metadata=dict(full_meta))

@@ -143,6 +143,10 @@ caption row. The bridge therefore keeps the entire active row buffered until it
 stops changing for `--settle` seconds. It releases the buffer immediately if
 Meet advances to a newer row or removes the old row.
 
+Each finalized caption is pushed into `/ws_collab/v1/stt/ingest` with engine
+`google_meet`, so the STT page and durable transcript stream identify Meet as
+the source. Browser Web Speech remains a separate optional microphone test.
+
 The Chrome/CDP automation remains in a child worker because it has blocking
 browser and audio loops. Its loopback-only port (`48699` by default) is an
 internal implementation detail, so the UI does not need direct access and a

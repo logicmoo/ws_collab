@@ -271,8 +271,9 @@ function applyControlState(page, saved) {
     if (!node || node.type === "password" || isSensitiveStateName(node.id || node.name || "")) return;
     if (node.dataset && node.dataset.role) return;
     if (row.value !== undefined && "value" in node && node.type !== "file") {
-      const canApply = node.tagName !== "SELECT" || [...node.options].some((option) => option.value === row.value);
-      if (canApply && node.value !== row.value) node.value = row.value;
+      const savedValue = node.id === "stt-engine" && row.value === "external" ? "manual" : row.value;
+      const canApply = node.tagName !== "SELECT" || [...node.options].some((option) => option.value === savedValue);
+      if (canApply && node.value !== savedValue) node.value = savedValue;
     }
     if (row.checked !== undefined && "checked" in node && node.checked !== !!row.checked) {
       node.checked = !!row.checked;
@@ -3239,6 +3240,14 @@ function startSttSensitivityPolling() {
 // stream in ingest() -- no polling, no page reload needed.
 const sttEngineRows = new Map();
 
+function sttEngineLabel(engine) {
+  if (engine === "google_meet") return "google_meet (Meet driver)";
+  if (engine === "web_speech") return "web_speech (browser)";
+  if (engine === "external") return "external (legacy/API ingest)";
+  if (engine === "manual") return "manual ingest";
+  return engine;
+}
+
 function sttEngineTbody() {
   let tbody = document.querySelector("#stt-engine-body tbody");
   if (tbody) return tbody;
@@ -3255,7 +3264,7 @@ function sttEngineRow(engine) {
   const tbody = sttEngineTbody();
   const tr = el("tr");
   if (engine === "disambiguator") tr.classList.add("stt-final-row");
-  const tdEngine = el("td"); tdEngine.appendChild(mono(engine));
+  const tdEngine = el("td"); tdEngine.appendChild(mono(sttEngineLabel(engine)));
   const tdStatus = el("td"); tdStatus.appendChild(badge("waiting…", ""));
   const tdConf = el("td"); tdConf.textContent = "—";
   const tdText = el("td"); tdText.textContent = "—";
@@ -3274,7 +3283,7 @@ function primeSttEngineRows() {
   api(`${V1}/status`).then((status) => {
     const engines = (status.subsystems && status.subsystems.stt && status.subsystems.stt.engines) || [];
     $("stt-engine-hint").textContent = engines.length
-      ? `Configured engines: ${engines.join(", ")}, then disambiguator. Speak into the mic (Devices page → Start listening) to see live results.`
+      ? `Configured server drivers: ${engines.join(", ")}, then disambiguator. google_meet reads the Meet bridge; browser Web Speech is a separate test and appears as web_speech.`
       : "No STT engines configured.";
     engines.forEach((name) => sttEngineRow(name));
     sttEngineRow("disambiguator");
@@ -3313,7 +3322,7 @@ async function sttIngest(text, opts = {}) {
     await api(`${V1}/stt/ingest`, {
       method: "POST",
       body: {
-        engine: $("stt-engine").value || "external",
+        engine: opts.engine || $("stt-engine").value || "manual",
         text: trimmed,
         language: $("stt-lang").value || "en",
         confidence: opts.confidence != null ? opts.confidence : Number($("stt-conf").value || 0.9),
@@ -3393,7 +3402,7 @@ function startSttRecognizer(mode) {
   recognizer.onstart = () => {
     lastError = null;
     status.textContent = mode === "single" ? "🔴 listening for one utterance…" : "🔴 listening (won't stop itself)…";
-    $("stt-mic").textContent = "⏹ Stop listening";
+    $("stt-mic").textContent = "⏹ Stop browser Web Speech";
     $("stt-live-partial").textContent = "…";
     setSpeechIndicator("🗣️ speaking…", "ok");
   };
@@ -3421,8 +3430,8 @@ function startSttRecognizer(mode) {
     }
     sttShouldContinue = false;
     status.textContent = mode === "single" ? `stopped: ${reason}` : `stopped by user (${reason})`;
-    $("stt-mic").textContent = "🎤 Start listening";
-    $("stt-live-partial").textContent = "Click \"Start listening\" and speak…";
+    $("stt-mic").textContent = "🎤 Start browser Web Speech";
+    $("stt-live-partial").textContent = "Click \"Start browser Web Speech\" and speak…";
     setSpeechIndicator("", "");
   };
   recognizer.onresult = (event) => {
@@ -3434,11 +3443,18 @@ function startSttRecognizer(mode) {
         $("stt-live-partial").textContent = "…";
         sttLiveLog(transcript);
         $("stt-text").value = transcript;
-        sttIngest(transcript, { is_final: true, confidence });
+        sttIngest(transcript, { engine: "web_speech", is_final: true, confidence });
       } else {
         // Interim hypothesis: reflect it live as it changes, word by word.
         $("stt-live-partial").textContent = transcript;
-        if ($("stt-send-partials").checked) sttIngest(transcript, { is_final: false, confidence, silent: true });
+        if ($("stt-send-partials").checked) {
+          sttIngest(transcript, {
+            engine: "web_speech",
+            is_final: false,
+            confidence,
+            silent: true,
+          });
+        }
       }
     }
   };
@@ -3465,8 +3481,8 @@ function toggleSttMic() {
     if (sttRecognizer) sttRecognizer.stop();
     else {
       status.textContent = "stopped by user";
-      $("stt-mic").textContent = "🎤 Start listening";
-      $("stt-live-partial").textContent = "Click \"Start listening\" and speak…";
+      $("stt-mic").textContent = "🎤 Start browser Web Speech";
+      $("stt-live-partial").textContent = "Click \"Start browser Web Speech\" and speak…";
       setSpeechIndicator("", "");
     }
     return;
