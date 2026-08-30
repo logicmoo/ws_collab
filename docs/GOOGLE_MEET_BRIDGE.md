@@ -30,6 +30,12 @@ WebAudio source (or, if `--mic-select-device`/`--tts-output-device` are
 configured, a real virtual-cable device) that only carries `/say` speech,
 never the room.
 
+Tab uniqueness is scoped by the composite `(connector, SSO identity)`, never by
+browser-wide URL similarity. Reopening an account, restarting the bridge, or
+moving a role to another meeting focuses and, when needed, navigates that
+scope's existing tab instead of opening a duplicate. Tabs belonging to another
+connector or another SSO role/account remain intentionally separate.
+
 ## Running it
 
 ```
@@ -142,6 +148,21 @@ Meet frequently revises the punctuation and wording at the end of its active
 caption row. The bridge therefore keeps the entire active row buffered until it
 stops changing for `--settle` seconds. It releases the buffer immediately if
 Meet advances to a newer row or removes the old row.
+
+Caption DOM updates are delivered primarily over a CDP push channel:
+`Runtime.addBinding("__wsCollabCaptionPush")` installs a page-side
+`MutationObserver` that sends the same payload shape as the `/captions` polling
+reader. Polling remains as a safety net and slows down while each active role is
+receiving recent push frames. `/captions` and `/health` expose
+`captionTransport`, `lastPushAt`, `lastPushIso`, `pushFrameCount`, and
+`captionTransportByRole` so consumers can see whether HOST and COMPANION are
+currently on `push` or `poll`.
+
+If CDP bindings ever stop working, the documented fallback is a page-side
+WebSocket to the existing server endpoint `ws://127.0.0.1:8802/ws_collab/ws`.
+That alternative is not enabled by default because Google Meet's CSP blocks
+localhost `connect-src`; it would require `Page.setBypassCSP` before injecting
+the page WebSocket client.
 
 Each finalized caption is pushed into `/ws_collab/v1/stt/ingest` with engine
 `google_meet`, so the STT page and durable transcript stream identify Meet as

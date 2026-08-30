@@ -22,6 +22,7 @@ SOURCE_OPERATOR = "operator"
 SOURCE_AGENT = "agent"
 SOURCE_SYSTEM_TTS = "system_tts"
 SOURCE_EXTERNAL = "external"
+SOURCE_COMPANION_HEARD = "companion_heard"
 SOURCE_UNKNOWN = "unknown"
 
 ECHO_POLICIES = {
@@ -136,6 +137,10 @@ class SourceClassifier:
                 reasons=reasons,
                 should_execute=bool(executing),
             )
+
+        if segment.source_kind == SOURCE_COMPANION_HEARD:
+            reasons.append("segment source metadata = companion-heard meeting audio")
+            return Classification(source=SOURCE_EXTERNAL, confidence=0.75, reasons=reasons, should_execute=False)
 
         # 5) Otherwise external/unknown: never auto-execute consequential speech.
         reasons.append("no corroborating evidence for a trusted source")

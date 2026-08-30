@@ -32,3 +32,5 @@ Thumbs.db
 *.bak
 
 .pytest_tmp/
+
+.pytest-tmp/

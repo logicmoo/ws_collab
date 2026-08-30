@@ -28,7 +28,7 @@ class AudioSegment:
     duration_ms: int = 0
     samples: Any = None  # np.ndarray | bytes | None
     reference_text: str | None = None  # synthetic/loopback ground truth, if known
-    source_kind: str = "external"  # operator | agent | system | external | unknown
+    source_kind: str = "external"  # operator | agent | system | companion_heard | external | unknown
     is_loopback: bool = False
     is_replay: bool = False
     is_diagnostic: bool = False

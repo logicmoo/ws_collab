@@ -16,12 +16,15 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from websocket import create_connection  # websocket-client
+from websocket import WebSocketTimeoutException
 
 DEFAULT_CDP = "http://127.0.0.1:9222"
 DEFAULT_POPUP_PORT = 9223
@@ -31,6 +34,7 @@ DEFAULT_PROFILE = Path(
     os.environ.get("WS_COLLAB_MEET_PROFILE_DIR")
     or (_PLUGIN_ROOT / "collab_state" / "meet_bridge_profile")
 )
+DEFAULT_SSO_AUTHUSER_PROBE_SLOTS = (0, 1)
 
 BROWSER_CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -97,7 +101,7 @@ def ensure_default_profile_migrated(profile: Path | None = None) -> Path:
         return target
     try:
         shutil.copytree(old, target)
-        print(f"[bridge] migrated existing Chrome profile from {old} to {target}")
+        print(f"[bridge] migrated existing Chrome profile from {old} to {target}", flush=True)
     except Exception:
         pass
     return target
@@ -177,21 +181,142 @@ def _http_touch(url: str, *, method: str = "GET", timeout: float = 5.0) -> None:
 
 
 class CdpTab:
-    def __init__(self, ws_url: str) -> None:
+    def __init__(
+        self,
+        ws_url: str,
+        event_handler: Callable[[str, dict[str, Any]], None] | None = None,
+        error_handler: Callable[[str], None] | None = None,
+    ) -> None:
         # suppress_origin: Chrome rejects DevTools websocket handshakes that
         # carry a browser-style Origin header with HTTP 403.
-        self.ws = create_connection(ws_url, timeout=10, suppress_origin=True)
+        self.ws = create_connection(ws_url, timeout=10, suppress_origin=True, enable_multithread=True)
         self._id = 0
+        self._send_lock = threading.Lock()
+        self._condition = threading.Condition()
+        self._responses: dict[int, dict[str, Any]] = {}
+        self._events: list[dict[str, Any]] = []
+        self._event_handler = event_handler
+        self._error_handler = error_handler
+        self._logged_recv_problems: set[str] = set()
+        self._closed = False
+        self._recv_error: Exception | None = None
+        self._reader = threading.Thread(target=self._recv_loop, daemon=True)
+        self._reader.start()
+
+    def _log_recv_problem(self, key: str, message: str) -> None:
+        with self._condition:
+            if key in self._logged_recv_problems:
+                return
+            self._logged_recv_problems.add(key)
+        handler = self._error_handler
+        try:
+            if handler is not None:
+                handler(message)
+            else:
+                print(f"[cdp] {message}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _text_frame(raw: Any) -> str:
+        if raw is None:
+            return ""
+        if isinstance(raw, (bytes, bytearray)):
+            return bytes(raw).decode("utf-8", errors="replace")
+        if isinstance(raw, str):
+            return raw
+        return str(raw)
+
+    def _recv_loop(self) -> None:
+        while True:
+            with self._condition:
+                if self._closed:
+                    return
+            try:
+                raw = self.ws.recv()
+            except WebSocketTimeoutException:
+                self._log_recv_problem("timeout", "DevTools receive timed out once; continuing")
+                continue
+            except Exception as error:  # noqa: BLE001 - connection lifecycle is best-effort.
+                with self._condition:
+                    if self._closed:
+                        return
+                    self._recv_error = error
+                    self._condition.notify_all()
+                self._log_recv_problem("socket", f"DevTools receive stopped: {error}")
+                return
+            text = self._text_frame(raw).strip()
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+            except Exception as error:
+                self._log_recv_problem("json", f"DevTools sent an invalid JSON frame; ignoring ({error})")
+                continue
+            if not isinstance(payload, dict):
+                self._log_recv_problem("shape", "DevTools sent a non-object frame; ignoring")
+                continue
+            payload_id = payload.get("id")
+            if payload_id is not None:
+                try:
+                    response_id = int(payload_id)
+                except (TypeError, ValueError):
+                    continue
+                with self._condition:
+                    self._responses[response_id] = payload
+                    self._condition.notify_all()
+                continue
+            handler = self._event_handler
+            with self._condition:
+                self._events.append(payload)
+                del self._events[:-1000]
+                self._condition.notify_all()
+            if handler is not None:
+                try:
+                    handler(str(payload.get("method") or ""), dict(payload.get("params") or {}))
+                except Exception:
+                    pass
+
+    def set_event_handler(self, handler: Callable[[str, dict[str, Any]], None] | None) -> None:
+        self._event_handler = handler
+
+    def set_error_handler(self, handler: Callable[[str], None] | None) -> None:
+        self._error_handler = handler
+
+    def drain_events(self) -> list[dict[str, Any]]:
+        with self._condition:
+            events = list(self._events)
+            self._events.clear()
+            return events
 
     def call(self, method: str, params: dict[str, Any] | None = None, timeout: float = 10.0) -> Any:
-        self._id += 1
-        wanted = self._id
-        self.ws.send(json.dumps({"id": wanted, "method": method, "params": params or {}}))
+        with self._send_lock:
+            with self._condition:
+                if self._closed:
+                    raise RuntimeError(f"CDP connection is closed before {method}")
+            self._id += 1
+            wanted = self._id
+            try:
+                self.ws.send(json.dumps({"id": wanted, "method": method, "params": params or {}}))
+            except Exception as error:  # noqa: BLE001
+                self._log_recv_problem("send", f"DevTools send failed: {error}")
+                raise
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            payload = json.loads(self.ws.recv())
-            if payload.get("id") == wanted:
-                return payload.get("result")
+        with self._condition:
+            while time.time() < deadline:
+                payload = self._responses.pop(wanted, None)
+                if payload is not None:
+                    if "error" in payload:
+                        raise RuntimeError(f"CDP {method} failed: {payload.get('error')}")
+                    return payload.get("result")
+                if self._recv_error is not None:
+                    raise RuntimeError(f"CDP connection closed while waiting for {method}: {self._recv_error}")
+                if self._closed:
+                    raise RuntimeError(f"CDP connection closed while waiting for {method}")
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._condition.wait(remaining)
         raise TimeoutError(f"CDP {method} timed out")
 
     def evaluate(self, expression: str, await_promise: bool = False, timeout: float = 10.0) -> Any:
@@ -209,10 +334,15 @@ class CdpTab:
         self.call("Page.bringToFront")
 
     def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
         try:
             self.ws.close()
         except Exception:
             pass
+        if self._reader.is_alive():
+            self._reader.join(timeout=1.0)
 
 
 def list_tabs(cdp: str) -> list[dict[str, Any]]:
@@ -260,6 +390,51 @@ def open_url(cdp_endpoint: str, target: str) -> dict[str, Any] | None:
             return None
 
 
+def reuse_or_open_tab(
+    cdp_endpoint: str,
+    target: str,
+    *,
+    existing_in_scope: dict[str, Any] | None = None,
+    navigate_existing: bool = False,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Reuse only a caller-selected connector+SSO tab, never globally dedupe."""
+    controlled = existing_in_scope
+    if (
+        existing_in_scope
+        and not existing_in_scope.get("webSocketDebuggerUrl")
+        and existing_in_scope.get("id")
+    ):
+        controlled = next(
+            (
+                tab
+                for tab in list_tabs(cdp_endpoint)
+                if str(tab.get("id") or "") == str(existing_in_scope.get("id") or "")
+            ),
+            existing_in_scope,
+        )
+    if controlled and controlled.get("webSocketDebuggerUrl"):
+        tab = CdpTab(controlled["webSocketDebuggerUrl"])
+        try:
+            if navigate_existing:
+                tab.call("Page.navigate", {"url": target})
+            tab.bring_to_front()
+        finally:
+            tab.close()
+        result = dict(controlled)
+        if navigate_existing:
+            result["url"] = target
+        return result, True
+
+    info = open_url(cdp_endpoint, target)
+    if info and info.get("webSocketDebuggerUrl"):
+        tab = CdpTab(info["webSocketDebuggerUrl"])
+        try:
+            tab.bring_to_front()
+        finally:
+            tab.close()
+    return info, False
+
+
 def close_tab(cdp_endpoint: str, tab_id: str) -> None:
     """Hang up a meeting tab by its CDP id (e.g. the previous meeting after
     /join or /new switches to a fresh one) -- best-effort, never raises."""
@@ -303,18 +478,28 @@ def scan_signed_in_sso_accounts(
     """Probe Google authuser slots and return only distinct live sign-ins."""
     accounts: list[dict[str, Any]] = []
     seen_emails: set[str] = set()
-    slots = authusers if authusers is not None else list(range(10))
-    for authuser in slots:
-        try:
-            existing_ids = {str(tab.get("id")) for tab in list_tabs(cdp_endpoint) if tab.get("id")}
-        except Exception:
-            existing_ids = set()
-        info = open_url(cdp_endpoint, f"https://myaccount.google.com/?authuser={authuser}")
-        if not info or not info.get("webSocketDebuggerUrl"):
-            break
-        probe = CdpTab(info["webSocketDebuggerUrl"])
-        account: dict[str, Any] | None = None
-        try:
+    automatic_slots = authusers is None
+    slots = list(authusers) if authusers is not None else list(DEFAULT_SSO_AUTHUSER_PROBE_SLOTS)
+    try:
+        existing_ids = {str(tab.get("id")) for tab in list_tabs(cdp_endpoint) if tab.get("id")}
+    except Exception:
+        existing_ids = set()
+    probe: CdpTab | None = None
+    probe_info: dict[str, Any] | None = None
+    try:
+        for authuser in slots:
+            target = f"https://myaccount.google.com/?authuser={authuser}"
+            if probe is None:
+                probe_info = open_url(cdp_endpoint, target)
+                if not probe_info or not probe_info.get("webSocketDebuggerUrl"):
+                    break
+                probe = CdpTab(probe_info["webSocketDebuggerUrl"])
+            else:
+                try:
+                    probe.call("Page.navigate", {"url": target})
+                except Exception:
+                    break
+            account: dict[str, Any] | None = None
             deadline = time.time() + timeout
             while time.time() < deadline:
                 candidate = read_google_account(probe)
@@ -324,23 +509,26 @@ def scan_signed_in_sso_accounts(
                     account["email"] = email
                     break
                 time.sleep(0.25)
+            if account is None:
+                if automatic_slots:
+                    break
+                continue
+            email = str(account["email"])
+            if email in seen_emails:
+                if automatic_slots:
+                    break
+                continue
+            seen_emails.add(email)
+            account["authuser"] = authuser
+            accounts.append(account)
+    finally:
+        tab_id = str((probe_info or {}).get("id") or "")
+        try:
+            if probe is not None:
+                probe.close()
         finally:
-            probe.close()
-            tab_id = str(info.get("id") or "")
             if tab_id and tab_id not in existing_ids:
                 close_tab(cdp_endpoint, tab_id)
-        if account is None:
-            if authusers is None:
-                break
-            continue
-        email = str(account["email"])
-        if email in seen_emails:
-            if authusers is None:
-                break
-            continue
-        seen_emails.add(email)
-        account["authuser"] = authuser
-        accounts.append(account)
     return accounts
 
 
@@ -371,14 +559,24 @@ def browser_profile_root(cdp_endpoint: str, *, timeout: float = 3.0) -> Path | N
     return None
 
 
-def find_sso_tab(cdp_endpoint: str, email: str) -> dict[str, Any] | None:
-    """Find an existing page for an account without creating or focusing one."""
+def _find_account_tab(
+    cdp_endpoint: str,
+    email: str,
+    *,
+    sso_connector_only: bool,
+) -> dict[str, Any] | None:
     wanted_email = str(email or "").strip().lower()
     if not wanted_email:
         return None
     for info in list_tabs(cdp_endpoint):
         if info.get("type") != "page" or not info.get("webSocketDebuggerUrl"):
             continue
+        url = str(info.get("url") or "")
+        if sso_connector_only:
+            if not re.match(r"https?://(?:accounts|myaccount)\.google\.com(?:[/:?#]|$)", url, re.IGNORECASE):
+                continue
+            if "accountchooser" in url.lower():
+                continue
         tab = CdpTab(info["webSocketDebuggerUrl"])
         try:
             account = read_google_account(tab)
@@ -397,22 +595,33 @@ def find_sso_tab(cdp_endpoint: str, email: str) -> dict[str, Any] | None:
     return None
 
 
+def find_sso_tab(cdp_endpoint: str, email: str) -> dict[str, Any] | None:
+    """Find any existing page for an account without creating or focusing one."""
+    return _find_account_tab(cdp_endpoint, email, sso_connector_only=False)
+
+
+def find_sso_connector_tab(cdp_endpoint: str, email: str) -> dict[str, Any] | None:
+    """Find this identity's SSO connector without consuming another connector."""
+    return _find_account_tab(cdp_endpoint, email, sso_connector_only=True)
+
+
+def find_add_account_tab(cdp_endpoint: str) -> dict[str, Any] | None:
+    """Find the unassigned add-account connector without consuming an SSO tab."""
+    for info in list_tabs(cdp_endpoint):
+        if info.get("type") != "page" or not info.get("webSocketDebuggerUrl"):
+            continue
+        url = str(info.get("url") or "")
+        if re.match(r"https?://accounts\.google\.com(?:[/:?#]|$)", url, re.IGNORECASE) and "accountchooser" in url.lower():
+            return info
+    return None
+
+
 def foreground_sso_tab(cdp_endpoint: str, email: str) -> dict[str, Any] | None:
     """Foreground an existing account page without creating a tab."""
     found = find_sso_tab(cdp_endpoint, email)
     if found is None:
         return None
-    info = next(
-        (tab for tab in list_tabs(cdp_endpoint) if str(tab.get("id") or "") == str(found.get("id") or "")),
-        None,
-    )
-    if not info or not info.get("webSocketDebuggerUrl"):
-        return None
-    tab = CdpTab(info["webSocketDebuggerUrl"])
-    try:
-        tab.bring_to_front()
-    finally:
-        tab.close()
+    reuse_or_open_tab(cdp_endpoint, str(found.get("url") or ""), existing_in_scope=found)
     return found
 
 
@@ -436,30 +645,18 @@ def launch_browser(args: Any) -> tuple[str, subprocess.Popen[bytes] | None]:
         )
         process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         label = Path(find_browser(args.browser)).name if getattr(args, "browser_backend", "windows") == "windows" else "WSL Chrome/Chromium"
-        print(f"[bridge] browser window opened ({label}, profile {profile})")
-        print("[bridge] pick your Google account in that window (SSO persists for next time)...")
+        print(f"[bridge] browser window opened ({label}, profile {profile})", flush=True)
+        print("[bridge] pick your Google account in that window (SSO persists for next time)...", flush=True)
         deadline = time.time() + 60
         while time.time() < deadline and not cdp_alive(cdp):
             time.sleep(0.5)
         if not cdp_alive(cdp):
             raise SystemExit("The launched browser never opened its DevTools port -- is another instance using the profile?")
         return cdp, process
-    elif args.meet or args.new:
-        # Browser already up: only open a NEW tab if one isn't already
-        # sitting on this exact meeting room. Otherwise every restart of
-        # just the python process (Chrome left running) clones a duplicate
-        # tab, and Meet -- seeing the same account twice -- offers a
-        # "Switch the call here / Join here too" prompt on the new one
-        # instead of just reattaching to the real, already-in-call tab.
-        target = getattr(args, "launch_url", None) or args.meet or "https://meet.google.com/new"
-        existing = find_meet_tab(cdp)
-        room = re.compile(r"meet\.google\.com/([a-z0-9-]+)", re.IGNORECASE)
-        target_match = room.search(target)
-        target_room = target_match.group(1) if target_match else None
-        existing_match = room.search(str(existing.get("url") or "")) if existing else None
-        existing_room = existing_match.group(1) if existing_match else None
-        if not (existing and target_room and target_room == existing_room):
-            open_url(cdp, target)
+    # An already-running profile already owns the shared browser window.
+    # Role/account-aware orchestration in bridge.main selects and focuses the
+    # correct connector tab after SSO preflight; opening here would race that
+    # selection and can create a duplicate tab for the same connector.
     return cdp, None
 
 
@@ -482,6 +679,6 @@ def wait_for_meet_tab(cdp: str, timeout: float = 900.0, require_room: bool = Fal
             return tab
         if not told:
             told = True
-            print("[bridge] waiting for a meet.google.com tab -- sign in and open the meeting in the popped-up window...")
+            print("[bridge] waiting for a meet.google.com tab -- sign in and open the meeting in the popped-up window...", flush=True)
         time.sleep(1.5)
     raise SystemExit("Timed out waiting for a Google Meet tab (15 min).")

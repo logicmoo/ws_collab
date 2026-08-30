@@ -262,3 +262,43 @@ def test_external_recognizer_can_be_ingested(service) -> None:
     assert result["resolved"]["resolved_text"] == "deploy the staging build"
     hypotheses = service.read_events(HYPOTHESES, limit=100)["events"]
     assert any(e["data"].get("engine") == "external-asr" for e in hypotheses)
+
+
+def test_companion_heard_audio_is_tagged_and_skips_google_meet_engine(service) -> None:
+    class StaticEngine:
+        model = "m"
+        is_remote = False
+
+        def __init__(self, name: str):
+            self.name = name
+
+        async def transcribe(self, segment, on_partial=None):
+            return _hyp(self.name, "meeting speech")
+
+    service.stt_engines = [StaticEngine("google_meet"), StaticEngine("whisper:tiny.en")]
+    segment = AudioSegment(
+        correlation_id="companion-heard-1",
+        reference_text="meeting speech",
+        source_kind="companion_heard",
+        route={
+            "source": "meet-companion-incoming",
+            "audio_source": "companion_heard_meeting_audio",
+            "capture": "secondary",
+            "exclude_engines": ["google_meet"],
+        },
+    )
+
+    result = asyncio.run(service.process_segment(segment))
+
+    assert [hyp["engine"] for hyp in result["hypotheses"]] == ["whisper:tiny.en"]
+    assert result["classification"]["source"] == "external"
+    assert result["classification"]["should_execute"] is False
+
+    hypotheses = service.read_events(HYPOTHESES, limit=100)["events"]
+    final_events = [event for event in hypotheses if event["type"] == STT_FINAL_RESULT]
+    assert final_events[-1]["data"]["segment_source"] == "companion_heard_meeting_audio"
+    speech = service.read_events(SPEECH, limit=100)["events"]
+    heard = [event for event in speech if event["type"] == "HEARD_SPEECH"][-1]
+    assert heard["source_id"] == "meet-companion-incoming"
+    assert heard["source_kind"] == "companion_heard"
+    assert heard["data"]["segment"]["route"]["audio_source"] == "companion_heard_meeting_audio"

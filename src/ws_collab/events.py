@@ -131,7 +131,15 @@ WORKER_STATE_CHANGED = "WORKER_STATE_CHANGED"
 ALERT_RAISED = "ALERT_RAISED"
 ALERT_RECOVERED = "ALERT_RECOVERED"
 
-VALID_SOURCE_KINDS = {"operator", "agent", "system", "client", "worker", "unknown"}
+VALID_SOURCE_KINDS = {
+    "operator",
+    "agent",
+    "system",
+    "client",
+    "worker",
+    "companion_heard",
+    "unknown",
+}
 
 
 def utc_now_iso() -> str:

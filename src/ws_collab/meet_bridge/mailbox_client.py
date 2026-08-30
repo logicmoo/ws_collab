@@ -129,3 +129,19 @@ class MailboxClient:
                 "audio_meta": audio_meta,
             },
         )
+
+    def list_audio_devices(self) -> dict[str, Any]:
+        """Return ws_collab's audio device catalog."""
+        return self._call("/v1/audio/devices")
+
+    def secondary_capture_state(self) -> dict[str, Any]:
+        """Return the current companion-heard secondary capture state."""
+        return self._call("/v1/audio/secondary-capture")
+
+    def start_secondary_capture(self, device_id: str) -> dict[str, Any]:
+        """Start server-side secondary capture on the virtual cable input side."""
+        return self._call(
+            "/v1/audio/secondary-capture/start",
+            method="POST",
+            body={"device_id": device_id},
+        )

@@ -53,3 +53,21 @@ def test_final_caption_is_ingested_as_google_meet(monkeypatch) -> None:
     assert captured["body"]["engine"] == "google_meet"
     assert captured["body"]["text"] == "A complete Meet caption."
     assert captured["body"]["is_final"] is True
+
+
+def test_secondary_capture_start_uses_audio_endpoint(monkeypatch) -> None:
+    client = MailboxClient(token="worker-token")
+    captured = {}
+
+    def call(path, *, method="GET", body=None):
+        captured.update(path=path, method=method, body=body)
+        return {"listening": True, "device_id": "dev-1"}
+
+    monkeypatch.setattr(client, "_call", call)
+
+    result = client.start_secondary_capture("dev-1")
+
+    assert result["listening"] is True
+    assert captured["path"] == "/v1/audio/secondary-capture/start"
+    assert captured["method"] == "POST"
+    assert captured["body"] == {"device_id": "dev-1"}

@@ -215,11 +215,25 @@ class Config:
     # Virtual (emulated) read-only mailboxes: each projects a source (a disk JSON
     # file, or a `self:`/http endpoint) as a mailbox. Configure via
     # WS_COLLAB_VIRTUAL_MAILBOXES (a JSON list of {source, mailbox, purpose?}).
-    virtual_mailboxes: list[dict[str, str]] = field(default_factory=lambda: [
+    virtual_mailboxes: list[dict[str, Any]] = field(default_factory=lambda: [
         {
             "source": "self:mailbox/agents",
             "mailbox": "server-agents",
             "purpose": "Agents/users directory, emulated as a read-only stream.",
+        },
+        {
+            "source": "merge:conversation",
+            "mailbox": "workspace",
+            "purpose": "Workspace-facing conversation inbox for workbench suggestions and operator messages.",
+        },
+        {
+            "source": "merge:conversation",
+            "mailbox": "suggestions",
+            "purpose": "Suggestion messages projected from the shared conversation for the workspace.",
+            "rules": [
+                {"field": "any", "op": "regex", "value": "\\bsuggest(?:ion|ions|ed)?\\b", "action": "relay"},
+            ],
+            "policy": "drop",
         }
     ])
 

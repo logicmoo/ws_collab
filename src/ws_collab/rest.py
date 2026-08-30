@@ -819,6 +819,45 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             request.query_params.get("meeting_url", ""),
         )
 
+    @router.get(f"{mount}/meet/companion-click")
+    async def meet_companion_click(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(
+            service.get_meet_companion_click,
+            request.query_params.get("meeting_url", ""),
+        )
+
+    @router.post(f"{mount}/meet/companion-click")
+    async def set_meet_companion_click(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.set_meet_companion_click,
+            body.get("enabled", False),
+            body.get("interval_seconds", body.get("intervalSeconds")),
+            body.get("meeting_url", ""),
+            mode=body.get("mode"),
+            trigger=body.get("trigger"),
+            after_seconds=body.get("after_seconds", body.get("afterSeconds")),
+            silence_ms=body.get("silence_ms", body.get("silenceMs")),
+            min_gap_seconds=body.get("min_gap_seconds", body.get("minGapSeconds")),
+            max_wait_seconds=body.get("max_wait_seconds", body.get("maxWaitSeconds")),
+            audio_rms_threshold=body.get("audio_rms_threshold", body.get("audioRmsThreshold")),
+            click_ms=body.get("click_ms", body.get("clickMs")),
+            gain=body.get("gain"),
+            sound=body.get("sound"),
+            f0_hz=body.get("f0_hz", body.get("f0Hz")),
+            f1_hz=body.get("f1_hz", body.get("f1Hz")),
+            f2_hz=body.get("f2_hz", body.get("f2Hz")),
+        )
+
+    @router.delete(f"{mount}/meet/companion-click")
+    async def clear_meet_companion_click(request: Request) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.clear_meet_companion_click,
+            request.query_params.get("meeting_url", ""),
+        )
+
     @router.post(f"{mount}/meet/bridge/start")
     async def start_meet_bridge(
         request: Request,
@@ -841,7 +880,8 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         await _require(request, "viewer")
         return guarded(
             service.meet_bridge_captions,
-            request.query_params.get("since", "0") or "0",
+            since=request.query_params.get("since", "0") or "0",
+            from_end=request.query_params.get("fromEnd"),
         )
 
     @router.post(f"{mount}/meet/bridge/command")

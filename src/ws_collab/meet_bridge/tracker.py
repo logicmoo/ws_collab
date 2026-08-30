@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable
+from typing import Any
 
 # A sentence boundary: one or more .!? immediately followed by whitespace or
 # end-of-string. Deliberately simple (this is ASR captions, not copy-edited
@@ -86,12 +87,12 @@ class CaptionTracker:
         self.baselined = False
         self._baseline_warming = False
         self._baseline_changed_at = 0.0
-        self._baseline_snapshot: tuple[tuple[str, str, str], ...] = ()
+        self._baseline_snapshot: tuple[tuple[str, str], ...] = ()
 
     @staticmethod
-    def _snapshot(rows: list[dict[str, str]]) -> tuple[tuple[str, str, str], ...]:
+    def _snapshot(rows: list[dict[str, str]]) -> tuple[tuple[str, str], ...]:
         return tuple(
-            (row["key"], row["speaker"], row["text"].strip())
+            (row["speaker"], row["text"].strip())
             for row in rows
         )
 
@@ -109,6 +110,74 @@ class CaptionTracker:
             self.settled_len[row["key"]] = len(text)
             self.speakers[row["key"]] = row["speaker"]
             self.changed_at[row["key"]] = now
+
+    def _stabilize_recreated_row_keys(
+        self,
+        rows: list[dict[str, str]],
+        live_keys: list[str],
+    ) -> tuple[list[dict[str, str]], list[str], dict[str, str]]:
+        """Keep tracker keys stable when Meet recreates identical scroll-back DOM.
+
+        The JavaScript reader normally keys rows by DOM element identity. Some
+        Meet renders churn those elements even when the visible caption history
+        is unchanged. Without this aliasing, the tracker sees every old row as
+        "removed" and every replacement as "new" on each poll, replaying the
+        whole scroll-back repeatedly.
+        """
+        if not self.raw or not rows:
+            return rows, live_keys, {}
+        incoming_keys = {row["key"] for row in rows}
+        candidates: dict[tuple[str, str], list[str]] = {}
+        for key, text in self.raw.items():
+            if key in incoming_keys:
+                continue
+            signature = (self.speakers.get(key, "Speaker"), text.strip())
+            candidates.setdefault(signature, []).append(key)
+        if not candidates:
+            return rows, live_keys, {}
+        used: set[str] = set()
+        remap: dict[str, str] = {}
+        stabilized: list[dict[str, str]] = []
+        for row in rows:
+            key = row["key"]
+            text = row["text"].strip()
+            signature = (row["speaker"], text)
+            stable_key = key
+            if key not in self.raw:
+                bucket = candidates.get(signature) or []
+                while bucket and bucket[0] in used:
+                    bucket.pop(0)
+                if bucket:
+                    stable_key = bucket.pop(0)
+                    used.add(stable_key)
+                    remap[key] = stable_key
+            if stable_key == key:
+                stabilized.append(row)
+            else:
+                stabilized.append({**row, "key": stable_key})
+        if not remap:
+            return rows, live_keys, {}
+        return stabilized, [remap.get(key, key) for key in live_keys], remap
+
+    def stabilize_payload_keys(self, payload: dict[str, Any]) -> dict[str, Any]:
+        rows = payload.get("rows") or []
+        live_keys = payload.get("liveKeys") or []
+        if not isinstance(rows, list) or not isinstance(live_keys, list):
+            return payload
+        stable_rows, stable_live_keys, remap = self._stabilize_recreated_row_keys(rows, live_keys)
+        if not remap:
+            return payload
+        stable_payload = dict(payload)
+        stable_payload["rows"] = stable_rows
+        stable_payload["liveKeys"] = stable_live_keys
+        raw_rows = payload.get("rawRows") or []
+        if isinstance(raw_rows, list):
+            stable_payload["rawRows"] = [
+                ({**row, "key": remap.get(row.get("key"), row.get("key"))} if isinstance(row, dict) else row)
+                for row in raw_rows
+            ]
+        return stable_payload
+
 
     def _queue_completed(
         self,
@@ -144,7 +213,7 @@ class CaptionTracker:
             self._baseline_snapshot = self._snapshot(rows)
             self._baseline_changed_at = now
             self._baseline_warming = self.settle > 0 and any(
-                text for _, _, text in self._baseline_snapshot
+                text for _, text in self._baseline_snapshot
             )
             self._replace_baseline(rows, now)
             return
@@ -158,6 +227,7 @@ class CaptionTracker:
             if now - self._baseline_changed_at < self.settle:
                 return
             self._baseline_warming = False
+        rows, live_keys, _remap = self._stabilize_recreated_row_keys(rows, live_keys)
         seen_keys = set()
         active_dom_key = live_keys[-1] if live_keys else (rows[-1]["key"] if rows else None)
         for row in rows:

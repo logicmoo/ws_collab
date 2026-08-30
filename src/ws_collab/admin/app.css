@@ -258,9 +258,25 @@ html, body {
   overflow-y: auto;
   padding: 10px 12px;
 }
+.stt-driver-panel {
+  flex: 0 0 auto;
+  overflow-y: visible;
+}
 
 .page { display: none; height: 100%; flex-direction: column; overflow: hidden; }
 .page.active { display: flex; }
+.page[data-page="stt"] { overflow-y: auto; }
+.page[data-page="stt"] > .toolbar,
+.page[data-page="stt"] .panel-body,
+.page[data-page="stt"] .panel,
+.page[data-page="stt"] .panel-content,
+.page[data-page="stt"] #stt-engine-body,
+.page[data-page="stt"] #stt-live-log,
+.page[data-page="stt"] #stt-body {
+  flex: 0 0 auto;
+  max-height: none !important;
+  overflow-y: visible !important;
+}
 
 /* ------------------------------------------------------------------ inputs */
 input[type="text"], input[type="search"], input[type="number"], select, textarea {
@@ -436,6 +452,49 @@ tr:hover td { background: var(--bg-panel-raised); }
 /* Disambiguator's resolved-final row: visually pinned/highlighted vs. the raw
    per-engine hypothesis rows above it. */
 tr.stt-final-row td { background: var(--bg-panel-raised); border-top: 2px solid var(--accent-teal); font-weight: 600; }
+
+#stt-engine-body table { table-layout: fixed; }
+#stt-engine-body th:nth-child(1) { width: 12%; }
+#stt-engine-body th:nth-child(2) { width: 10%; }
+#stt-engine-body th:nth-child(3) { width: 8%; }
+#stt-engine-body th:nth-child(4) { width: 58%; }
+#stt-engine-body th:nth-child(5) { width: 12%; }
+#stt-engine-body td:nth-child(1) .mono {
+  font-size: 6px;
+  line-height: 1.2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+#stt-engine-body td:nth-child(4) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.stt-transcript-table {
+  table-layout: fixed;
+}
+.stt-transcript-table th:nth-child(1) { width: 9%; }
+.stt-transcript-table th:nth-child(2) { width: 11%; }
+.stt-transcript-table th:nth-child(3) { width: 8%; }
+.stt-transcript-table th:nth-child(4) { width: 8%; }
+.stt-transcript-table th:nth-child(5) { width: 52%; }
+.stt-transcript-table th:nth-child(6) { width: 12%; }
+.stt-transcript-table td:nth-child(2) .mono {
+  font-size: 6px;
+  line-height: 1.2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.stt-transcript-table td:nth-child(5) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.stt-transcript-table td:nth-child(6) {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 
 /* ---- drag-to-resize columns (Devices & Routing table only) ---- */
 table.dv-resizable-table {
@@ -615,6 +674,78 @@ button.mini.danger:hover { color: var(--status-danger); border-color: var(--stat
 }
 .meet-scroll-box table { margin: 0; }
 .meet-scroll-box pre.mono { height: 100%; box-sizing: border-box; }
+
+/* --------------------------------------------------------------- silences */
+.silences-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+.silence-metric {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  background: var(--bg-panel-raised);
+  padding: 8px 10px;
+}
+.silence-metric-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.silence-metric-value {
+  margin-top: 3px;
+  font-family: var(--font-mono);
+  font-size: 16px;
+  color: var(--text-primary);
+}
+.silences-turn-box {
+  height: 430px;
+}
+.silences-turn-box table {
+  margin: 0;
+  table-layout: fixed;
+}
+.silences-turn-box td:nth-child(7) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+tr.silence-turn-correct td { background: rgba(32, 214, 167, 0.055); }
+tr.silence-turn-mis-attributed td { background: rgba(228, 173, 77, 0.07); }
+tr.silence-turn-sequence-error td { background: rgba(255, 79, 135, 0.06); }
+.silence-token-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.silence-token {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: var(--bg-input);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.silence-token.done {
+  border-color: var(--status-success);
+  color: var(--status-success);
+}
+.silence-token.current {
+  border-color: var(--accent-teal);
+  color: var(--accent-teal);
+  box-shadow: 0 0 0 1px rgba(0, 216, 200, 0.15);
+}
+.silence-token-role {
+  font-size: 9px;
+  opacity: 0.8;
+}
 
 
 /* -------------------------------------------------------------- event list */

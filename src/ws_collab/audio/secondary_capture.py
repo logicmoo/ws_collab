@@ -87,6 +87,9 @@ class SecondaryCaptureService:
             vad = self._vad
             return {
                 "listening": self._listening,
+                "source_id": "meet-companion-incoming",
+                "source_kind": "companion_heard",
+                "audio_source": "companion_heard_meeting_audio",
                 "device_id": self._device_id,
                 "device_name": device.name if device else None,
                 "backend": device.backend if device else self.devices.backend,
@@ -228,8 +231,15 @@ class SecondaryCaptureService:
             channels=1,
             samples=audio,
             reference_text=None,
-            source_kind="external",
+            source_kind="companion_heard",
             duration_ms=duration_ms,
+            route={
+                "source": "meet-companion-incoming",
+                "audio_source": "companion_heard_meeting_audio",
+                "capture": "secondary",
+                "exclude_engines": ["google_meet"],
+                "self_audio_exclusion": "browser-output-sink-only",
+            },
         )
         with self._lock:
             self._captured += 1

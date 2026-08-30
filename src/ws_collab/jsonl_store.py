@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -75,7 +76,14 @@ class _StreamState:
         }
         tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload), encoding="utf-8")
-        os.replace(tmp, self.state_path)
+        for attempt in range(8):
+            try:
+                os.replace(tmp, self.state_path)
+                return
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
 
     def _recover(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)

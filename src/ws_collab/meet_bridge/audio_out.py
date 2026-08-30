@@ -34,7 +34,7 @@ def speak_windows(text: str) -> None:
         )
         proc.communicate(input=text.encode("utf-8"), timeout=120)
     except Exception as error:  # noqa: BLE001 - TTS must never kill the bridge
-        print(f"[tts] {error}", file=sys.stderr)
+        print(f"[tts] {error}", file=sys.stderr, flush=True)
 
 
 def sapi_wav_base64(text: str) -> tuple[str, float]:
@@ -82,7 +82,7 @@ def list_audio_devices() -> None:
         if entry.get("max_output_channels", 0) > 0:
             kind.append("out")
         print(f"[{index:3}] {entry.get('name', '?')!r}  ({'/'.join(kind) or 'none'}, "
-              f"in={entry.get('max_input_channels', 0)} out={entry.get('max_output_channels', 0)})")
+              f"in={entry.get('max_input_channels', 0)} out={entry.get('max_output_channels', 0)})", flush=True)
 
 
 def resolve_audio_device(name_substring: str, *, want: str) -> int:

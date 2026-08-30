@@ -100,10 +100,9 @@
       <span class="nav-label">Google Meet</span>
       <span class="status-dot" id="meet-nav-dot" title="Bridge status"></span>
     </div>
-    <div class="nav-item" data-page="meetbridge" tabindex="0">
-      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 3h12v8H5l-3 3V3z"/></svg>
-      <span class="nav-label">Meet Bridge</span>
-      <span class="status-dot" id="meetbridge-nav-dot" title="Bridge status"></span>
+    <div class="nav-item" data-page="silences" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 8h2l2-4v8l2-4h6"/><circle cx="12.5" cy="8" r="1.5"/></svg>
+      <span class="nav-label">Silences</span>
     </div>
     <div class="nav-item" data-page="processes" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="M5 6h6M5 8h6M5 10h4"/></svg>
@@ -318,56 +317,58 @@
       </div>
     </section>
 
-    <!-- ---------------------------------------------------------- meet bridge (simple transcript view) -->
-    <section class="page" data-page="meetbridge">
+    <!-- ----------------------------------------------------------- silences -->
+    <section class="page" data-page="silences">
       <div class="toolbar">
-        <button class="primary" id="mb-refresh">Refresh</button>
-        <span class="mono hint" id="mb-status-line">checking…</span>
+        <button class="primary" id="sil-start">Start</button>
+        <button id="sil-stop" disabled>Stop</button>
+        <button id="sil-reset">Reset</button>
+        <span class="toolbar-sep"></span>
+        <label class="inline">Test
+          <select id="sil-test">
+            <option value="count20">Count to 20</option>
+            <option value="abcs">ABCs</option>
+          </select>
+        </label>
+        <label class="inline">First side
+          <select id="sil-first-role">
+            <option value="host">host</option>
+            <option value="companion">companion</option>
+          </select>
+        </label>
+        <span class="toolbar-sep"></span>
+        <button id="sil-drive-next" disabled title="agent-voices-via-companion is not wired yet">Drive next agent turn</button>
+        <span class="hint">Drive mode disabled — agent voice not yet wired.</span>
+        <span class="spacer" style="flex:1"></span>
+        <span class="mono hint" id="sil-status">ready</span>
       </div>
       <div class="panel-body">
         <div class="panel">
+          <div class="panel-title">Observation-first turn-taking harness</div>
           <div class="panel-content">
-            <div class="hint" style="margin-bottom:4px">
-              GOOGLE MEET · STT SUBSYSTEM
-            </div>
-            <div style="font-size:16px;font-weight:600;color:var(--text-primary);margin-bottom:6px">Google Meet bridge</div>
             <div class="hint">
-              Meet's live captions are ws_collab's best speech recognizer. The bridge keeps a
-              <b>servant meeting</b> listening to the room mic — and joins any meeting you invite it to,
-              so you and others can talk to each other <i>and</i> to ws_collab. Captions land in the
-              mailbox; replies go back into the Meet chat.
+              Watches finalized Google Meet captions, ignores cross-role duplicates, and scores humans against the selected alternating sequence.
             </div>
+            <div id="sil-summary" class="silences-summary"></div>
           </div>
         </div>
-
-        <div class="panel" id="mb-card-panel">
-          <div class="panel-content" id="mb-card-body"></div>
-        </div>
-
         <div class="panel">
-          <div class="panel-title">Meetings — commands travel through the real mailbox</div>
-          <div class="panel-content">
-            <div class="toolbar">
-              <input type="text" id="mb-join-url" placeholder="https://meet.google.com/xxx-yyyy-zzz — a meeting you're inviting the bridge to" style="flex:1" />
-              <button class="primary" id="mb-join-btn">⇒ Join this meeting</button>
-              <button id="mb-new-btn">✚ New servant meeting</button>
-            </div>
-            <div class="mono hint" id="mb-command-result"></div>
-            <div class="hint" style="margin-top:8px" id="mb-hint-line">
-              In an invited meeting everyone talks normally; every finished caption line arrives as
-              <span class="mono">meet-&lt;speaker&gt;</span>, and anything sent to
-              <span class="mono">google-meet</span> is typed into the Meet's in-call chat for all to see.
-            </div>
-          </div>
+          <div class="panel-title">Expected sequence</div>
+          <div class="panel-content" id="sil-expected-seq"></div>
         </div>
-
         <div class="panel">
-          <div class="panel-title" id="mb-captions-title">Live captions</div>
+          <div class="panel-title">Live scored turns</div>
           <div class="panel-content">
-            <div id="mb-captions-feed" style="max-height:360px;overflow-y:auto"></div>
+            <div class="meet-scroll-toolbar">
+              <button id="sil-autoscroll" class="mini toggle">Autoscroll: ON</button>
+              <button id="sil-jump" class="mini" hidden>Jump to latest</button>
+              <span class="mono hint" id="sil-transport-line">caption feed not sampled yet</span>
+              <span class="spacer" style="flex:1"></span>
+              <span class="mono hint" id="sil-paused-note"></span>
+            </div>
+            <div id="sil-turns" class="meet-scroll-box silences-turn-box"></div>
           </div>
         </div>
-
       </div>
     </section>
 
@@ -454,7 +455,7 @@
         </select>
         <span class="hint" id="stt-policy-status"></span>
       </div>
-      <div class="panel-body">
+      <div class="panel-body stt-driver-panel">
         <div class="panel">
           <div class="panel-title">Server STT drivers (server audio → configured drivers such as google_meet → disambiguator)</div>
           <div class="panel-content">
@@ -467,7 +468,7 @@
         <div class="panel">
           <div class="panel-title">Browser Web Speech (separate browser mic recognizer → server ingest as web_speech)</div>
           <div class="panel-content">
-            <div id="stt-live-log" style="max-height:180px;overflow-y:auto"></div>
+            <div id="stt-live-log"></div>
             <div id="stt-live-partial" class="hint" style="min-height:1.4em;font-style:italic;margin-top:6px">Click "Start browser Web Speech" and speak…</div>
           </div>
         </div>
@@ -545,6 +546,7 @@
   </footer>
 </div>
 
+<script src="silences.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

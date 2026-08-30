@@ -173,6 +173,26 @@ def test_mailbox_directory_uses_durable_personal_cursor(service: WsCollabService
     assert cleared["behind"] == 2
 
 
+def test_workspace_suggestion_mailboxes_project_conversation_messages(service: WsCollabService) -> None:
+    names = {row["id"] for row in service.list_mailboxes("reader")["mailboxes"]}
+    assert {"workspace", "suggestions"} <= names
+
+    sent = service.mailbox_send(
+        to="workspace",
+        send_to="workspace",
+        text="Suggested next step: update the workspace task list.",
+        sender="copilot-workbench",
+    )["message"]
+
+    workspace_messages = service.mailbox_messages("workspace")["messages"]
+    suggestion_messages = service.mailbox_messages("suggestions")["messages"]
+
+    assert sent["mailboxId"] == "conversation"
+    assert sent["send_to"] == "workspace"
+    assert any(message["id"] == sent["id"] for message in workspace_messages)
+    assert any(message["id"] == sent["id"] for message in suggestion_messages)
+
+
 def test_state_directory_is_relocatable(tmp_path) -> None:
     elsewhere = tmp_path / "somewhere-else"
     config = Config.from_env(_env(tmp_path, WS_COLLAB_STATE_DIR=str(elsewhere)))

@@ -81,6 +81,14 @@ const state = {
   meetAssignmentScope: "",
   meetKnownUrls: [...DEFAULT_DRIVER_MEETING_URLS, ...DEFAULT_CLIENT_MEETING_URLS],
   meetGlobalAssignments: null,
+  silences: {
+    run: null,
+    running: false,
+    polling: false,
+    lastCaptionData: null,
+    pendingRender: false,
+    pendingRows: 0,
+  },
   pageApiSnapshots: {},
   restoredPageStates: {},
   pendingPageRestore: {},
@@ -105,11 +113,35 @@ function adoptStreams(capabilities) {
   populateStreamMenu();
 }
 
+function meetEmailName(value) {
+  const match = /([A-Z0-9._%+-]+)@[A-Z0-9.-]+/i.exec(String(value || ""));
+  return match ? match[1] : null;
+}
+
+function meetStableSso(value) {
+  const match = /\bsso[-_]\d+\b/i.exec(String(value || ""));
+  return match ? match[0].toLowerCase().replace("-", "_") : null;
+}
+
+function meetBareName(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const first = text.split(/\s*[([]/)[0].trim();
+  return first && !/authuser|resolution/i.test(first) ? first : null;
+}
+
+function meetShortIdentity(value) {
+  return meetEmailName(value) || meetStableSso(value) || meetBareName(value);
+}
+
 function ssoLabel(profile, account) {
-  if (account && account.signedIn && account.email) return account.email;
+  if (account) {
+    const label = meetShortIdentity(account.email) || meetShortIdentity(account.label) || meetStableSso(account.id);
+    if (label) return label;
+  }
   if (!profile) return "\u2014";
-  if (typeof profile === "string") return profile;
-  return profile.label || (profile.known === false ? "unknown" : "\u2014");
+  const raw = typeof profile === "string" ? profile : (profile.email || profile.label || profile.id);
+  return meetShortIdentity(raw) || (profile.known === false ? "unknown" : "\u2014");
 }
 
 /* The "JSONL Streams" nav item expands into one entry per durable stream, each
@@ -588,7 +620,10 @@ function createView(opts) {
     id: opts.id,
     streams: opts.streams,
     rows: [],
-    paused: false,
+    manualPaused: false,
+    hoverPaused: false,
+    scrollPaused: false,
+    get paused() { return this.manualPaused || this.hoverPaused || this.scrollPaused || hasSelectionIn(opts.scrollId); },
     follow: true,
     unseen: 0,
     hidden: 0,
@@ -601,13 +636,17 @@ function createView(opts) {
       if (this.paused) { this.pending.push(event); if (this.pending.length > MAX_BUFFER) this.pending.shift(); return; }
       this.append(event);
     },
-    append(event) {
-      if (!this.filter(event)) { this.hidden += 1; this.updateCounts(); return; }
+    append(event, noDraw = false) {
+      if (!this.filter(event)) { this.hidden += 1; if (!noDraw) this.updateCounts(); return; }
       this.rows.push(event);
       if (this.rows.length > MAX_BUFFER) this.rows.shift();
-      if (this.follow) { this.draw(); this.scrollToEnd(); }
-      else { this.unseen += 1; jump.classList.add("visible"); if (unseenLabel) unseenLabel.textContent = this.unseen; this.draw(); }
-      this.updateCounts();
+      if (this.follow) {
+        if (!noDraw) { this.draw(); this.scrollToEnd(); }
+      } else {
+        this.unseen += 1;
+        if (!noDraw) { jump.classList.add("visible"); if (unseenLabel) unseenLabel.textContent = this.unseen; this.draw(); }
+      }
+      if (!noDraw) this.updateCounts();
     },
     rebuild(source) {
       this.rows = source.filter(this.filter);
@@ -634,22 +673,68 @@ function createView(opts) {
     },
     scrollToEnd() { scroll.scrollTop = scroll.scrollHeight; },
     setPaused(value) {
-      this.paused = value;
-      if (!value) { this.pending.forEach((e) => this.append(e)); this.pending = []; }
+      const wasPaused = this.paused;
+      this.manualPaused = value;
+      this.updatePauseState(wasPaused);
+    },
+    setHoverPaused(value) {
+      const wasPaused = this.paused;
+      this.hoverPaused = value;
+      this.updatePauseState(wasPaused);
+    },
+    setScrollPaused(value) {
+      const wasPaused = this.paused;
+      this.scrollPaused = value;
+      this.updatePauseState(wasPaused);
+    },
+    updatePauseState(wasPaused) {
+      if (wasPaused && !this.paused && this.pending.length > 0) {
+        this.pending.forEach((e) => this.append(e, true));
+        this.pending = [];
+        this.updateCounts();
+        if (this.follow) {
+          this.draw();
+          this.scrollToEnd();
+        } else {
+          jump.classList.add("visible");
+          if (unseenLabel) unseenLabel.textContent = this.unseen;
+          this.draw();
+        }
+      }
     },
     clearView() { this.rows = []; this.hidden = 0; this.draw(); this.updateCounts(); },
   };
+
+  scroll.addEventListener("mouseenter", () => {
+    view.setHoverPaused(true);
+  });
+  scroll.addEventListener("mouseleave", () => {
+    view.setHoverPaused(false);
+  });
 
   scroll.addEventListener("scroll", () => {
     const atBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 40;
     // Automatic pause when the operator scrolls upward; never force the view down.
     view.follow = atBottom;
-    if (atBottom) { view.unseen = 0; jump.classList.remove("visible"); }
+    if (atBottom) {
+      view.unseen = 0;
+      jump.classList.remove("visible");
+      view.setScrollPaused(false);
+    } else {
+      view.setScrollPaused(true);
+    }
     view.draw();
   });
   jump.addEventListener("click", () => {
-    view.follow = true; view.unseen = 0; jump.classList.remove("visible");
-    view.draw(); view.scrollToEnd();
+    view.follow = true;
+    view.unseen = 0;
+    jump.classList.remove("visible");
+    const sel = window.getSelection();
+    if (sel) sel.removeAllRanges();
+    view.setHoverPaused(false); // force unpause on click so it jumps immediately
+    view.setScrollPaused(false);
+    view.draw();
+    view.scrollToEnd();
   });
 
   state.views[opts.id] = view;
@@ -1219,10 +1304,16 @@ async function showPage(page) {
   const loaders = {
     workers: loadWorkers, alerts: loadAlerts, devices: loadDevices, voices: loadVoices,
     accuracy: loadAccuracy, cursors: loadCursors, prompt: loadPrompt, system: loadSystem,
-    meet: loadMeetWithPolling, stt: loadStt, meetbridge: loadMeetBridge, processes: loadProcesses, browser: loadBrowserSettings,
+    meet: loadMeetWithPolling, silences: loadSilencesWithPolling, stt: loadStt, processes: loadProcesses, browser: loadBrowserSettings,
   };
-  if (loaders[page]) loaders[page]();
-  else {
+  if (loaders[page]) {
+    const p = loaders[page]();
+    if (page === "stt" && (window.SpeechRecognition || window.webkitSpeechRecognition)) {
+      if (!sttShouldContinue && !sttRecognizer) {
+        toggleSttMic();
+      }
+    }
+  } else {
     applyControlState(page, state.restoredPageStates[page]);
     state.pendingPageRestore[page] = false;
   }
@@ -1843,23 +1934,6 @@ async function postMeetCommand(command) {
   loadMeet();
 }
 
-/* Same bridge, same /command endpoint -- a separate result target and
- * refresh (the simple "Meet Bridge" transcript-viewer page) so driving it
- * from there doesn't depend on the deep ops "Google Meet" page also being
- * loaded. */
-async function postMeetBridgeCommand(command) {
-  const resultEl = $("mb-command-result");
-  resultEl.textContent = `${command} — sending…`;
-  try {
-    const result = await api(`${MEET_BRIDGE_BASE}/command`, { method: "POST", body: { command } });
-    resultEl.textContent = `${command} → ${result.verdict}`;
-    if (result.started) setTimeout(loadMeetBridge, 2000);
-  } catch (error) {
-    resultEl.textContent = `${command} → error: ${error.message}`;
-  }
-  loadMeetBridge();
-}
-
 async function postMeetSso(path, body, confirmText) {
   if (confirmText && !confirm(confirmText)) return;
   const resultEl = $("br-result");
@@ -2014,8 +2088,7 @@ async function loadBrowserSettings(scannedSsoState = null) {
 
 function meetAccountLabel(account) {
   if (!account) return "Unassigned";
-  const accountName = account.email || account.label || account.id;
-  return accountName === account.id ? account.id : `${accountName} (${account.id})`;
+  return meetShortIdentity(account.email) || meetShortIdentity(account.label) || meetStableSso(account.id) || "Unassigned";
 }
 
 function meetAssignmentKey(url) {
@@ -2026,6 +2099,15 @@ function meetAssignmentKey(url) {
   } catch (_error) {
     return url;
   }
+}
+
+function rememberMeetKnownUrls(urls) {
+  const known = new Set(state.meetKnownUrls.map(meetAssignmentKey).filter(Boolean));
+  (urls || []).forEach((url) => {
+    const key = meetAssignmentKey(url);
+    if (key) known.add(key);
+  });
+  state.meetKnownUrls = [...known];
 }
 
 function meetRoleOverride(url, role) {
@@ -2059,7 +2141,7 @@ function meetSsoCombo(url, role) {
   select.appendChild(new Option(`(default) ${meetAccountLabel(defaultAccount)}`, "__default__"));
   accounts.forEach((account) => select.appendChild(new Option(meetAccountLabel(account), account.id)));
   select.value = meetRoleOverride(url, role);
-  select.title = `Select the ${role.toUpperCase()} SSO for this meeting; its live authuser slot is resolved at runtime.`;
+  select.title = `Select the ${role.toUpperCase()} SSO for this meeting.`;
   select.onclick = (event) => event.stopPropagation();
   select.onchange = async () => {
     const previous = meetRoleOverride(url, role);
@@ -2089,6 +2171,11 @@ async function loadMeetRoleAssignments() {
     const meetingUrl = state.meetAssignmentScope;
     const query = meetingUrl ? `?meeting_url=${encodeURIComponent(meetingUrl)}` : "";
     const data = await api(`${V1}/meet/role-assignments${query}`);
+    rememberMeetKnownUrls([
+      ...(data.known_meeting_urls || []),
+      ...Object.keys(data.meeting_role_account_maps || {}),
+      data.meeting_url,
+    ]);
     if (!meetingUrl) state.meetGlobalAssignments = data;
     else if (!state.meetGlobalAssignments) {
       state.meetGlobalAssignments = { ...data, role_account_map: data.global_role_account_map || {} };
@@ -2135,8 +2222,6 @@ async function loadMeetRoleAssignments() {
       return [
         (row.role || "-").toUpperCase(),
         select,
-        row.email || row.label || "unassigned",
-        row.authuser == null ? "-" : String(row.authuser),
         row.account_id ? (row.tab_exists ? "Exists" : "None") : "Unassigned",
         actions,
       ];
@@ -2202,7 +2287,7 @@ async function loadMeetRoleAssignments() {
       el("div", "hint", "Meet roles select SSO accounts. Browser sign-in remains account-only."),
       scopeRow,
       el("div", "hint", scopeHint),
-      table(["Meet role", "SSO account", "Current label", "Authuser", "Browser page", "Actions"], rows),
+      table(["Meet role", "SSO account", "Browser page", "Actions"], rows),
       toolbar,
       el("div", "hint", "Role arguments for the next launch"),
       mono(data.role_arguments || "ws-collab-meet-bridge --companion"),
@@ -2267,7 +2352,7 @@ async function loadProcesses() {
  * has ever actually been in that room; plain dashes only when it truly
  * never has). Every row shows the meeting URL + connection state, an SSO
  * column whose combo stores a stable sso_N override for this meeting (or uses
- * the global default) and resolves its current authuser slot at runtime, and
+ * the global default), and
  * Actions: for the CURRENT
  * meeting, role-scoped Foreground (raise that identity's browser window)
  * + Disconnect (hang up just that tab) buttons; for a not-current meeting,
@@ -2675,10 +2760,83 @@ function meetScrollSection(clearKey, label) {
   return { wrap, box };
 }
 
+function meetCaptionRole(c) {
+  if (c && c.role) return String(c.role);
+  const key = c && c.key ? String(c.key) : "";
+  const idx = key.indexOf(":");
+  return idx > 0 ? key.slice(0, idx) : "";
+}
+
+function meetCaptionKeyLabel(value) {
+  const text = esc(value);
+  if (!text) return "\u2014";
+  const idx = text.indexOf(":");
+  if (idx > 0) {
+    const role = text.slice(0, idx);
+    const rest = text.slice(idx + 1);
+    return `${role}:${rest.length > 12 ? `\u2026${rest.slice(-12)}` : rest}`;
+  }
+  return text.length > 14 ? `\u2026${text.slice(-14)}` : text;
+}
+
+function meetCaptionKeyNode(value) {
+  if (!value) return "\u2014";
+  const node = mono(meetCaptionKeyLabel(value));
+  node.title = esc(value);
+  return node;
+}
+
+function meetCaptionTextCell(c) {
+  const wrap = el("span", "meet-caption-text", c && c.text ? c.text : "");
+  const raw = c && c.rawText ? String(c.rawText) : "";
+  if (raw) {
+    const title = `Raw DOM text: ${raw}`;
+    wrap.title = title;
+    const marker = el("span", "badge", "raw");
+    marker.title = title;
+    marker.style.marginLeft = "6px";
+    wrap.appendChild(marker);
+  }
+  return wrap;
+}
+
+function meetTransportLine(source) {
+  const transport = source && source.captionTransport ? source.captionTransport : "\u2014";
+  const frames = source && source.pushFrameCount != null ? source.pushFrameCount : 0;
+  return `${transport} (push frames ${frames})`;
+}
+
+function meetTransportByRoleLine(source) {
+  const byRole = (source && source.captionTransportByRole) || {};
+  const roles = Object.keys(byRole).sort();
+  if (!roles.length) return "\u2014";
+  return roles.map((role) => {
+    const info = byRole[role] || {};
+    const transport = info.captionTransport || "\u2014";
+    const frames = info.pushFrameCount != null ? info.pushFrameCount : 0;
+    const last = shortTs(info.lastPushIso) || info.lastPushIso || "\u2014";
+    return `${role}: ${transport}, push frames ${frames}, last ${last}`;
+  }).join("; ");
+}
+
+function meetTranscriptSpeaker(c, rows) {
+  const speaker = (c && c.speaker ? String(c.speaker) : "").trim();
+  const role = meetCaptionRole(c);
+  const bySpeaker = new Map();
+  (rows || []).forEach((row) => {
+    const name = (row && row.speaker ? String(row.speaker) : "").trim().toLowerCase();
+    if (!name) return;
+    if (!bySpeaker.has(name)) bySpeaker.set(name, new Set());
+    bySpeaker.get(name).add(meetCaptionRole(row) || "");
+  });
+  const rolesForSpeaker = speaker ? bySpeaker.get(speaker.toLowerCase()) : null;
+  const ambiguous = !speaker || /^you$/i.test(speaker) || /^speaker$/i.test(speaker) || (rolesForSpeaker && rolesForSpeaker.size > 1);
+  if (ambiguous && role) return role;
+  return speaker || role || "Speaker";
+}
+
 function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, debugRows, bridgeOnline, emitCount, hostProfile, meetingState, recipients) {
-  const known = new Set(state.meetKnownUrls);
-  groups.forEach(({ url }) => { if (url && url !== "(unknown meeting)") known.add(url); });
-  state.meetKnownUrls = [...known];
+  rememberMeetKnownUrls(groups.map(({ url }) => (url && url !== "(unknown meeting)" ? url : "")));
   groups = groups.filter(({ kind }) => getMeetKindFilter(kind || "driver"));
   const priorOpen = new Map();
   container.querySelectorAll(".meet-tree-meeting").forEach((d) => {
@@ -2694,7 +2852,7 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
   // everywhere at once instead of repeating 7 checkboxes per meeting.
   const usBodies = [], agentsBodies = [], presenceBodies = [], debugBodies = [], emitBodies = [], phrasesBodies = [], transcribeBodies = [];
   const emitBoxes = [], phrasesBoxes = [], transcribeBoxes = [];
-  let totalAgentRows = 0, totalDebugRows = 0, totalTranscriptLines = 0, totalConnectorRows = 0, totalPhraseRows = 0;
+  let totalAgentRows = 0, totalDebugRows = 0, totalEmitRows = 0, totalTranscriptLines = 0, totalConnectorRows = 0, totalPhraseRows = 0;
   const meetingEls = [];
 
   groups.forEach(({ url, captions, kind }) => {
@@ -2767,9 +2925,9 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     const emitCutoff = meetClearCutoff(`${url}::Emit`);
     const emitRowsShown = sortedByKey.filter((c) => (c.at || 0) > emitCutoff);
     const { wrap: emitBody, box: emitBox } = meetScrollSection(`${url}::Emit`, "Emit");
-    emitBox.appendChild(emitRowsShown.length ? table(["Key", "Time", "Speaker", "Text", "Final", "Replaces"], emitRowsShown.map((c) => [
-      mono((c.key || "").slice(-10)), shortTs(c.iso) || c.iso || "", c.speaker || "", c.text || "",
-      c.final ? "yes" : "growing…", c.replaces ? mono(c.replaces.slice(-10)) : "—",
+    emitBox.appendChild(emitRowsShown.length ? table(["Key", "Time", "Role", "Speaker", "Text", "Final", "Replaces", "Dup"], emitRowsShown.map((c) => [
+      meetCaptionKeyNode(c.key), shortTs(c.iso) || c.iso || "", meetCaptionRole(c) || "—", c.speaker || "", meetCaptionTextCell(c),
+      c.final ? "yes" : "growing…", meetCaptionKeyNode(c.replaces), meetCaptionKeyNode(c.duplicateOf),
     ])) : el("div", "hint", "Cleared — new emits appear here as they happen."));
 
     // Phrases: JUST the settled sentences (final=true) out of the same raw
@@ -2778,13 +2936,13 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     // what "phrases" means for this bridge: Meet gives one continuously
     // growing row per monologue, and every completed sentence peeled off
     // of it becomes one phrase here, in order.
-    const phraseRows = sortedByKey.filter((c) => c.final);
+    const phraseRows = sortedByKey.filter((c) => c.final && !c.duplicateOf);
     const phrasesCutoff = meetClearCutoff(`${url}::Phrases`);
     const phraseRowsShown = phraseRows.filter((c) => (c.at || 0) > phrasesCutoff);
     const { wrap: phrasesBody, box: phrasesBox } = meetScrollSection(`${url}::Phrases`, "Phrases");
     phrasesBox.appendChild(phraseRowsShown.length
-      ? table(["Key", "Time", "Speaker", "Text"], phraseRowsShown.map((c) => [
-        mono((c.key || "").slice(-10)), shortTs(c.iso) || c.iso || "", c.speaker || "", c.text || "",
+      ? table(["Key", "Time", "Role", "Speaker", "Text"], phraseRowsShown.map((c) => [
+        meetCaptionKeyNode(c.key), shortTs(c.iso) || c.iso || "", meetCaptionRole(c) || "—", c.speaker || "", meetCaptionTextCell(c),
       ]))
       : el("div", "hint", phraseRows.length ? "Cleared — new phrases appear here as sentences finish." : "No completed phrases yet — a phrase appears here the instant a sentence finishes."));
 
@@ -2798,12 +2956,11 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     // contain many settled sentences, a different number than the raw
     // emit-event count shown by "Emit" above.
     const transcribeCutoff = meetClearCutoff(`${url}::Transcribe`);
-    const transcribeRowsShown = sortedByKey.filter((c) => (c.at || 0) > transcribeCutoff);
+    const transcriptRows = sortedByKey.filter((c) => c.final && !c.duplicateOf);
+    const transcribeRowsShown = transcriptRows.filter((c) => (c.at || 0) > transcribeCutoff);
     const { wrap: transcribeBody, box: transcribeBox } = meetScrollSection(`${url}::Transcribe`, "Transcribe");
-    const transcriptLines = transcribeRowsShown.map((c) => `${c.speaker || "Speaker"}: ${c.text || ""}`);
-    transcribeBox.appendChild(el("pre", "mono", transcriptLines.join("\n") || (sortedByKey.length ? "(cleared — new lines appear here as they're said)" : "(nothing said yet)")));
-    const sentenceCount = sortedByKey.reduce((sum, c) =>
-      sum + (c.text || "").split(/(?<=[.!?])\s+/).filter((s) => s.trim()).length, 0);
+    const transcriptLines = transcribeRowsShown.map((c) => `${meetTranscriptSpeaker(c, transcriptRows)}: ${c.text || ""}`);
+    transcribeBox.appendChild(el("pre", "mono", transcriptLines.join("\n") || (transcriptRows.length ? "(cleared — new finalized lines appear here as they're said)" : "(no finalized transcript yet — growing emits appear in Emit)")));
 
     meeting.appendChild(usBody);
     meeting.appendChild(agentsBody);
@@ -2824,9 +2981,10 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     emitBoxes.push(emitBox);
     phrasesBoxes.push(phrasesBox);
     transcribeBoxes.push(transcribeBox);
+    totalEmitRows += sortedByKey.length;
     totalAgentRows += agentRows.length;
     totalDebugRows += isCurrent ? rows.length : 0;
-    totalTranscriptLines += sentenceCount;
+    totalTranscriptLines += transcriptRows.length;
     totalPhraseRows += phraseRows.length;
   });
 
@@ -2838,7 +2996,7 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
   toggleRow.appendChild(meetSectionToggle("Virtual agents", totalAgentRows, false, agentsBodies));
   toggleRow.appendChild(meetSectionToggle("Presences", "?", false, presenceBodies));
   toggleRow.appendChild(meetSectionToggle("Other things", totalDebugRows, false, debugBodies));
-  toggleRow.appendChild(meetSectionToggle("Emit", emitCount || 0, true, emitBodies));
+  toggleRow.appendChild(meetSectionToggle("Emit", totalEmitRows || emitCount || 0, true, emitBodies));
   toggleRow.appendChild(meetSectionToggle("Phrases", totalPhraseRows, true, phrasesBodies));
   toggleRow.appendChild(meetSectionToggle("Transcribe", totalTranscriptLines, true, transcribeBodies));
   container.appendChild(toggleRow);
@@ -2908,26 +3066,32 @@ async function loadMeet() {
     // correctly "not current" while the bridge itself is down) so the
     // intended meetings stay visible instead of the section going blank.
     renderMeetTree($("meet-driver-tree"), [
-      ...DEFAULT_DRIVER_MEETING_URLS.map((url) => ({ url, captions: [], kind: "driver" })),
+      ...state.meetKnownUrls
+        .filter((url) => !DEFAULT_CLIENT_MEETING_URLS.map(meetAssignmentKey).includes(meetAssignmentKey(url)))
+        .map((url) => ({ url, captions: [], kind: "driver" })),
       ...DEFAULT_CLIENT_MEETING_URLS.map((url) => ({ url, captions: [], kind: "client" })),
     ], null, [], [], [], false, 0, null, {}, []);
     return;
   }
   if (dot) { dot.classList.toggle("ok", !!health.ok); dot.classList.toggle("danger", !health.ok); }
   statusLine.textContent = health.meetingUrl ? `bridge online — ${health.meetingUrl}` : "bridge online — no meeting";
-  const hostProfileLabel = health.hostProfile
-    ? (health.hostProfile.label || (health.hostProfile.known === false ? "unknown" : "\u2014"))
-    : "\u2014";
-  const cardLines = [
-    `service       ${health.service || "ws_collab_meet_bridge"}`,
-    `meeting       ${health.meetingUrl || "\u2014"}`,
-    `chrome profile (host)   ${hostProfileLabel}`,
-    `browser backend  ${health.browserBackend || "windows"}`,
-    `captions      ${health.captionCount ?? 0} total, last at ${health.lastCaptionAt || "\u2014"}`,
-    `outbox        ${health.outbox || "\u2014"}`,
-    `transcripts   \u2192 ${(health.recipients || []).join(", ") || "\u2014"}`,
-  ];
-  $("meet-bridge-card").textContent = cardLines.join("\n");
+  const hostProfileLabel = ssoLabel(health.hostProfile);
+  const paintBridgeCard = (captionData) => {
+    const transportSource = captionData || health;
+    const cardLines = [
+      `service       ${health.service || "ws_collab_meet_bridge"}`,
+      `meeting       ${health.meetingUrl || "\u2014"}`,
+      `host account  ${hostProfileLabel}`,
+      `browser backend  ${health.browserBackend || "windows"}`,
+      `captions      ${captionData ? (captionData.captions || []).length : (health.captionCount ?? 0)} loaded, last at ${health.lastCaptionAt || (captionData && captionData.rawIso) || "\u2014"}`,
+      `transport     ${meetTransportLine(transportSource)}`,
+      `by role       ${meetTransportByRoleLine(transportSource)}`,
+      `outbox        ${health.outbox || "\u2014"}`,
+      `transcripts   \u2192 ${(health.recipients || []).join(", ") || "\u2014"}`,
+    ];
+    $("meet-bridge-card").textContent = cardLines.join("\n");
+  };
+  paintBridgeCard(null);
 
   let capData;
   try {
@@ -2936,6 +3100,7 @@ async function loadMeet() {
     $("meet-driver-tree").textContent = `error loading captions: ${error.message}`;
     return;
   }
+  paintBridgeCard(capData);
   let agentProfiles = [];
   try {
     agentProfiles = ((await api(`${V1}/voices`)).profiles || []);
@@ -2944,32 +3109,54 @@ async function loadMeet() {
   }
   const byMeeting = new Map();
   (capData.captions || []).forEach((c) => {
-    const key = c.meetingUrl || "(unknown meeting)";
+    const key = c.meetingUrl ? meetAssignmentKey(c.meetingUrl) : "(unknown meeting)";
     if (!byMeeting.has(key)) byMeeting.set(key, []);
     byMeeting.get(key).push(c);
   });
   // The CURRENT bridge meeting is always a driver meeting by definition —
   // show it even with zero captions so far (e.g. right after joining,
   // before anyone has spoken), not only once something has been said.
-  if (health.meetingUrl && !byMeeting.has(health.meetingUrl)) byMeeting.set(health.meetingUrl, []);
+  const currentMeetingKey = health.meetingUrl ? meetAssignmentKey(health.meetingUrl) : "";
+  if (currentMeetingKey && !byMeeting.has(currentMeetingKey)) byMeeting.set(currentMeetingKey, []);
   // Every known default driver meeting is shown too, even ones this bridge
   // isn't currently attached to (e.g. it moved to a different one, or
   // hasn't switched there yet) — Join re-attaches the live driver there.
-  DEFAULT_DRIVER_MEETING_URLS.forEach((url) => { if (!byMeeting.has(url)) byMeeting.set(url, []); });
-  DEFAULT_CLIENT_MEETING_URLS.forEach((url) => { if (!byMeeting.has(url)) byMeeting.set(url, []); });
-  const clientUrlSet = new Set(DEFAULT_CLIENT_MEETING_URLS);
+  state.meetKnownUrls.forEach((url) => {
+    const key = meetAssignmentKey(url);
+    if (key && !byMeeting.has(key)) byMeeting.set(key, []);
+  });
+  const clientUrlSet = new Set(DEFAULT_CLIENT_MEETING_URLS.map(meetAssignmentKey));
   // Current meeting first, then whatever else the ring buffer still
   // remembers (most-recently-active-in-buffer order).
-  const order = [health.meetingUrl, ...[...byMeeting.keys()].filter((u) => u !== health.meetingUrl)].filter(Boolean);
-  const groups = order.filter((u) => byMeeting.has(u)).map((u) => ({ url: u, captions: byMeeting.get(u), kind: clientUrlSet.has(u) ? "client" : "driver" }));
-  renderMeetTree($("meet-driver-tree"), groups, health.meetingUrl, health.clients, agentProfiles, health.debug, !!health.ok, health.emitCount, health.hostProfile, health.meetingState, health.recipients);
+  const order = [currentMeetingKey, ...[...byMeeting.keys()].filter((u) => u !== currentMeetingKey)].filter(Boolean);
+  const groups = order.filter((u) => byMeeting.has(u)).map((u) => ({ url: u, captions: byMeeting.get(u), kind: clientUrlSet.has(meetAssignmentKey(u)) ? "client" : "driver" }));
+
+  const isMeetHovered = () => !!document.querySelector('.meet-scroll-box:hover');
+  const hasSelectionInMeet = () => {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) return false;
+    let node = sel.anchorNode;
+    while (node) {
+      if (node.classList && node.classList.contains("meet-scroll-box")) return true;
+      node = node.parentNode;
+    }
+    return false;
+  };
+  const isMeetScrolledUp = () => {
+    let scrolledUp = false;
+    document.querySelectorAll('.meet-scroll-box').forEach(box => {
+      if (box.scrollHeight - box.scrollTop - box.clientHeight >= 40) {
+        scrolledUp = true;
+      }
+    });
+    return scrolledUp;
+  };
+
+  if (!isMeetHovered() && !hasSelectionInMeet() && !isMeetScrolledUp()) {
+    renderMeetTree($("meet-driver-tree"), groups, currentMeetingKey, health.clients, agentProfiles, health.debug, !!health.ok, health.emitCount, health.hostProfile, health.meetingState, health.recipients);
+  }
 }
 
-/* ---- meet bridge (simple transcript-viewer page, separate from the deep
- * ops "Google Meet" page above -- same bridge API, a friendlier front door) */
-let mbSince = 0;
-let mbPolling = false;
-let mbCaptionCount = 0;
 let meetPolling = false;
 
 function meetPollOnce() {
@@ -2981,8 +3168,8 @@ function meetPollOnce() {
     && meetPage.contains(active);
   const run = typingInMeet ? Promise.resolve() : loadMeet();
   run.finally(() => {
-    // Slower than the simple Meet Bridge page because this does a heavier full
-    // tree rebuild, and it intentionally skips ticks while the operator is typing.
+    // This does a heavier full tree rebuild, and intentionally skips ticks
+    // while the operator is typing.
     if (state.page === "meet") setTimeout(meetPollOnce, 3000);
     else meetPolling = false;
   });
@@ -2995,76 +3182,254 @@ async function loadMeetWithPolling() {
   meetPollOnce();
 }
 
-function mbRenderCard(health, offline) {
-  const body = $("mb-card-body");
-  body.replaceChildren();
-  const header = el("div", null);
-  const dot = el("b", null, offline ? "● bridge offline" : "● bridge online");
-  dot.style.color = offline ? "var(--status-warning)" : "var(--status-success)";
-  header.appendChild(dot);
-  if (!offline && health.meetingUrl) {
-    const link = el("a", "mono", health.meetingUrl.replace("https://", "") + " ↗");
-    link.href = health.meetingUrl; link.target = "_blank"; link.rel = "noreferrer";
-    link.style.marginLeft = "10px";
-    header.appendChild(link);
+function hasSelectionIn(containerId) {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed) return false;
+  let node = sel.anchorNode;
+  while (node) {
+    if (node.id === containerId) return true;
+    node = node.parentNode;
   }
-  body.appendChild(header);
-  if (offline) {
-    body.appendChild(el("div", "hint", "Start it from the Processes page, or run \"ws-collab-meet-bridge\" (or \"python -m ws_collab.meet_bridge\")."));
-  } else {
-    body.appendChild(kv({
-      captions: health.captionCount ?? 0,
-      "last caption": health.lastCaptionAt || "—",
-      "command mailbox": health.outbox || "google-meet",
-      "transcripts to": (health.recipients || []).join(", ") || "—",
-    }));
+  return false;
+}
+
+/* ---- silences turn-taking test harness */
+function silencesLogic() {
+  return window.WsCollabSilencesLogic;
+}
+
+function silencesRun() {
+  const logic = silencesLogic();
+  if (!logic) return null;
+  if (!state.silences.run) {
+    state.silences.run = logic.createRun({
+      testId: $("sil-test") ? $("sil-test").value : "count20",
+      firstRole: $("sil-first-role") ? $("sil-first-role").value : "host",
+      startedAtSec: Date.now() / 1000,
+    });
+  }
+  return state.silences.run;
+}
+
+function silencesLatency(value) {
+  return Number.isFinite(value) ? `${Math.round(value)} ms` : "\u2014";
+}
+
+function silencesMetric(label, value) {
+  const node = el("div", "silence-metric");
+  node.append(el("div", "silence-metric-label", label), el("div", "silence-metric-value", value));
+  return node;
+}
+
+function silencesStatusBadge(status) {
+  if (status === "correct") return badge("\u2713 correct", "ok");
+  if (status === "mis-attributed") return badge("\u26a0 mis-attributed", "warn");
+  return badge("\u2717 sequence", "danger");
+}
+
+function silencesAutoscrollOn() {
+  return localStorage.getItem("ws_collab_silences_autoscroll") !== "0";
+}
+
+function setSilencesAutoscroll(on) {
+  localStorage.setItem("ws_collab_silences_autoscroll", on ? "1" : "0");
+  const button = $("sil-autoscroll");
+  if (button) {
+    button.textContent = on ? "Autoscroll: ON" : "Autoscroll: OFF";
+    button.classList.toggle("on", on);
   }
 }
 
-function mbAppendCaptions(rows) {
-  const feed = $("mb-captions-feed");
-  if (feed.querySelector(".hint")) feed.replaceChildren();
-  rows.forEach((row) => {
-    const line = el("div", null);
-    line.style.cssText = "display:grid;grid-template-columns:64px 130px 1fr;gap:10px;padding:4px 2px;border-bottom:1px solid var(--border-subtle)";
-    line.appendChild(mono((row.iso || "").split("T")[1] || row.iso || ""));
-    line.appendChild(el("b", null, row.speaker || "?"));
-    line.appendChild(el("span", null, row.text || ""));
-    feed.appendChild(line);
-  });
-  mbCaptionCount += rows.length;
-  $("mb-captions-title").textContent = mbCaptionCount ? `Live captions — ${mbCaptionCount} line(s) this session` : "Live captions";
-  feed.scrollTop = feed.scrollHeight;
+function silencesScrolledUp() {
+  const box = $("sil-turns");
+  return !!box && box.scrollHeight - box.scrollTop - box.clientHeight >= 40;
 }
 
-function mbPollOnce() {
-  const dot = $("meetbridge-nav-dot");
-  api(`${MEET_BRIDGE_BASE}/status`).then((health) => {
-    if (dot) { dot.classList.toggle("ok", !!health.ok); dot.classList.toggle("danger", !health.ok); }
-    $("mb-status-line").textContent = health.meetingUrl ? `bridge online — ${health.meetingUrl}` : "bridge online — no meeting";
-    mbRenderCard(health, false);
-    return api(`${MEET_BRIDGE_BASE}/captions?since=${mbSince}`);
-  }).then((payload) => {
-    const rows = payload.captions || [];
-    if (rows.length) {
-      mbSince = Math.max(mbSince, ...rows.map((r) => r.at || 0));
-      mbAppendCaptions(rows);
-    }
-  }).catch((error) => {
-    if (dot) { dot.classList.remove("ok"); dot.classList.add("danger"); }
-    $("mb-status-line").textContent = `bridge offline (${error.message})`;
-    mbRenderCard({}, true);
-  });
-  if (state.page === "meetbridge") setTimeout(mbPollOnce, 1500);
-  else mbPolling = false;
+function silencesShouldDeferRender() {
+  const box = $("sil-turns");
+  return !!box && (box.matches(":hover") || hasSelectionIn("sil-turns") || silencesScrolledUp());
 }
 
-async function loadMeetBridge() {
-  const feed = $("mb-captions-feed");
-  if (!feed.hasChildNodes()) feed.appendChild(el("div", "hint", "Caption lines appear here the moment anyone speaks in the bridged meeting."));
-  if (mbPolling) return;
-  mbPolling = true;
-  mbPollOnce();
+function renderSilencesSummary(run) {
+  const logic = silencesLogic();
+  const summary = $("sil-summary");
+  if (!logic || !summary || !run) return;
+  const stats = logic.summarizeRun(run);
+  summary.replaceChildren(
+    silencesMetric("Turns completed", `${stats.completed}/${stats.total}`),
+    silencesMetric("Scored turns", String(stats.scored)),
+    silencesMetric("Correct", String(stats.correct)),
+    silencesMetric("Errors", String(stats.errors)),
+    silencesMetric("Mean latency", silencesLatency(stats.meanLatencyMs)),
+    silencesMetric("Median latency", silencesLatency(stats.medianLatencyMs)),
+    silencesMetric("Max latency", silencesLatency(stats.maxLatencyMs)),
+  );
+}
+
+function renderSilencesExpected(run) {
+  const logic = silencesLogic();
+  const target = $("sil-expected-seq");
+  if (!logic || !target || !run) return;
+  const test = logic.TESTS[run.testId] || logic.TESTS.count20;
+  const strip = el("div", "silence-token-strip");
+  test.tokens.forEach((token, index) => {
+    const cls = "silence-token" + (index < run.nextIndex ? " done" : (index === run.nextIndex ? " current" : ""));
+    const node = el("span", cls);
+    node.append(mono(token), el("span", "silence-token-role", logic.expectedRoleFor(index, run.firstRole)));
+    strip.appendChild(node);
+  });
+  target.replaceChildren(strip);
+}
+
+function silencesTurnsTable(turns) {
+  const t = table(["#", "Status", "Expected", "Observed", "Role", "Speaker", "Caption", "Latency", "Finding"], turns.map((turn) => [
+    String(turn.turnNumber),
+    silencesStatusBadge(turn.status),
+    `${turn.expectedToken || "\u2014"} / ${turn.expectedRole || "\u2014"}`,
+    turn.observedToken || "\u2014",
+    turn.role || "\u2014",
+    turn.speaker || "\u2014",
+    turn.text || "",
+    silencesLatency(turn.latencyMs),
+    turn.detail,
+  ]));
+  [...t.querySelectorAll("tbody tr")].forEach((tr, index) => {
+    tr.classList.add(`silence-turn-${turns[index].status}`);
+    tr.title = turns[index].key || "";
+  });
+  return t;
+}
+
+function renderSilencesTurns(run, options = {}) {
+  const box = $("sil-turns");
+  const jump = $("sil-jump");
+  const note = $("sil-paused-note");
+  if (!box || !run) return;
+  if (!options.force && run.turns.length && silencesShouldDeferRender()) {
+    state.silences.pendingRender = true;
+    state.silences.pendingRows = run.turns.length;
+    if (jump) jump.hidden = false;
+    if (note) note.textContent = "Turn list paused while hovered, selected, or scrolled up.";
+    return;
+  }
+  state.silences.pendingRender = false;
+  state.silences.pendingRows = 0;
+  if (jump) jump.hidden = true;
+  if (note) note.textContent = "";
+  box.replaceChildren(run.turns.length
+    ? silencesTurnsTable(run.turns)
+    : el("div", "hint", "Press Start, then speak the sequence in alternating turns. Finalized captions appear here as they are scored."));
+  if (silencesAutoscrollOn() || options.force) box.scrollTop = box.scrollHeight;
+}
+
+function renderSilencesPage(options = {}) {
+  const logic = silencesLogic();
+  if (!logic) {
+    $("sil-status").textContent = "silences.js failed to load";
+    return;
+  }
+  const run = silencesRun();
+  $("sil-start").disabled = state.silences.running;
+  $("sil-stop").disabled = !state.silences.running;
+  $("sil-test").disabled = state.silences.running;
+  $("sil-first-role").disabled = state.silences.running;
+  setSilencesAutoscroll(silencesAutoscrollOn());
+  const captionData = state.silences.lastCaptionData;
+  $("sil-transport-line").textContent = captionData
+    ? `captions ${(captionData.captions || []).length} · ${meetTransportLine(captionData)} · ${meetTransportByRoleLine(captionData)}`
+    : "caption feed not sampled yet";
+  renderSilencesSummary(run);
+  renderSilencesExpected(run);
+  renderSilencesTurns(run, options);
+  if (!state.silences.running && logic.summarizeRun(run).completed >= logic.TESTS[run.testId].tokens.length) {
+    $("sil-status").textContent = "complete";
+  }
+}
+
+async function silencesPollCaptions() {
+  const logic = silencesLogic();
+  const run = silencesRun();
+  if (!logic || !run || !state.silences.running) return;
+  const query = new URLSearchParams({ since: String(run.startedAtSec), fromEnd: "100" });
+  const data = await api(`${MEET_BRIDGE_BASE}/captions?${query}`);
+  state.silences.lastCaptionData = data;
+  const captions = ((data && data.captions) || []).slice().sort((a, b) => (a.at || 0) - (b.at || 0));
+  let scored = 0;
+  captions.forEach((caption) => {
+    if (logic.scoreCaption(run, caption)) scored += 1;
+  });
+  const stats = logic.summarizeRun(run);
+  if (stats.completed >= stats.total) state.silences.running = false;
+  $("sil-status").textContent = state.silences.running
+    ? `running · ${scored} new scored turn${scored === 1 ? "" : "s"}`
+    : (stats.completed >= stats.total ? "complete" : "stopped");
+  renderSilencesPage();
+}
+
+function resetSilencesRun() {
+  const logic = silencesLogic();
+  if (!logic) return;
+  state.silences.running = false;
+  state.silences.lastCaptionData = null;
+  state.silences.pendingRender = false;
+  state.silences.run = logic.createRun({
+    testId: $("sil-test").value,
+    firstRole: $("sil-first-role").value,
+    startedAtSec: Date.now() / 1000,
+  });
+  $("sil-status").textContent = "ready";
+  renderSilencesPage({ force: true });
+}
+
+function startSilencesRun() {
+  const logic = silencesLogic();
+  if (!logic) return;
+  state.silences.running = true;
+  state.silences.lastCaptionData = null;
+  state.silences.run = logic.createRun({
+    testId: $("sil-test").value,
+    firstRole: $("sil-first-role").value,
+    startedAtSec: Date.now() / 1000,
+  });
+  $("sil-status").textContent = "running";
+  renderSilencesPage({ force: true });
+  if (!state.silences.polling) {
+    state.silences.polling = true;
+    silencesPollOnce();
+  }
+}
+
+function stopSilencesRun() {
+  state.silences.running = false;
+  $("sil-status").textContent = "stopped";
+  renderSilencesPage();
+}
+
+function driveNextSilenceAgentTurn() {
+  // SEAM for queued task agent-voices-via-companion: speak the current expected token here.
+}
+
+function silencesPollOnce() {
+  if (!state.silences.running) {
+    state.silences.polling = false;
+    renderSilencesPage();
+    return;
+  }
+  silencesPollCaptions().catch((error) => {
+    $("sil-status").textContent = `caption feed error: ${error.message}`;
+    pushError(`silences: ${error.message}`);
+  }).finally(() => {
+    if (state.page === "silences" && state.silences.running) setTimeout(silencesPollOnce, 1000);
+    else state.silences.polling = false;
+  });
+}
+
+async function loadSilencesWithPolling() {
+  silencesRun();
+  renderSilencesPage();
+  if (!state.silences.running || state.silences.polling) return;
+  state.silences.polling = true;
+  silencesPollOnce();
 }
 
 /* ---- voices */
@@ -3170,24 +3535,35 @@ async function loadVoices() {
 async function loadStt() {
   const body = $("stt-body");
   try {
-    const data = await api(`${V1}/stt/transcripts?limit=100`);
-    const events = (data.events || []).slice().reverse();
+    const data = await api(`${V1}/streams/stt_transcripts/tail?count=100`);
+    const events = (data.events || []).slice().sort((a, b) => {
+      const at = Date.parse(a.ts || "") || 0;
+      const bt = Date.parse(b.ts || "") || 0;
+      if (at !== bt) return bt - at;
+      return (b.seq || 0) - (a.seq || 0);
+    });
     body.replaceChildren();
     const p = panel("Recent STT transcripts (newest first) — includes hypotheses ingested from this page or any recognizer");
-    p.content.appendChild(events.length ? table(
-      ["Time", "Engine", "Final", "Confidence", "Text", "Correlation"],
-      events.map((e) => {
-        const d = e.data || {};
-        const isError = e.type === "STT_ENGINE_ERROR";
-        const text = d.text || d.normalized_text || d.raw_text || (isError ? `⚠ ${d.error || "error"}` : "—");
-        return [
-          shortTs(e.ts), mono(d.engine || e.source_id || "—"),
-          d.is_final ? badge("final", "ok") : badge("partial", "warn"),
-          mono(d.confidence != null ? String(d.confidence) : "—"),
-          isError ? el("span", "hint", text) : (text || "—"), mono(d.correlation_id || e.correlation_id || e.id),
-        ];
-      })
-    ) : el("div", "hint", "No transcripts yet. Ingest text below, or use the mic button to test with real speech recognition."));
+    if (events.length) {
+      const transcriptTable = table(
+        ["Time", "Engine", "Final", "Confidence", "Text", "Correlation"],
+        events.map((e) => {
+          const d = e.data || {};
+          const isError = e.type === "STT_ENGINE_ERROR";
+          const text = d.text || d.normalized_text || d.raw_text || (isError ? `⚠ ${d.error || "error"}` : "—");
+          return [
+            shortTs(e.ts), mono(d.engine || e.source_id || "—"),
+            d.is_final ? badge("final", "ok") : badge("partial", "warn"),
+            mono(d.confidence != null ? String(d.confidence) : "—"),
+            isError ? el("span", "hint", text) : (text || "—"), mono(d.correlation_id || e.correlation_id || e.id),
+          ];
+        }),
+      );
+      transcriptTable.classList.add("stt-transcript-table");
+      p.content.appendChild(transcriptTable);
+    } else {
+      p.content.appendChild(el("div", "hint", "No transcripts yet. Ingest text below, or use the mic button to test with real speech recognition."));
+    }
     body.appendChild(p.root);
   } catch (error) { body.textContent = `error: ${error.message}`; }
   primeSttEngineRows();
@@ -3254,6 +3630,7 @@ function sttEngineTbody() {
   const host = $("stt-engine-body");
   host.replaceChildren();
   const t = table(["Engine", "Status", "Confidence", "Text", "Time"], []);
+  t.classList.add("stt-engine-table");
   host.appendChild(t);
   return t.querySelector("tbody");
 }
@@ -3263,6 +3640,7 @@ function sttEngineRow(engine) {
   if (row) return row;
   const tbody = sttEngineTbody();
   const tr = el("tr");
+  tr.dataset.engine = engine;
   if (engine === "disambiguator") tr.classList.add("stt-final-row");
   const tdEngine = el("td"); tdEngine.appendChild(mono(sttEngineLabel(engine)));
   const tdStatus = el("td"); tdStatus.appendChild(badge("waiting…", ""));
@@ -3272,8 +3650,17 @@ function sttEngineRow(engine) {
   tr.append(tdEngine, tdStatus, tdConf, tdText, tdTime);
   // Keep the disambiguator's final-result row pinned to the bottom, visually
   // separated from the individual per-engine hypotheses above it.
-  if (engine === "disambiguator") tbody.appendChild(tr);
-  else tbody.insertBefore(tr, tbody.querySelector(".stt-final-row"));
+  if (engine === "disambiguator") {
+    tbody.appendChild(tr);
+  } else {
+    const rows = Array.from(tbody.querySelectorAll("tr"));
+    const nextRow = rows.find(r => r.classList.contains("stt-final-row") || (r.dataset.engine && r.dataset.engine.localeCompare(engine) > 0));
+    if (nextRow) {
+      tbody.insertBefore(tr, nextRow);
+    } else {
+      tbody.appendChild(tr);
+    }
+  }
   row = { tr, tdStatus, tdConf, tdText, tdTime };
   sttEngineRows.set(engine, row);
   return row;
@@ -3281,7 +3668,8 @@ function sttEngineRow(engine) {
 
 function primeSttEngineRows() {
   api(`${V1}/status`).then((status) => {
-    const engines = (status.subsystems && status.subsystems.stt && status.subsystems.stt.engines) || [];
+    let engines = (status.subsystems && status.subsystems.stt && status.subsystems.stt.engines) || [];
+    engines = [...engines].sort((a, b) => a.localeCompare(b));
     $("stt-engine-hint").textContent = engines.length
       ? `Configured server drivers: ${engines.join(", ")}, then disambiguator. google_meet reads the Meet bridge; browser Web Speech is a separate test and appears as web_speech.`
       : "No STT engines configured.";
@@ -3335,12 +3723,17 @@ async function sttIngest(text, opts = {}) {
   }
 }
 
+let sttHoverPaused = false;
+let sttScrollPaused = false;
+
 function sttLiveLog(text) {
   const log = $("stt-live-log");
   if (!log) return;
   const line = el("div", "mono", `${new Date().toLocaleTimeString()}  ${text}`);
   log.appendChild(line);
-  log.scrollTop = log.scrollHeight;
+  if (!sttHoverPaused && !sttScrollPaused && !hasSelectionIn("stt-live-log")) {
+    log.scrollTop = log.scrollHeight;
+  }
 }
 
 // Two listening modes -- this is an explicit "allowed to stop itself or not"
@@ -3661,7 +4054,59 @@ function wireToggle(id, onChange) {
 function table(headers, rows) {
   const t = el("table");
   const thead = el("thead"); const hr = el("tr");
-  headers.forEach((h) => hr.appendChild(el("th", null, h)));
+  let sortCol = -1;
+  let sortDir = 1;
+
+  const ths = headers.map((h, i) => {
+    const th = el("th", null, h);
+    th.style.cursor = "pointer";
+    th.title = "Click to sort";
+    th.addEventListener("click", () => {
+      const tbody = t.querySelector("tbody");
+      if (!tbody) return;
+      if (sortCol === i) {
+        sortDir *= -1;
+      } else {
+        sortCol = i;
+        sortDir = 1;
+      }
+
+      const rowsArr = Array.from(tbody.querySelectorAll("tr"));
+      const pinned = [];
+      const sortable = [];
+      rowsArr.forEach((r) => {
+        if (r.classList.contains("stt-final-row") || r.classList.contains("pinned-row")) {
+          pinned.push(r);
+        } else {
+          sortable.push(r);
+        }
+      });
+
+      sortable.sort((a, b) => {
+        const cellA = a.children[i];
+        const cellB = b.children[i];
+        const textA = cellA ? cellA.textContent.trim() : "";
+        const textB = cellB ? cellB.textContent.trim() : "";
+
+        const numA = parseFloat(textA.replace(/[^0-9.-]/g, ""));
+        const numB = parseFloat(textB.replace(/[^0-9.-]/g, ""));
+        if (!isNaN(numA) && !isNaN(numB) && /^[\d.,%ms-]+$/.test(textA) && /^[\d.,%ms-]+$/.test(textB)) {
+           return (numA - numB) * sortDir;
+        }
+        return textA.localeCompare(textB) * sortDir;
+      });
+
+      sortable.forEach(r => tbody.appendChild(r));
+      pinned.forEach(r => tbody.appendChild(r));
+
+      ths.forEach((c, idx) => {
+        c.textContent = headers[idx] + (idx === sortCol ? (sortDir === 1 ? " ▲" : " ▼") : "");
+      });
+    });
+    return th;
+  });
+
+  ths.forEach((th) => hr.appendChild(th));
   thead.appendChild(hr); t.appendChild(thead);
   const tbody = el("tbody");
   rows.forEach((cells) => {
@@ -3827,14 +4272,32 @@ function wireEvents() {
     if (event.key === "Escape") toggleEndpointPopover(false);
   });
 
+  document.addEventListener("selectionchange", () => {
+    Object.values(state.views).forEach((v) => {
+      if (v.updatePauseState) v.updatePauseState(true);
+    });
+    if (state.silences.pendingRender && !hasSelectionIn("sil-turns") && !silencesScrolledUp()) {
+      renderSilencesTurns(silencesRun(), { force: true });
+    }
+  });
+
+  const sttLog = $("stt-live-log");
+  if (sttLog) {
+    sttLog.addEventListener("mouseenter", () => { sttHoverPaused = true; });
+    sttLog.addEventListener("mouseleave", () => { sttHoverPaused = false; });
+    sttLog.addEventListener("scroll", () => {
+      sttScrollPaused = sttLog.scrollHeight - sttLog.scrollTop - sttLog.clientHeight >= 40;
+    });
+  }
+
   // transcript controls
   ["tr-search", "tr-finals", "tr-hide-partials", "tr-hide-echo", "tr-hide-routine", "tr-minconf", "tr-cap"]
     .forEach((id) => $(id).addEventListener("input", refreshTranscriptFilter));
   $("tr-pause").onclick = () => {
     const view = state.views.transcript;
-    view.setPaused(!view.paused);
-    $("tr-pause").textContent = view.paused ? "Resume" : "Pause";
-    $("tr-pause").classList.toggle("primary", !view.paused);
+    view.setPaused(!view.manualPaused);
+    $("tr-pause").textContent = view.manualPaused ? "Resume" : "Pause";
+    $("tr-pause").classList.toggle("primary", !view.manualPaused);
   };
   $("tr-backfill").onclick = () => backfill(TRANSCRIPT_STREAMS, state.views.transcript);
   $("tr-export").onclick = () => exportView(state.views.transcript, "transcript");
@@ -3846,8 +4309,8 @@ function wireEvents() {
   });
   $("cv-pause").onclick = () => {
     const view = state.views.conversation;
-    view.setPaused(!view.paused);
-    $("cv-pause").textContent = view.paused ? "Resume" : "Pause";
+    view.setPaused(!view.manualPaused);
+    $("cv-pause").textContent = view.manualPaused ? "Resume" : "Pause";
   };
   $("cv-send").onclick = async () => {
     const text = $("cv-text").value.trim();
@@ -3873,8 +4336,8 @@ function wireEvents() {
     }));
   $("st-pause").onclick = () => {
     const view = state.views.streams;
-    view.setPaused(!view.paused);
-    $("st-pause").textContent = view.paused ? "Resume" : "Pause";
+    view.setPaused(!view.manualPaused);
+    $("st-pause").textContent = view.manualPaused ? "Resume" : "Pause";
   };
   $("st-backfill").onclick = () => backfill([$("st-stream").value], state.views.streams);
   $("st-export").onclick = () => exportView(state.views.streams, $("st-stream").value);
@@ -3936,15 +4399,37 @@ function wireEvents() {
     if (!text) { pushError("Enter text to speak into the meeting."); return; }
     postMeetCommand(`/say ${text}`);
   };
-  $("mb-refresh").onclick = loadMeetBridge;
+  $("sil-start").onclick = startSilencesRun;
+  $("sil-stop").onclick = stopSilencesRun;
+  $("sil-reset").onclick = resetSilencesRun;
+  $("sil-test").onchange = resetSilencesRun;
+  $("sil-first-role").onchange = resetSilencesRun;
+  $("sil-autoscroll").onclick = () => {
+    const next = !silencesAutoscrollOn();
+    setSilencesAutoscroll(next);
+    if (next) renderSilencesTurns(silencesRun(), { force: true });
+  };
+  $("sil-jump").onclick = () => {
+    const sel = window.getSelection();
+    if (sel) sel.removeAllRanges();
+    renderSilencesTurns(silencesRun(), { force: true });
+  };
+  $("sil-drive-next").onclick = driveNextSilenceAgentTurn;
+  $("sil-turns").addEventListener("mouseleave", () => {
+    if (state.silences.pendingRender && !silencesScrolledUp() && !hasSelectionIn("sil-turns")) {
+      renderSilencesTurns(silencesRun(), { force: true });
+    }
+  });
+  $("sil-turns").addEventListener("scroll", () => {
+    if (!silencesScrolledUp() && state.silences.pendingRender && !hasSelectionIn("sil-turns")) {
+      renderSilencesTurns(silencesRun(), { force: true });
+    } else if (silencesScrolledUp() && state.silences.run && state.silences.run.turns.length) {
+      $("sil-jump").hidden = false;
+      $("sil-paused-note").textContent = "Turn list paused while hovered, selected, or scrolled up.";
+    }
+  });
   $("br-refresh").onclick = () => loadBrowserSettings();
   $("ps-refresh").onclick = loadProcesses;
-  $("mb-join-btn").onclick = () => {
-    const url = $("mb-join-url").value.trim();
-    if (!url) { pushError("Enter a meeting URL to join."); return; }
-    postMeetBridgeCommand(`/join ${url}`);
-  };
-  $("mb-new-btn").onclick = () => postMeetBridgeCommand("/new");
   $("vc-refresh").onclick = loadVoices;
   $("vc-assign").onclick = async () => {
     try { await api(`${V1}/voices/assign`, { method: "POST", body: { policy: $("vc-policy").value } }); loadVoices(); }

@@ -5,6 +5,8 @@ def test_secondary_capture_state_defaults(service) -> None:
     state = service.secondary_capture_state()
     assert state["listening"] is False
     assert state["device_id"] == ""
+    assert state["source_kind"] == "companion_heard"
+    assert state["audio_source"] == "companion_heard_meeting_audio"
 
 
 def test_secondary_capture_rest_start_stop(client, admin_headers, app_context) -> None:

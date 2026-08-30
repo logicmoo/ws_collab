@@ -227,3 +227,64 @@ def test_no_op_when_text_is_unchanged() -> None:
     tracker.update([_row("row1", "Hello there")], [], emit)
     tracker.update([_row("row1", "Hello there")], [], emit)  # repeat, unchanged
     assert emits == []
+
+
+def test_recreated_scrollback_rows_are_not_reemitted_every_poll() -> None:
+    tracker = _tracker()
+    emits, emit = _recorder()
+
+    for cycle in range(10):
+        tracker.update(
+            [
+                _row(f"old-{cycle}-1", "Already said one."),
+                _row(f"old-{cycle}-2", "Already said two."),
+            ],
+            [f"old-{cycle}-1", f"old-{cycle}-2"],
+            emit,
+        )
+
+    assert emits == []
+
+    for cycle in range(10, 20):
+        tracker.update(
+            [
+                _row(f"new-{cycle}-1", "Already said one."),
+                _row(f"new-{cycle}-2", "Already said two."),
+                _row(f"new-{cycle}-3", "Fresh sentence."),
+            ],
+            [f"new-{cycle}-1", f"new-{cycle}-2", f"new-{cycle}-3"],
+            emit,
+        )
+
+    assert emits == [("new-10-3", "Alice", "Fresh sentence.", True, None)]
+
+
+def test_cold_start_warming_ignores_recreated_scrollback_keys() -> None:
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    tracker = CaptionTracker(settle=1.2, clock=clock)
+    emits, emit = _recorder()
+
+    for cycle in range(5):
+        now = cycle * 0.2
+        tracker.update(
+            [
+                _row(f"old-{cycle}-1", "Already said one."),
+                _row(f"old-{cycle}-2", "Already said two."),
+            ],
+            [f"old-{cycle}-1", f"old-{cycle}-2"],
+            emit,
+        )
+
+    now = 1.3
+    tracker.update(
+        [_row("old-final-1", "Already said one."), _row("old-final-2", "Already said two.")],
+        ["old-final-1", "old-final-2"],
+        emit,
+    )
+
+    assert emits == []
+    assert tracker._baseline_warming is False

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 import re
@@ -71,13 +72,14 @@ from . import __version__
 from .meet_bridge.cdp import (
     DEFAULT_POPUP_PORT,
     DEFAULT_PROFILE,
-    CdpTab,
     browser_profile_root,
     cdp_alive,
     find_browser,
+    find_add_account_tab,
     find_sso_tab,
+    find_sso_connector_tab,
     foreground_sso_tab,
-    open_url,
+    reuse_or_open_tab,
     scan_signed_in_sso_accounts,
 )
 from .meet_browser_settings import MeetBrowserSettings
@@ -91,6 +93,11 @@ DEFAULT_ROUTE_SOURCE = "microphone"
 # to this ceiling (effectively "all") and only truncate the final result.
 _MAX_SCAN = 100_000
 MEET_ROLES = ("host", "companion", "guest")
+_MEET_URL_RE = re.compile(
+    r"https?://meet\.google\.com/([a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4})(?:[/?#][^\s\"'<)]*)?",
+    re.IGNORECASE,
+)
+_IGNORED_MEET_ROOMS = {"xxx-yyyy-zzz"}
 
 
 def _sso_sort_key(account_id: str) -> tuple[int, str]:
@@ -180,6 +187,8 @@ class WsCollabService:
         self.routing = RoutingManager(config.state_dir, audit_sink=self._audit_sink)
         self.sound_settings = SoundSettings(config.state_dir)
         self.meet_browser_settings = MeetBrowserSettings(config.state_dir)
+        self._known_meeting_scan_at = 0.0
+        self._known_meeting_scan_cache: list[str] = []
         self.admin_ui_state = AdminUIState(config.state_dir)
         self._meet_bridge_process: subprocess.Popen[Any] | None = None
         self.voices = VoiceManager(config, config.state_dir, audit_sink=self._audit_sink)
@@ -221,14 +230,19 @@ class WsCollabService:
         # mailboxes) as a read-only mailbox. server-agents is the default entry.
         # Runtime-created ones (e.g. a saved merge combo) are durable and marked
         # runtime="1"; config entries are re-applied on top and win on clashes.
-        self._virtual: dict[str, dict[str, str]] = {}
+        self._virtual: dict[str, dict[str, Any]] = {}
         self._load_virtual_registry()
         for entry in (getattr(config, "virtual_mailboxes", None) or []):
             if entry.get("mailbox") and entry.get("source"):
-                self._virtual[str(entry.get("mailbox"))] = {
+                spec: dict[str, Any] = {
                     "source": str(entry.get("source", "")),
                     "purpose": str(entry.get("purpose", "")),
                 }
+                if isinstance(entry.get("rules"), list):
+                    spec["rules"] = [rule for rule in entry.get("rules", []) if isinstance(rule, dict)]
+                if entry.get("policy"):
+                    spec["policy"] = str(entry.get("policy"))
+                self._virtual[str(entry.get("mailbox"))] = spec
         # Global namespace prefix for this server's mailboxes (federation).
         self._global_name = str(getattr(config, "global_name", "") or "").strip()
 
@@ -270,6 +284,85 @@ class WsCollabService:
         except OSError:
             return False
 
+    def _meet_bridge_pid_path(self) -> Path:
+        return Path(self.config.state_dir) / "meet_bridge.pid"
+
+    def _is_pid_alive(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            process_query_limited_information = 0x1000
+            synchronize = 0x00100000
+            wait_timeout = 0x00000102
+            handle = kernel32.OpenProcess(process_query_limited_information | synchronize, False, int(pid))
+            if not handle:
+                return False
+            try:
+                return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+            finally:
+                kernel32.CloseHandle(handle)
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def _meet_bridge_tracked_process_running(self) -> bool:
+        process = getattr(self, "_meet_bridge_process", None)
+        if process is None:
+            return False
+        try:
+            running = process.poll() is None
+        except Exception:
+            running = False
+        if running:
+            return True
+        self._meet_bridge_process = None
+        self._cleanup_stale_meet_bridge_pid(process.pid if getattr(process, "pid", None) else None)
+        return False
+
+    def _meet_bridge_pid_running(self) -> int | None:
+        pid_path = self._meet_bridge_pid_path()
+        try:
+            raw = pid_path.read_text(encoding="utf-8").strip()
+            pid = int(raw)
+        except OSError:
+            return None
+        except ValueError:
+            self._cleanup_stale_meet_bridge_pid()
+            return None
+        if self._is_pid_alive(pid):
+            return pid
+        self._cleanup_stale_meet_bridge_pid(pid)
+        return None
+
+    def _cleanup_stale_meet_bridge_pid(self, pid: int | None = None) -> None:
+        pid_path = self._meet_bridge_pid_path()
+        try:
+            raw = pid_path.read_text(encoding="utf-8").strip()
+            current = int(raw)
+        except (OSError, ValueError):
+            current = None
+        if pid is not None and current is not None and current != pid:
+            return
+        try:
+            pid_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    def _write_meet_bridge_pid(self, pid: int) -> None:
+        pid_path = self._meet_bridge_pid_path()
+        try:
+            pid_path.parent.mkdir(parents=True, exist_ok=True)
+            pid_path.write_text(str(int(pid)), encoding="utf-8")
+        except OSError:
+            pass
+
     def _meet_profile_path(self) -> Path:
         return Path(str(self.meet_browser_settings.get("profile_path") or DEFAULT_PROFILE)).expanduser()
 
@@ -283,12 +376,18 @@ class WsCollabService:
         accounts: dict[str, Any] | None = None,
         role_account_map: dict[str, Any] | None = None,
         meeting_role_account_maps: dict[str, Any] | None = None,
+        companion_click: dict[str, Any] | None = None,
+        meeting_companion_click: dict[str, Any] | None = None,
+        known_meeting_urls: list[str] | None = None,
     ) -> dict[str, Any]:
         return self.meet_browser_settings.set_profile_state(
             profile_path or self._meet_profile_path(),
             accounts=accounts,
             role_account_map=role_account_map,
             meeting_role_account_maps=meeting_role_account_maps,
+            companion_click=companion_click,
+            meeting_companion_click=meeting_companion_click,
+            known_meeting_urls=known_meeting_urls,
         )
 
     def _normalize_sso_accounts(self, accounts: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
@@ -402,14 +501,139 @@ class WsCollabService:
     @staticmethod
     def _meet_assignment_key(meeting_url: str) -> str:
         value = str(meeting_url or "").strip()
+        room_match = re.fullmatch(r"[a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4}", value, re.IGNORECASE)
+        if room_match:
+            return f"https://meet.google.com/{room_match.group(0).lower()}"
         match = re.match(
             r"^https?://meet\.google\.com/([a-z0-9-]+)(?:[/?#].*)?$",
             value,
             re.IGNORECASE,
         )
         if not match:
-            raise ValidationError("meeting_url must be a Google Meet room URL")
+            raise ValidationError("meeting_url must be a Google Meet room URL or room id")
         return f"https://meet.google.com/{match.group(1).lower()}"
+
+    @staticmethod
+    def _normal_meet_url(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        match = _MEET_URL_RE.search(value)
+        if not match:
+            return None
+        room = match.group(1).lower()
+        if room in _IGNORED_MEET_ROOMS:
+            return None
+        return f"https://meet.google.com/{room}"
+
+    def _collect_meet_urls_from_value(
+        self,
+        value: Any,
+        found: dict[str, str],
+        source: str,
+        *,
+        depth: int = 0,
+    ) -> None:
+        if depth > 12:
+            return
+        if isinstance(value, str):
+            for match in _MEET_URL_RE.finditer(value):
+                url = self._normal_meet_url(match.group(0))
+                if url:
+                    found.setdefault(url, source)
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                self._collect_meet_urls_from_value(key, found, source, depth=depth + 1)
+                self._collect_meet_urls_from_value(child, found, source, depth=depth + 1)
+            return
+        if isinstance(value, list):
+            for child in value:
+                self._collect_meet_urls_from_value(child, found, source, depth=depth + 1)
+
+    def _profile_under_state_dir(self, profile_path: Path) -> bool:
+        try:
+            profile_path.resolve().relative_to(Path(self.config.state_dir).resolve())
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _collect_meet_urls_from_profile_history(self, profile_path: Path, found: dict[str, str]) -> None:
+        candidates = [Path(self.config.state_dir) / "meet_bridge_profile"]
+        if self._profile_under_state_dir(profile_path):
+            candidates.append(profile_path)
+        for profile in candidates:
+            if not profile.exists():
+                continue
+            for pattern in ("History", "Tabs_*"):
+                for path in profile.rglob(pattern):
+                    if not path.is_file():
+                        continue
+                    try:
+                        if path.stat().st_size > 64 * 1024 * 1024:
+                            continue
+                        text = path.read_bytes().decode("utf-8", errors="ignore")
+                    except OSError:
+                        continue
+                    self._collect_meet_urls_from_value(text, found, f"browser profile {path.name}")
+
+    def _historical_meet_urls(self, profile_path: Path) -> dict[str, str]:
+        found: dict[str, str] = {}
+        for stream in [*STREAMS, *self._dynamic_mailboxes]:
+            try:
+                for event in self.store.tail(stream, _MAX_SCAN):
+                    self._collect_meet_urls_from_value(event.to_dict(), found, f"{stream} event history")
+            except Exception:
+                continue
+        try:
+            admin_state = self.admin_ui_state.get_page("meet").get("state", {})
+            self._collect_meet_urls_from_value(admin_state, found, "admin UI state")
+        except Exception:
+            pass
+        self._collect_meet_urls_from_profile_history(profile_path, found)
+        return found
+
+    def _remember_known_meeting_urls(
+        self,
+        profile_path: Path,
+        urls: list[str] | tuple[str, ...] | set[str],
+    ) -> list[str]:
+        state = self._meet_profile_state(profile_path)
+        known: list[str] = []
+        seen: set[str] = set()
+        raw_known = state.get("known_meeting_urls", [])
+        raw_maps = state.get("meeting_role_account_maps", {})
+        raw_click_maps = state.get("meeting_companion_click", {})
+        candidates: list[Any] = []
+        if isinstance(raw_known, list):
+            candidates.extend(raw_known)
+        if isinstance(raw_maps, dict):
+            candidates.extend(raw_maps.keys())
+        if isinstance(raw_click_maps, dict):
+            candidates.extend(raw_click_maps.keys())
+        candidates.extend(urls)
+        for candidate in candidates:
+            url = self._normal_meet_url(candidate)
+            if url and url not in seen:
+                seen.add(url)
+                known.append(url)
+        if known != raw_known:
+            self._set_meet_profile_state(profile_path, known_meeting_urls=known)
+        return known
+
+    def _known_meeting_urls(self, profile_path: Path, *, include_history: bool = True) -> list[str]:
+        state = self._meet_profile_state(profile_path)
+        known = self._remember_known_meeting_urls(profile_path, set())
+        if include_history:
+            now = time.time()
+            if not self._known_meeting_scan_cache or now - self._known_meeting_scan_at > 60.0:
+                recovered = self._historical_meet_urls(profile_path)
+                self._known_meeting_scan_cache = sorted(recovered)
+                self._known_meeting_scan_at = now
+            known = self._remember_known_meeting_urls(profile_path, set(self._known_meeting_scan_cache))
+        live_url = self._normal_meet_url((self._meet_bridge_health_for_settings() or {}).get("meetingUrl"))
+        if live_url:
+            known = self._remember_known_meeting_urls(profile_path, {live_url})
+        return known
 
     def _meeting_role_overrides(
         self,
@@ -447,6 +671,114 @@ class WsCollabService:
                 else:
                     effective.pop(role, None)
         return effective, overrides
+
+    @staticmethod
+    def _normalize_companion_click_setting(raw: Any, default: dict[str, Any] | None = None) -> dict[str, Any]:
+        baseline = default or {
+            "enabled": False,
+            "intervalSeconds": 2.0,
+            "mode": "reactive",
+            "trigger": "caption",
+            "afterSeconds": 10.0,
+            "silenceMs": 500.0,
+            "minGapSeconds": 6.0,
+            "maxWaitSeconds": 0.0,
+            "audioRmsThreshold": 0.015,
+            "clickMs": 100.0,
+            "gain": 0.12,
+            "sound": "uh",
+            "f0Hz": 125.0,
+            "f1Hz": 600.0,
+            "f2Hz": 1300.0,
+        }
+        row = raw if isinstance(raw, dict) else {}
+        enabled = bool(row.get("enabled", baseline.get("enabled", False)))
+        aliases = {
+            "intervalSeconds": ("intervalSeconds", "interval_seconds"),
+            "afterSeconds": ("afterSeconds", "after_seconds"),
+            "silenceMs": ("silenceMs", "silence_ms"),
+            "minGapSeconds": ("minGapSeconds", "min_gap_seconds"),
+            "maxWaitSeconds": ("maxWaitSeconds", "max_wait_seconds"),
+            "audioRmsThreshold": ("audioRmsThreshold", "audio_rms_threshold"),
+            "clickMs": ("clickMs", "click_ms"),
+            "gain": ("gain",),
+            "f0Hz": ("f0Hz", "f0_hz", "f0"),
+            "f1Hz": ("f1Hz", "f1_hz", "f1"),
+            "f2Hz": ("f2Hz", "f2_hz", "f2"),
+        }
+
+        def positive(name: str, fallback: float) -> float:
+            raw_value = next((row[key] for key in aliases[name] if key in row), baseline.get(name, fallback))
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                value = float(baseline.get(name, fallback))
+            return value if value > 0 else float(baseline.get(name, fallback))
+
+        def nonnegative(name: str, fallback: float) -> float:
+            raw_value = next((row[key] for key in aliases[name] if key in row), baseline.get(name, fallback))
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                value = float(baseline.get(name, fallback))
+            return value if value >= 0 else float(baseline.get(name, fallback))
+
+        mode = str(row.get("mode") or baseline.get("mode") or "reactive").lower()
+        if mode not in {"reactive", "fixed"}:
+            mode = "reactive"
+        trigger = str(row.get("trigger") or baseline.get("trigger") or "caption").lower()
+        if trigger not in {"caption", "audio", "both"}:
+            trigger = "caption"
+        sound = str(row.get("sound") or baseline.get("sound") or "uh").lower()
+        if sound not in {"uh", "click"}:
+            sound = "uh"
+        return {
+            "enabled": enabled,
+            "intervalSeconds": positive("intervalSeconds", 2.0),
+            "mode": mode,
+            "trigger": trigger,
+            "afterSeconds": positive("afterSeconds", 10.0),
+            "silenceMs": positive("silenceMs", 500.0),
+            "minGapSeconds": positive("minGapSeconds", 6.0),
+            "maxWaitSeconds": nonnegative("maxWaitSeconds", 0.0),
+            "audioRmsThreshold": nonnegative("audioRmsThreshold", 0.015),
+            "clickMs": positive("clickMs", 100.0),
+            "gain": min(1.0, positive("gain", 0.12)),
+            "sound": sound,
+            "f0Hz": positive("f0Hz", 125.0),
+            "f1Hz": positive("f1Hz", 600.0),
+            "f2Hz": positive("f2Hz", 1300.0),
+        }
+
+    def _meet_companion_click_maps(
+        self,
+        profile_path: Path,
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        state = self._meet_profile_state(profile_path)
+        default = self._normalize_companion_click_setting(state.get("companion_click"))
+        raw_overrides = state.get("meeting_companion_click", {})
+        overrides: dict[str, dict[str, Any]] = {}
+        if isinstance(raw_overrides, dict):
+            for raw_key, raw_setting in raw_overrides.items():
+                try:
+                    key = self._meet_assignment_key(str(raw_key))
+                except ValidationError:
+                    continue
+                overrides[key] = self._normalize_companion_click_setting(raw_setting, default)
+        if overrides != raw_overrides:
+            self._set_meet_profile_state(profile_path, meeting_companion_click=overrides)
+        return default, overrides
+
+    def _effective_meet_companion_click(
+        self,
+        profile_path: Path,
+        meeting_url: str = "",
+    ) -> dict[str, Any]:
+        default, overrides = self._meet_companion_click_maps(profile_path)
+        key = self._meet_assignment_key(meeting_url) if meeting_url else ""
+        if key and key in overrides:
+            return {**overrides[key], "meetingUrl": key, "source": "override"}
+        return {**default, "meetingUrl": key, "source": "default"}
 
     def _meet_role_assignments(self, accounts: dict[str, dict[str, Any]], role_account_map: dict[str, str]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -544,6 +876,7 @@ class WsCollabService:
         backend = str(self.meet_browser_settings.get("browser_backend") or "windows")
         health = self._meet_bridge_health_for_settings()
         accounts = self._sso_accounts(health, profile_path=profile_path)
+        known_meeting_urls = self._known_meeting_urls(profile_path)
         role_account_map, role_overrides = self._effective_meet_role_account_map(
             accounts,
             profile_path,
@@ -568,6 +901,23 @@ class WsCollabService:
                 if email:
                     command.extend(["--role-email", f"{role}={email}"])
         role_assignments = self._meet_role_assignments(accounts, role_account_map)
+        companion_click = self._effective_meet_companion_click(profile_path, meeting_url)
+        if companion_click.get("enabled"):
+            command.append("--companion-click")
+            command.extend(["--companion-click-interval", f"{float(companion_click.get('intervalSeconds') or 2.0):g}"])
+            command.extend(["--companion-click-mode", str(companion_click.get("mode") or "reactive")])
+            command.extend(["--companion-click-trigger", str(companion_click.get("trigger") or "caption")])
+            command.extend(["--companion-click-after", f"{float(companion_click.get('afterSeconds') or 10.0):g}"])
+            command.extend(["--companion-click-silence-ms", f"{float(companion_click.get('silenceMs') or 500.0):g}"])
+            command.extend(["--companion-click-min-gap", f"{float(companion_click.get('minGapSeconds') or 6.0):g}"])
+            command.extend(["--companion-click-max-wait", f"{float(companion_click.get('maxWaitSeconds') or 0.0):g}"])
+            command.extend(["--companion-click-audio-rms-threshold", f"{float(companion_click.get('audioRmsThreshold') or 0.015):g}"])
+            command.extend(["--companion-click-ms", f"{float(companion_click.get('clickMs') or 100.0):g}"])
+            command.extend(["--companion-click-gain", f"{float(companion_click.get('gain') or 0.12):g}"])
+            command.extend(["--companion-click-sound", str(companion_click.get("sound") or "uh")])
+            command.extend(["--companion-click-f0", f"{float(companion_click.get('f0Hz') or 125.0):g}"])
+            command.extend(["--companion-click-f1", f"{float(companion_click.get('f1Hz') or 600.0):g}"])
+            command.extend(["--companion-click-f2", f"{float(companion_click.get('f2Hz') or 1300.0):g}"])
         stored_meeting_maps = self._meet_profile_state(profile_path).get("meeting_role_account_maps", {})
         meeting_role_account_maps = (
             stored_meeting_maps if isinstance(stored_meeting_maps, dict) else {}
@@ -587,6 +937,8 @@ class WsCollabService:
             "global_role_account_map": global_role_account_map,
             "role_overrides": role_overrides,
             "meeting_role_account_maps": meeting_role_account_maps,
+            "known_meeting_urls": known_meeting_urls,
+            "companion_click": companion_click,
             "inherited_roles": [
                 role for role in role_account_map
                 if meeting_url and role not in role_overrides
@@ -649,6 +1001,7 @@ class WsCollabService:
                 accounts=accounts,
                 meeting_role_account_maps=maps,
             )
+            self._remember_known_meeting_urls(profile_path, {key})
             return self.get_meet_role_assignments(key)
         cleaned = {role: account_id for role, account_id in selected.items() if account_id}
         self._set_meet_profile_state(profile_path, accounts=accounts, role_account_map=cleaned)
@@ -662,19 +1015,143 @@ class WsCollabService:
         maps = dict(maps) if isinstance(maps, dict) else {}
         maps.pop(key, None)
         self._set_meet_profile_state(profile_path, meeting_role_account_maps=maps)
+        self._remember_known_meeting_urls(profile_path, {key})
         return self.get_meet_role_assignments(key)
+
+    def get_meet_companion_click(self, meeting_url: str = "") -> dict[str, Any]:
+        profile_path = self._meet_profile_path()
+        known_meeting_urls = self._known_meeting_urls(profile_path)
+        default, overrides = self._meet_companion_click_maps(profile_path)
+        effective = self._effective_meet_companion_click(profile_path, meeting_url)
+        return {
+            **effective,
+            "scope": "meeting" if meeting_url else "global",
+            "globalDefault": default,
+            "meetingOverrides": overrides,
+            "knownMeetingUrls": known_meeting_urls,
+        }
+
+    def set_meet_companion_click(
+        self,
+        enabled: bool,
+        interval_seconds: float | int | str | None = None,
+        meeting_url: str = "",
+        *,
+        mode: str | None = None,
+        trigger: str | None = None,
+        after_seconds: float | int | str | None = None,
+        silence_ms: float | int | str | None = None,
+        min_gap_seconds: float | int | str | None = None,
+        max_wait_seconds: float | int | str | None = None,
+        audio_rms_threshold: float | int | str | None = None,
+        click_ms: float | int | str | None = None,
+        gain: float | int | str | None = None,
+        sound: str | None = None,
+        f0_hz: float | int | str | None = None,
+        f1_hz: float | int | str | None = None,
+        f2_hz: float | int | str | None = None,
+    ) -> dict[str, Any]:
+        profile_path = self._meet_profile_path()
+        _default, overrides = self._meet_companion_click_maps(profile_path)
+        current = self._effective_meet_companion_click(profile_path, meeting_url)
+        def positive(value: Any, key: str, label: str) -> float:
+            try:
+                parsed = float(value if value is not None else current[key])
+            except (TypeError, ValueError) as error:
+                raise ValidationError(f"{label} must be a positive number") from error
+            if parsed <= 0:
+                raise ValidationError(f"{label} must be a positive number")
+            return parsed
+
+        def nonnegative(value: Any, key: str, label: str) -> float:
+            try:
+                parsed = float(value if value is not None else current.get(key, 0.0))
+            except (TypeError, ValueError) as error:
+                raise ValidationError(f"{label} must be a non-negative number") from error
+            if parsed < 0:
+                raise ValidationError(f"{label} must be a non-negative number")
+            return parsed
+
+        parsed_mode = str(mode or current.get("mode") or "reactive").lower()
+        if parsed_mode not in {"reactive", "fixed"}:
+            raise ValidationError("mode must be 'reactive' or 'fixed'")
+        parsed_trigger = str(trigger or current.get("trigger") or "caption").lower()
+        if parsed_trigger not in {"caption", "audio", "both"}:
+            raise ValidationError("trigger must be 'caption', 'audio', or 'both'")
+        parsed_sound = str(sound or current.get("sound") or "uh").lower()
+        if parsed_sound not in {"uh", "click"}:
+            raise ValidationError("sound must be 'uh' or 'click'")
+        setting = {
+            "enabled": bool(enabled),
+            "intervalSeconds": positive(interval_seconds, "intervalSeconds", "interval_seconds"),
+            "mode": parsed_mode,
+            "trigger": parsed_trigger,
+            "afterSeconds": positive(after_seconds, "afterSeconds", "after_seconds"),
+            "silenceMs": positive(silence_ms, "silenceMs", "silence_ms"),
+            "minGapSeconds": positive(min_gap_seconds, "minGapSeconds", "min_gap_seconds"),
+            "maxWaitSeconds": nonnegative(max_wait_seconds, "maxWaitSeconds", "max_wait_seconds"),
+            "audioRmsThreshold": nonnegative(audio_rms_threshold, "audioRmsThreshold", "audio_rms_threshold"),
+            "clickMs": positive(click_ms, "clickMs", "click_ms"),
+            "gain": min(1.0, positive(gain, "gain", "gain")),
+            "sound": parsed_sound,
+            "f0Hz": positive(f0_hz, "f0Hz", "f0_hz"),
+            "f1Hz": positive(f1_hz, "f1Hz", "f1_hz"),
+            "f2Hz": positive(f2_hz, "f2Hz", "f2_hz"),
+        }
+        if meeting_url:
+            key = self._meet_assignment_key(meeting_url)
+            overrides = dict(overrides)
+            overrides[key] = setting
+            self._set_meet_profile_state(profile_path, meeting_companion_click=overrides)
+            self._remember_known_meeting_urls(profile_path, {key})
+            return self.get_meet_companion_click(key)
+        self._set_meet_profile_state(profile_path, companion_click=setting)
+        return self.get_meet_companion_click()
+
+    def clear_meet_companion_click(self, meeting_url: str = "") -> dict[str, Any]:
+        profile_path = self._meet_profile_path()
+        if meeting_url:
+            key = self._meet_assignment_key(meeting_url)
+            _default, overrides = self._meet_companion_click_maps(profile_path)
+            overrides = dict(overrides)
+            overrides.pop(key, None)
+            self._set_meet_profile_state(profile_path, meeting_companion_click=overrides)
+            self._remember_known_meeting_urls(profile_path, {key})
+            return self.get_meet_companion_click(key)
+        self._set_meet_profile_state(
+            profile_path,
+            companion_click={
+                "enabled": False,
+                "intervalSeconds": 2.0,
+                "mode": "reactive",
+                "trigger": "caption",
+                "afterSeconds": 10.0,
+                "silenceMs": 500.0,
+                "minGapSeconds": 6.0,
+                "maxWaitSeconds": 0.0,
+                "audioRmsThreshold": 0.015,
+                "clickMs": 100.0,
+                "gain": 0.12,
+                "sound": "uh",
+                "f0Hz": 125.0,
+                "f1Hz": 600.0,
+                "f2Hz": 1300.0,
+            },
+        )
+        return self.get_meet_companion_click()
 
     def start_meet_bridge(self, meeting_url: str = "", *, new: bool = False) -> dict[str, Any]:
         health = self._meet_bridge_health(timeout=0.75)
-        process = getattr(self, "_meet_bridge_process", None)
-        process_running = process is not None and process.poll() is None
-        port_open = not health and not process_running and self._meet_bridge_port_open()
-        if health or process_running or port_open:
+        process_running = self._meet_bridge_tracked_process_running()
+        pid_running = None if health or process_running else self._meet_bridge_pid_running()
+        port_open = False if health or process_running or pid_running else self._meet_bridge_port_open()
+        if health or process_running or pid_running or port_open:
             return {
                 "ok": True,
                 "started": False,
                 "already_running": True,
                 "meeting_url": (health or {}).get("meetingUrl"),
+                "pid": pid_running,
             }
         target = self._meet_assignment_key(meeting_url) if meeting_url else ""
         settings = self.get_meet_role_assignments(target)
@@ -704,6 +1181,7 @@ class WsCollabService:
             )
         argv = [
             sys.executable,
+            "-u",
             "-m",
             "ws_collab.meet_bridge",
             "--profile",
@@ -716,6 +1194,23 @@ class WsCollabService:
             argv.extend(["--meet", target])
         elif new:
             argv.append("--new")
+        click = self.get_meet_companion_click(target)
+        if click.get("enabled"):
+            argv.append("--companion-click")
+            argv.extend(["--companion-click-interval", f"{float(click.get('intervalSeconds') or 2.0):g}"])
+            argv.extend(["--companion-click-mode", str(click.get("mode") or "reactive")])
+            argv.extend(["--companion-click-trigger", str(click.get("trigger") or "caption")])
+            argv.extend(["--companion-click-after", f"{float(click.get('afterSeconds') or 10.0):g}"])
+            argv.extend(["--companion-click-silence-ms", f"{float(click.get('silenceMs') or 500.0):g}"])
+            argv.extend(["--companion-click-min-gap", f"{float(click.get('minGapSeconds') or 6.0):g}"])
+            argv.extend(["--companion-click-max-wait", f"{float(click.get('maxWaitSeconds') or 0.0):g}"])
+            argv.extend(["--companion-click-audio-rms-threshold", f"{float(click.get('audioRmsThreshold') or 0.015):g}"])
+            argv.extend(["--companion-click-ms", f"{float(click.get('clickMs') or 100.0):g}"])
+            argv.extend(["--companion-click-gain", f"{float(click.get('gain') or 0.12):g}"])
+            argv.extend(["--companion-click-sound", str(click.get("sound") or "uh")])
+            argv.extend(["--companion-click-f0", f"{float(click.get('f0Hz') or 125.0):g}"])
+            argv.extend(["--companion-click-f1", f"{float(click.get('f1Hz') or 600.0):g}"])
+            argv.extend(["--companion-click-f2", f"{float(click.get('f2Hz') or 1300.0):g}"])
         for role in ("host", "companion"):
             assignment = assignments[role]
             argv.extend([
@@ -726,20 +1221,22 @@ class WsCollabService:
             ])
         log_path = Path(self.config.state_dir) / "meet_bridge.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        process_env = None
+        process_env = os.environ.copy()
+        process_env["PYTHONUNBUFFERED"] = "1"
         if not self.config.auth_disabled:
-            import os
-
-            token = next(
-                (
-                    value
-                    for value, descriptor in self.config.tokens.items()
-                    if descriptor.get("role") in {"worker", "operator", "admin"}
-                ),
-                "",
-            )
+            token = ""
+            for preferred_role in ("admin", "operator", "worker"):
+                token = next(
+                    (
+                        value
+                        for value, descriptor in self.config.tokens.items()
+                        if descriptor.get("role") == preferred_role
+                    ),
+                    "",
+                )
+                if token:
+                    break
             if token:
-                process_env = os.environ.copy()
                 process_env["WS_COLLAB_TOKEN"] = token
         with log_path.open("ab") as log:
             self._meet_bridge_process = subprocess.Popen(
@@ -750,6 +1247,7 @@ class WsCollabService:
                 creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
                 env=process_env,
             )
+        self._write_meet_bridge_pid(self._meet_bridge_process.pid)
         return {
             "ok": True,
             "started": True,
@@ -792,7 +1290,7 @@ class WsCollabService:
             raise NotFoundError("Meet bridge worker is offline")
         return health
 
-    def meet_bridge_captions(self, since: float | str = 0.0) -> dict[str, Any]:
+    def meet_bridge_captions(self, since: float | str = 0.0, from_end: int | str | None = None) -> dict[str, Any]:
         import urllib.parse
         import urllib.request
 
@@ -800,7 +1298,15 @@ class WsCollabService:
             timestamp = float(since)
         except (TypeError, ValueError) as error:
             raise ValidationError("since must be a number") from error
-        query = urllib.parse.urlencode({"since": timestamp})
+
+        params = {"since": timestamp}
+        if from_end is not None:
+            try:
+                params["fromEnd"] = int(from_end)
+            except (TypeError, ValueError) as error:
+                raise ValidationError("fromEnd must be an integer") from error
+
+        query = urllib.parse.urlencode(params)
         try:
             with urllib.request.urlopen(  # noqa: S310
                 f"http://127.0.0.1:48699/captions?{query}",
@@ -866,13 +1372,19 @@ class WsCollabService:
                 return {"ok": True, "account_id": account_id or None, "path": str(path), "reused_bridge_window": True, "warning": warning}
         cdp_endpoint = self._meet_browser_cdp_for_profile(path)
         if cdp_endpoint is not None:
-            info = open_url(cdp_endpoint, target_url)
+            if add_account:
+                existing = find_add_account_tab(cdp_endpoint)
+            else:
+                accounts = self._sso_accounts(health, profile_path=path)
+                email = str((accounts.get(account_id) or {}).get("email") or "")
+                existing = find_sso_connector_tab(cdp_endpoint, email) if email else None
+            info, _ = reuse_or_open_tab(
+                cdp_endpoint,
+                target_url,
+                existing_in_scope=existing,
+                navigate_existing=bool(add_account and existing),
+            )
             if info and info.get("webSocketDebuggerUrl"):
-                tab = CdpTab(info["webSocketDebuggerUrl"])
-                try:
-                    tab.bring_to_front()
-                finally:
-                    tab.close()
                 return {
                     "ok": True,
                     "account_id": account_id or None,
@@ -880,6 +1392,7 @@ class WsCollabService:
                     "reused_bridge_window": True,
                     "warning": warning,
                 }
+            raise ValidationError("could not open or reuse the SSO tab in the existing browser window")
         argv = [
             find_browser(None),
             f"--remote-debugging-port={DEFAULT_POPUP_PORT}",
@@ -2412,6 +2925,8 @@ class WsCollabService:
         # simply falls through to the shared conversation.
         topic = next((name for name in (send_to, to) if name and self._writable_mailbox(name)), STREAM_CONVERSATION)
         data: dict[str, Any] = {"text": text}
+        if send_to:
+            data["send_to"] = send_to
         if to and to != topic:
             data["to"] = to
         published = self.publish(
@@ -2556,6 +3071,14 @@ class WsCollabService:
             pass
 
     # -------------------------------------------------------------- speech in
+    def _stt_engines_for_segment(self, segment: AudioSegment) -> list[Any]:
+        if (segment.route or {}).get("audio_source") != "companion_heard_meeting_audio":
+            return self.stt_engines
+        return [
+            engine for engine in self.stt_engines
+            if not str(getattr(engine, "name", "")).lower().replace("-", "_").startswith("google_meet")
+        ]
+
     async def process_segment(self, segment: AudioSegment) -> dict[str, Any]:
         """Run one segment through STT -> disambiguation -> classification."""
 
@@ -2569,8 +3092,9 @@ class WsCollabService:
                 correlation_id=correlation_id,
             )
 
+        engines = self._stt_engines_for_segment(segment)
         hypotheses = await run_stt(
-            self.stt_engines,
+            engines,
             segment,
             timeout_ms=self.config.stt_timeout_ms,
             concurrency=self.config.stt_concurrency,
@@ -2580,7 +3104,7 @@ class WsCollabService:
             self.publish(
                 stream=STREAM_STT_TRANSCRIPTS,
                 type=STT_ENGINE_ERROR if hyp.error else STT_FINAL_RESULT,
-                data={"segment_id": segment.id, **hyp.public()},
+                data={"segment_id": segment.id, "segment_source": (segment.route or {}).get("audio_source"), **hyp.public()},
                 source_id=hyp.engine,
                 source_kind="system",
                 correlation_id=segment.correlation_id,
@@ -2599,7 +3123,7 @@ class WsCollabService:
         self.publish(
             stream=STREAM_STT_TRANSCRIPTS,
             type=TRANSCRIPT_RESOLVED,
-            data={"segment_id": segment.id, **resolved.public()},
+            data={"segment_id": segment.id, "segment_source": (segment.route or {}).get("audio_source"), **resolved.public()},
             source_id="disambiguator",
             source_kind="system",
             correlation_id=segment.correlation_id,
@@ -2654,8 +3178,8 @@ class WsCollabService:
                 "resolved": resolved.public(),
                 "classification": classification.public(),
             },
-            source_id=segment.source_kind,
-            source_kind=segment.source_kind if segment.source_kind in {"operator", "agent", "system"} else "unknown",
+            source_id=(segment.route or {}).get("source") or segment.source_kind,
+            source_kind=segment.source_kind if segment.source_kind in {"operator", "agent", "system", "client", "worker", "companion_heard"} else "unknown",
             correlation_id=segment.correlation_id,
         )
         return {
