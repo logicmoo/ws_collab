@@ -82,6 +82,25 @@ from .tts.engine import TtsEngine
 from .tts.voices import VoiceManager
 from .workers import WorkerMonitor
 from . import __version__
+from .urls import (
+    DEFAULT_ROUTE_PREFIX,
+    MEET_BRIDGE_CAPTIONS,
+    MEET_BRIDGE_COMMAND,
+    MEET_BRIDGE_DISCONNECT_AUDIO,
+    MEET_BRIDGE_HEALTH,
+    MEET_BRIDGE_HTTP_PATHS,
+    MEET_BRIDGE_ORIGIN,
+    MEET_BRIDGE_SPEECH,
+    MEET_BRIDGE_SPEECH_CANCEL,
+    MEET_BRIDGE_SPEECH_STATUS,
+    MEET_BRIDGE_WIRE_AUDIO,
+    admin_base,
+    meet_bridge_url,
+    normalize_route_prefix,
+    openapi_base,
+    rest_base,
+    websocket_path,
+)
 from .meet_bridge.cdp import (
     DEFAULT_POPUP_PORT,
     DEFAULT_PROFILE,
@@ -339,7 +358,9 @@ class WsCollabService:
         import urllib.request
 
         try:
-            with urllib.request.urlopen("http://127.0.0.1:48699/health", timeout=timeout) as response:  # noqa: S310
+            with urllib.request.urlopen(
+                meet_bridge_url(MEET_BRIDGE_HEALTH), timeout=timeout
+            ) as response:  # noqa: S310
                 return json.loads(response.read().decode("utf-8"))
         except Exception:
             return None
@@ -2326,7 +2347,7 @@ class WsCollabService:
 
         payload = json.dumps({"command": command}).encode("utf-8")
         request = urllib.request.Request(
-            "http://127.0.0.1:48699/command",
+            meet_bridge_url(MEET_BRIDGE_COMMAND),
             data=payload,
             headers={"content-type": "application/json"},
             method="POST",
@@ -2342,18 +2363,18 @@ class WsCollabService:
         payload: dict[str, Any],
         timeout: float = 2.0,
         *,
-        path: str = "/speech",
+        path: str = MEET_BRIDGE_SPEECH,
     ) -> dict[str, Any] | None:
         import urllib.error
         import urllib.request
 
         headers = {"content-type": "application/json"}
-        if path in {"/wire-companion-audio", "/disconnect-companion-audio"}:
+        if path in {MEET_BRIDGE_WIRE_AUDIO, MEET_BRIDGE_DISCONNECT_AUDIO}:
             headers["authorization"] = (
                 f"Bearer {self._meet_bridge_worker_credential()}"
             )
         request = urllib.request.Request(
-            f"http://127.0.0.1:48699{path}",
+            meet_bridge_url(path),
             data=json.dumps(payload).encode("utf-8"),
             headers=headers,
             method="POST",
@@ -2473,7 +2494,7 @@ class WsCollabService:
                 self._meet_bridge_speech,
                 {"utterance_id": item.id},
                 1.0,
-                path="/speech/cancel",
+                path=MEET_BRIDGE_SPEECH_CANCEL,
             )
             raise RuntimeError("companion playback completion acknowledgement timed out")
 
@@ -2490,7 +2511,7 @@ class WsCollabService:
                 self._meet_bridge_speech,
                 {"utterance_id": item.id, "wait_seconds": max(0.01, wait_seconds)},
                 max(1.0, wait_seconds + 2.0),
-                path="/speech/status",
+                path=MEET_BRIDGE_SPEECH_STATUS,
             )
             if status is None:
                 if time.monotonic() >= soft_deadline:
@@ -2537,7 +2558,7 @@ class WsCollabService:
             target=lambda: self._meet_bridge_speech(
                 {"utterance_id": utterance_id},
                 timeout=1.0,
-                path="/speech/cancel",
+                path=MEET_BRIDGE_SPEECH_CANCEL,
             ),
             name=f"companion-tts-cancel-{utterance_id[:8]}",
             daemon=True,
@@ -2548,7 +2569,7 @@ class WsCollabService:
         companion = self._meet_bridge_speech(
             {"utterance_id": utterance_id},
             timeout=1.0,
-            path="/speech/cancel",
+            path=MEET_BRIDGE_SPEECH_CANCEL,
         )
         return {
             "cancelled": bool(local or (companion or {}).get("cancelled")),
@@ -2576,7 +2597,7 @@ class WsCollabService:
                 "meeting_url": self._normal_meet_url(meeting_url) if meeting_url else "",
                 "reason": "manual" if reason != "auto" else "auto",
             },
-            path="/wire-companion-audio",
+            path=MEET_BRIDGE_WIRE_AUDIO,
         )
         if result is None:
             raise NotFoundError("Meet bridge worker is offline")
@@ -2590,7 +2611,7 @@ class WsCollabService:
                 "meeting_url": self._normal_meet_url(meeting_url) if meeting_url else "",
                 "reason": "manual-disconnect",
             },
-            path="/disconnect-companion-audio",
+            path=MEET_BRIDGE_DISCONNECT_AUDIO,
             timeout=5.0,
         )
         if result is None:
@@ -2616,7 +2637,7 @@ class WsCollabService:
         query = urllib.parse.urlencode(params)
         try:
             with urllib.request.urlopen(  # noqa: S310
-                f"http://127.0.0.1:48699/captions?{query}",
+                f"{meet_bridge_url(MEET_BRIDGE_CAPTIONS)}?{query}",
                 timeout=2.0,
             ) as response:
                 return json.loads(response.read().decode("utf-8"))
@@ -3516,14 +3537,18 @@ class WsCollabService:
             "uptime_seconds": round(time.time() - self.started_at, 1),
         }
 
-    def capabilities(self) -> dict[str, Any]:
+    def capabilities(
+        self, *, route_prefix: str = DEFAULT_ROUTE_PREFIX
+    ) -> dict[str, Any]:
+        namespace = normalize_route_prefix(route_prefix)
         return {
             "version": __version__,
             "boot_id": self.boot_id,
             "product": "WS_COLLAB",
             "transports": ["http", "https", "ws", "wss"],
-            "rest_base": "/ws_collab",
-            "versioned_base": "/ws_collab/v1",
+            "namespace": namespace,
+            "rest_base": rest_base(namespace),
+            "websocket": websocket_path(namespace),
             "streams": STREAMS,
             "mailboxes": STREAMS,
             "stream_roles": STREAM_ROLES,
@@ -3946,8 +3971,7 @@ class WsCollabService:
     def _mailbox_descriptor(self, name: str, stats: dict[str, Any] | None = None) -> dict[str, Any]:
         if stats is None:
             stats = {row["stream"]: row for row in self.store.stats()}
-        v1 = "/ws_collab/v1"
-        mount = "/ws_collab"
+        v1 = rest_base()
         dyn = self._dynamic_mailboxes.get(name) or {}
         return {
             "id": name,
@@ -3966,7 +3990,7 @@ class WsCollabService:
                 "read": f"{v1}/mailbox/messages?mailbox={name}",
                 "send": f"{v1}/mailbox/send",
                 "tail": f"{v1}/streams/{name}/tail",
-                "ws": f"{mount}/ws",
+                "ws": websocket_path(),
             },
         }
 
@@ -4056,7 +4080,9 @@ class WsCollabService:
             "writable": False,
             "messages": count,
             "filename": None,
-            "endpoints": {"read": f"/ws_collab/v1/mailbox/messages?mailbox={name}"},
+            "endpoints": {
+                "read": f"{rest_base()}/mailbox/messages?mailbox={name}"
+            },
         }
 
     def create_mailbox(
@@ -5208,10 +5234,13 @@ class WsCollabService:
         # from before the src/ layout move) and silently finds nothing.
         return Path(__file__).resolve().parents[2] / "docs"
 
-    def list_docs(self) -> dict[str, Any]:
+    def list_docs(
+        self, *, route_prefix: str = DEFAULT_ROUTE_PREFIX
+    ) -> dict[str, Any]:
         """Markdown documentation shipped with the server."""
 
         directory = self.docs_dir
+        docs_base = f"{rest_base(route_prefix)}/docs"
         documents = []
         if directory.is_dir():
             for path in sorted(directory.glob("*.md")):
@@ -5220,13 +5249,14 @@ class WsCollabService:
                     "name": path.name,
                     "title": _markdown_title(path),
                     "bytes": path.stat().st_size,
-                    "path": f"/ws_collab/docs/{path.name}",
+                    "path": f"{docs_base}/{path.name}",
                 })
         readme = directory.parent / "README.md"
         if readme.is_file():
             documents.insert(0, {
                 "id": "readme", "name": "README.md", "title": _markdown_title(readme),
-                "bytes": readme.stat().st_size, "path": "/ws_collab/docs/README.md",
+                "bytes": readme.stat().st_size,
+                "path": f"{docs_base}/README.md",
             })
         return {"documents": documents, "count": len(documents)}
 
@@ -5247,11 +5277,17 @@ class WsCollabService:
             raise NotFoundError(name)
         return path.read_text(encoding="utf-8")
 
-    def ui_links(self, *, origin: str = "") -> dict[str, Any]:
+    def ui_links(
+        self,
+        *,
+        origin: str = "",
+        route_prefix: str = DEFAULT_ROUTE_PREFIX,
+    ) -> dict[str, Any]:
         """Deep links to every page of the operations workbench."""
 
         origin = origin.rstrip("/")
-        base = f"{origin}/ws_collab/admin/" if origin else "/ws_collab/admin/"
+        path = f"{admin_base(route_prefix)}/"
+        base = f"{origin}{path}" if origin else path
         pages = [
             ("transcript", "Unified Transcript", "Full speech pipeline in chronological order"),
             ("conversation", "Conversation", "Worker, agent, and human messages"),
@@ -5347,7 +5383,7 @@ class WsCollabService:
     def status(self) -> dict[str, Any]:
         """Subsystem rollup with an overall verdict.
 
-        ``/health`` answers "is the process alive"; this answers "is each part
+        The REST liveness route answers "is the process alive"; this answers "is each part
         actually working". Deliberately coarse and free of secrets so it is safe
         to expose to a load balancer or status page.
         """
@@ -5442,15 +5478,20 @@ class WsCollabService:
             "server_time": report["server_time"],
         }
 
-    def endpoints(self, *, origin: str = "") -> dict[str, Any]:
-        """Machine-readable map of every mounted endpoint.
+    def endpoints(
+        self,
+        *,
+        origin: str = "",
+        route_prefix: str = DEFAULT_ROUTE_PREFIX,
+        rest_entries: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Return the canonical, categorized endpoint inventory."""
 
-        Clients (including the admin page's connection inspector) resolve URLs
-        from here instead of hard-coding them, so a changed prefix or scheme
-        cannot leave a client pointing at the wrong place.
-        """
-
-        base = "/ws_collab"
+        base = normalize_route_prefix(route_prefix)
+        rest = rest_base(base)
+        ws = websocket_path(base)
+        admin = admin_base(base)
+        openapi = openapi_base(base)
         origin = origin.rstrip("/")
         ws_origin = ""
         if origin:
@@ -5462,50 +5503,168 @@ class WsCollabService:
         def ws_url(path: str) -> str:
             return f"{ws_origin}{path}" if ws_origin else path
 
-        # Every route answers under each of these roots.
-        mounts = ["", "/v1", "/ws_collab", "/ws_collab/v1"]
-
-        def entry(id_: str, path: str, auth: str, description: str, kind: str = "http") -> dict[str, Any]:
-            full = f"{base}{path}"
+        def entry(
+            category: str,
+            methods: list[str],
+            path: str,
+            auth: str,
+            capability: str,
+            visibility: str,
+            description: str,
+            kind: str = "http",
+        ) -> dict[str, Any]:
             return {
-                "id": id_,
+                "category": category,
                 "kind": kind,
-                "path": full,
-                "url": ws_url(full) if kind == "ws" else http_url(full),
+                "methods": methods,
+                "path": path,
+                "url": ws_url(path) if kind == "ws" else http_url(path),
+                "origin": origin or None,
                 "auth": auth,
+                "capability": capability,
+                "visibility": visibility,
                 "description": description,
-                "aliases": [
-                    (ws_url(f"{m}{path}") if kind == "ws" else http_url(f"{m}{path}"))
-                    for m in mounts
-                ],
             }
 
+        all_route_entries = list(rest_entries or [])
+        admin_control_entries = [
+            item for item in all_route_entries if item.get("category") == "admin-control"
+        ]
+        rest_entries = [
+            item for item in all_route_entries if item.get("category") != "admin-control"
+        ]
+        websocket_entry = entry(
+            "WebSocket",
+            ["WEBSOCKET"],
+            ws,
+            "bearer-token",
+            "viewer; message-specific roles are enforced",
+            "public",
+            "Bidirectional event transport with subscriptions, publication, cursors, and liveness.",
+            kind="ws",
+        )
+        admin_entries = [
+            entry(
+                "Admin/UI",
+                ["GET"],
+                admin,
+                "loopback-policy",
+                "admin-ui",
+                "admin-ui",
+                "Redirect to the canonical trailing-slash operations workbench.",
+            ),
+            entry(
+                "Admin/UI",
+                ["GET"],
+                f"{admin}/",
+                "loopback-policy",
+                "admin-ui",
+                "admin-ui",
+                "Serve the ws_collab operations workbench.",
+            ),
+            entry(
+                "Admin/UI",
+                ["GET"],
+                f"{admin}/{{asset:path}}",
+                "loopback-policy",
+                "admin-ui",
+                "admin-ui",
+                "Serve traversal-safe operations workbench assets.",
+            ),
+            entry(
+                "Admin/UI",
+                ["GET"],
+                f"{base}/{{asset:path}}",
+                "loopback-policy",
+                "intentional-static-asset",
+                "admin-ui",
+                "Serve an existing traversal-safe static asset; unknown paths return 404.",
+            ),
+        ]
+        openapi_entries = [
+            entry("OpenAPI", ["GET"], f"{openapi}/docs", "none", "public", "public", "Serve interactive Swagger API documentation."),
+            entry("OpenAPI", ["GET"], f"{openapi}/redoc", "none", "public", "public", "Serve interactive ReDoc API documentation."),
+            entry("OpenAPI", ["GET"], f"{openapi}.json", "none", "public", "public", "Return the machine-readable OpenAPI schema."),
+            entry(
+                "OpenAPI",
+                ["GET"],
+                f"{openapi}/oauth2-redirect",
+                "none",
+                "public",
+                "public",
+                "Handle the Swagger UI OAuth callback.",
+            ),
+        ]
+        internal_descriptions = {
+            MEET_BRIDGE_HEALTH: "Report internal Meet bridge worker health.",
+            MEET_BRIDGE_CAPTIONS: "Return captions captured by the internal Meet bridge.",
+            MEET_BRIDGE_COMMAND: "Send a navigation or control command to the Meet bridge.",
+            MEET_BRIDGE_SPEECH: "Queue speech for playback into the active Meet.",
+            MEET_BRIDGE_SPEECH_CANCEL: "Cancel queued or active Meet bridge speech.",
+            MEET_BRIDGE_SPEECH_STATUS: "Return status for queued Meet bridge speech.",
+            MEET_BRIDGE_WIRE_AUDIO: "Wire saved companion audio devices into the active Meet.",
+            MEET_BRIDGE_DISCONNECT_AUDIO: "Disconnect companion audio wiring from the active Meet.",
+        }
+        internal_entries = [
+            {
+                **entry(
+                    "Internal Meet bridge",
+                    ["GET", "OPTIONS"] if path in {MEET_BRIDGE_HEALTH, MEET_BRIDGE_CAPTIONS} else ["POST", "OPTIONS"],
+                    path,
+                    "worker-token" if path in {MEET_BRIDGE_WIRE_AUDIO, MEET_BRIDGE_DISCONNECT_AUDIO} else "loopback-only",
+                    "internal-worker",
+                    "internal-worker",
+                    internal_descriptions[path],
+                ),
+                "origin": MEET_BRIDGE_ORIGIN,
+                "url": meet_bridge_url(path),
+            }
+            for path in MEET_BRIDGE_HTTP_PATHS
+        ]
+        categories = {
+            "rest": {
+                "description": "Public unversioned REST operations.",
+                "base": rest,
+                "endpoints": rest_entries,
+            },
+            "admin-control": {
+                "description": "Operator-only host lifecycle controls.",
+                "base": admin,
+                "endpoints": admin_control_entries,
+            },
+            "websocket": {
+                "description": "Public WebSocket transport.",
+                "endpoints": [websocket_entry],
+            },
+            "admin_ui": {
+                "description": "Loopback-restricted workbench and static assets.",
+                "endpoints": admin_entries,
+            },
+            "openapi": {
+                "description": "Public API schema and interactive documentation.",
+                "endpoints": openapi_entries,
+            },
+            "internal_meet_bridge": {
+                "description": "Internal worker-only HTTP surface on port 48699.",
+                "origin": MEET_BRIDGE_ORIGIN,
+                "endpoints": internal_entries,
+            },
+        }
+        for category in categories.values():
+            category["paths"] = [item["path"] for item in category["endpoints"]]
         return {
             "origin": origin or None,
             "base": base,
-            "mounts": mounts,
+            "rest_base": rest,
             "tls": self.config.https_enabled,
+            "categories": categories,
             "endpoints": [
-                entry("health", "/health", "public", "Liveness: is the process running"),
-                entry("status", "/status", "public", "Subsystem rollup with an overall verdict"),
-                entry("ready", "/ready", "public", "Readiness probe; 503 when not serving"),
-                entry("capabilities", "/capabilities", "public", "Streams, roles, and feature flags"),
-                entry("endpoints", "/endpoints", "token", "This endpoint map"),
-                entry("events", "/events", "token", "Cursor-paginated durable events"),
-                entry("websocket", "/ws", "token", "WebSocket transport (full REST parity)", kind="ws"),
-                entry("docs", "/docs", "token", "Markdown documentation shipped with the server"),
-                entry("ui_links", "/ui/links", "token", "Deep links to every workbench page"),
-                entry("files", "/files", "token", "Writable state directory (read-only; secrets withheld)"),
-                entry("workers", "/workers", "token", "Worker registry and health"),
-                entry("cursors", "/cursors", "token", "Durable consumer cursors"),
-                entry("voices", "/voices", "token", "Voice catalog and agent profiles"),
-                entry("devices", "/audio/devices", "token", "Enumerated audio devices"),
-                entry("diagnostics", "/diagnostics", "token", "Detailed runtime diagnostics"),
-                entry("audit", "/audit", "token", "Security audit history"),
-                entry("admin", "/admin/", "token", "Operations workbench"),
-                {"id": "openapi", "kind": "http", "path": "/openapi/docs",
-                 "url": http_url("/openapi/docs"), "auth": "public",
-                 "description": "Interactive OpenAPI documentation", "aliases": []},
+                *rest_entries,
+                *admin_control_entries,
+                websocket_entry,
+                *admin_entries,
+                *openapi_entries,
+                *internal_entries,
             ],
         }
 
@@ -5534,6 +5693,16 @@ class WsCollabService:
             except asyncio.CancelledError:
                 pass
         await self.tts.stop()
+        process = self._meet_bridge_process
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                await asyncio.to_thread(process.wait, 5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                await asyncio.to_thread(process.wait, 5)
+            self._cleanup_stale_meet_bridge_pid(process.pid)
+            self._meet_bridge_process = None
 
     async def _monitor_loop(self) -> None:
         # An internal bounded server loop (allowed) -- NOT a worker keep-alive.

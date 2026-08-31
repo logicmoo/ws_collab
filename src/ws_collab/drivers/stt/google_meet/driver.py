@@ -38,8 +38,9 @@ from datetime import datetime, timezone
 from ws_collab.audio.segment import AudioSegment
 from ws_collab.drivers import SttDriverSpec
 from ws_collab.stt.base import Hypothesis, PartialCallback, SttAdapter, normalize_text
+from ws_collab.urls import MEET_BRIDGE_PREFIX, meet_bridge_url, with_url_path
 
-DEFAULT_BASE_URL = "http://127.0.0.1:48699"
+DEFAULT_BASE_URL = meet_bridge_url(MEET_BRIDGE_PREFIX)
 # The bridge finalizes a caption line only after it holds still for --settle
 # seconds (1.2s by default) plus one poll cycle; pad the correlation window on
 # both sides so a segment's own captions aren't missed due to that lag.
@@ -182,7 +183,7 @@ def _build(name: str, config) -> SttAdapter:
     base_url = name.split(":", 1)[1] if ":" in name else ""
     if not base_url:
         base_url = os.environ.get("WS_COLLAB_GOOGLE_MEET_URL", DEFAULT_BASE_URL)
-    return GoogleMeetAdapter(name, base_url=base_url)
+    return GoogleMeetAdapter(name, base_url=with_url_path(base_url, MEET_BRIDGE_PREFIX))
 
 
 def get_driver() -> SttDriverSpec:
@@ -193,7 +194,7 @@ def get_driver() -> SttDriverSpec:
         description=(
             "Google Meet live-caption bridge (reads scripts/meet_caption_bridge.py's "
             "/captions HTTP API). Configure as 'google_meet' (default bridge at "
-            f"{DEFAULT_BASE_URL}) or 'google_meet:http://host:port' to override."
+            f"{DEFAULT_BASE_URL}) or 'google_meet:http://host:port' to override the origin."
         ),
         is_remote=False,
     )

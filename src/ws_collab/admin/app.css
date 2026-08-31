@@ -310,6 +310,7 @@ button {
 button:hover { border-color: var(--accent-teal); color: var(--accent-teal); }
 button.primary { background: #073b3a; border-color: var(--accent-teal); color: var(--accent-teal); }
 button.primary:hover { background: #0a4f4c; }
+button.secondary { border-color: var(--status-warning); color: var(--status-warning); }
 button.ai { border-color: var(--accent-purple); color: #b49cf5; }
 button.danger { border-color: var(--status-danger); color: var(--status-danger); }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
@@ -1079,6 +1080,15 @@ tr.silence-turn-sequence-error td { background: rgba(255, 79, 135, 0.06); }
 .login-error { color: var(--status-danger); font-size: 11px; min-height: 14px; }
 
 .hint { color: var(--text-muted); font-size: 11px; }
+.lifecycle-actions {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 12px;
+}
+.lifecycle-result { min-height: 18px; margin-top: 10px; color: var(--text-secondary); }
+.lifecycle-result.error { color: var(--status-danger); }
+.lifecycle-result.ok { color: var(--status-success); }
 .warn-banner {
   border: 1px solid var(--status-warning);
   color: var(--status-warning);

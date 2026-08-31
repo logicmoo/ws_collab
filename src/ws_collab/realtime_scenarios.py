@@ -14,6 +14,11 @@ from typing import Any, Callable, Protocol
 from .meet_bridge.bridge import forward_companion_heard_audio
 from .meet_bridge.companion_audio import CompanionAudioArbiter
 from .stt.base import Hypothesis, normalize_text
+from .urls import (
+    MEET_BRIDGE_SPEECH,
+    MEET_BRIDGE_SPEECH_CANCEL,
+    MEET_BRIDGE_SPEECH_STATUS,
+)
 
 AGENT = "agent"
 USER = "user"
@@ -596,18 +601,18 @@ class DeterministicProductionScenarioIO:
         payload: dict[str, Any],
         timeout: float = 2.0,
         *,
-        path: str = "/speech",
+        path: str = MEET_BRIDGE_SPEECH,
     ) -> dict[str, Any]:
         del timeout
-        if path == "/speech/status":
+        if path == MEET_BRIDGE_SPEECH_STATUS:
             return self.arbiter.utterance_status(
                 str(payload.get("utterance_id") or ""),
                 wait_seconds=float(payload.get("wait_seconds") or 0.0),
             )
-        if path == "/speech/cancel":
+        if path == MEET_BRIDGE_SPEECH_CANCEL:
             utterance_id = str(payload.get("utterance_id") or "")
             return {"ok": True, "cancelled": self.arbiter.cancel(utterance_id)}
-        if path != "/speech":
+        if path != MEET_BRIDGE_SPEECH:
             return {"ok": False, "accepted": False, "error": f"unsupported fake path {path}"}
         result = self.arbiter.submit(
             kind="speech",

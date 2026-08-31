@@ -7,7 +7,7 @@ import pytest
 from ws_collab.admin_ui_state import AdminUIState
 from ws_collab.errors import ValidationError
 
-V1 = "/ws_collab/v1"
+API_BASE = "/ws_collab"
 
 
 def test_admin_ui_state_persists_page_snapshots_and_redacts_credentials(tmp_path) -> None:
@@ -58,12 +58,12 @@ def test_admin_ui_state_can_clear_one_auxiliary_page(tmp_path) -> None:
 
 def test_admin_ui_state_endpoints_round_trip(client, admin_headers) -> None:
     response = client.post(
-        f"{V1}/admin/ui-state/devices",
+        f"{API_BASE}/admin/ui-state/devices",
         headers=admin_headers,
         json={"state": {"controls": {"dv-search": "microphone"}, "display": {"text": "2 devices"}}},
     )
     assert response.status_code == 200
 
-    fetched = client.get(f"{V1}/admin/ui-state/devices", headers=admin_headers).json()
+    fetched = client.get(f"{API_BASE}/admin/ui-state/devices", headers=admin_headers).json()
     assert fetched["exists"] is True
     assert fetched["state"]["controls"]["dv-search"] == "microphone"

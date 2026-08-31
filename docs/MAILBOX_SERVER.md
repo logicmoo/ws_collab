@@ -7,8 +7,8 @@ implemented by the workbench so a federated chat can talk to both.
 A client (e.g. the workbench `ChatConversation`) keeps a list of places, requests
 each place's directory, and merges them — each mailbox tagged by its place.
 
-All paths below are under the REST mount `/ws_collab/v1` (also mounted at
-`/ws_collab`). On loopback, auth is disabled and every caller is a local admin.
+All relative HTTP paths below are under the sole REST mount
+`/ws_collab`. On loopback, auth is disabled and every caller is a local admin.
 
 ## Endpoints
 
@@ -22,10 +22,8 @@ All paths below are under the REST mount `/ws_collab/v1` (also mounted at
 | WS  | `/ws_collab/ws` | viewer | Live: send `auth` then `subscribe {streams:[mailbox]}` |
 | POST | `/mailbox/send` | worker | Post to the topic named by the mailbox; body `{to,text,sender,send_to}` |
 | POST | `/mailbox/record` | operator | Edit a record = append a correction (append-only); body `{id,record,mode}` |
-| POST | `/mailbox/create` | worker | Host a new mailbox; body `{id,purpose?,hidden?,source?}` |
-| POST | `/mailbox/mailboxes` | worker | Alias of `create` (classic "add mailbox") |
-| POST | `/mailbox/delete` | operator | Stop hosting a dynamic mailbox; body `{id}` |
-| DELETE | `/mailbox/mailboxes?id=` | operator | Same as `delete` (RESTful form) |
+| POST | `/mailbox/mailboxes` | worker | Host a new mailbox; body `{id,purpose?,hidden?,source?}` |
+| DELETE | `/mailbox/mailboxes?id=` | operator | Stop hosting a dynamic mailbox |
 | GET·POST | `/mailbox/mailbox-config` | viewer·operator | Read / set a per-mailbox config object |
 | GET·POST·DELETE | `/mailbox/cursor` | viewer·operator | Inspect / move / clear an agent's cursor |
 | POST | `/mailbox/subscription` | operator | Set / clear an agent's subscription intent |
@@ -36,9 +34,7 @@ All paths below are under the REST mount `/ws_collab/v1` (also mounted at
 
 | Resource | GET | POST | PUT | DELETE |
 |---|---|---|---|---|
-| `/mailbox/mailboxes` | list (omits hidden) | create *(alias)* | — | delete `?id=` |
-| `/mailbox/create` | — | create | — | — |
-| `/mailbox/delete` | — | delete | — | — |
+| `/mailbox/mailboxes` | list (omits hidden) | create | — | delete `?id=` |
 | `/mailbox/messages` | read + filter | — | — | — |
 | `/mailbox/send` | — | post to topic | — | — |
 | `/mailbox/record` | — | edit (append) | — | — |
@@ -69,9 +65,9 @@ All paths below are under the REST mount `/ws_collab/v1` (also mounted at
   "messages": 16,
   "filename": "conversation.jsonl",
   "endpoints": {
-    "read": "/ws_collab/v1/mailbox/messages?mailbox=conversation",
-    "send": "/ws_collab/v1/mailbox/send",
-    "tail": "/ws_collab/v1/streams/conversation/tail",
+    "read": "/ws_collab/mailbox/messages?mailbox=conversation",
+    "send": "/ws_collab/mailbox/send",
+    "tail": "/ws_collab/streams/conversation/tail",
     "ws":   "/ws_collab/ws"
   }
 }
@@ -128,10 +124,10 @@ A chat client can also merge several mailboxes into one view on its side; the
 `merge:` virtual mailbox is the server-side equivalent, shareable across places.
 
 * **Runtime virtual mailboxes.** A client can also save a virtual mailbox on the
-  fly with `POST /mailbox/create` by passing a virtual `source` (`merge:…`,
+  fly with `POST /mailbox/mailboxes` by passing a virtual `source` (`merge:…`,
   `self:…`, a disk `…json`, or `http(s)://…`) instead of the default `jsonl`.
   These are read-only, durable (persisted to `virtual_mailboxes.json` and
-  rehydrated on start), and deletable with `POST /mailbox/delete`; config entries
+  rehydrated on start), and deletable with `DELETE /mailbox/mailboxes?id=…`; config entries
   are re-applied on top and win on name clashes. This is what the chat's
   "Save as stream" button does with a merge combo. A virtual descriptor also
   reports `definition` (the raw source) and, for a merge, `members` (the merged
@@ -150,7 +146,7 @@ the emulated `server-agents` mailbox.
 
 ## Dynamic and hidden mailboxes
 
-* Clients create mailboxes with `POST /mailbox/create`; the server begins hosting
+* Clients create mailboxes with `POST /mailbox/mailboxes`; the server begins hosting
   a new durable JSONL stream by that name. Built-in streams cannot be created or
   deleted (HTTP 409).
 * Names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`.

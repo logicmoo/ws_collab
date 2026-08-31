@@ -134,26 +134,27 @@ Chrome has no desktop window by design.
 ## Server-managed HTTP API
 
 The ws_collab server owns the bridge worker lifecycle and exposes its API through
-the authenticated `/ws_collab/v1/meet/bridge` routes:
+the authenticated `/ws_collab/meet/bridge` routes:
 
-- `GET /status` -- `{ok, service, meetingUrl, captionCount, lastCaptionAt,
+- `GET /ws_collab/meet/bridge/status` -- `{ok, service, meetingUrl, captionCount, lastCaptionAt,
   outbox, recipients, clients, debug}`.
-- `GET /captions?since=<epoch>` -- every caption row (`key`, `at`,
+- `GET /ws_collab/meet/bridge/captions?since=<epoch>` -- every caption row (`key`, `at`,
   `updated_at`, `speaker`, `text`, `final`, `replaces`, `meetingUrl`) whose
   `updated_at` is newer than `since`.
-- `POST /command {"command": "/join <url>" | "/new" | "/say <text>"}`.
+- `POST /ws_collab/meet/bridge/command {"command": "/join <url>" | "/new" | "/say <text>"}`.
   Join and New start the worker when it is offline.
-- `POST /speech` is the structured virtual-agent route. It requires
+- Internal `POST /ws_collab/meet-bridge/speech` is the structured virtual-agent route. It requires
   `destination: "companion"` plus text and accepts meeting, utterance, agent,
   voice, correlation, and artifact-source metadata. It returns HTTP 409 rather
   than claiming success if the companion/tab/meeting/synthetic mic is not ready.
-- `POST /speech/cancel` cancels a queued or active utterance by ID.
+- Internal `POST /ws_collab/meet-bridge/speech/cancel` cancels a queued or active utterance by ID.
 
 Agent speech and automatic `uh`, `uhuh`, or `hmm` backchannels share one bounded FIFO arbiter,
 so their outbound synthetic-mic audio never overlaps. The default pending limit
 is 8 (`--companion-audio-queue-max`); overflow is rejected and counted. Meeting
 switch, companion disconnect, or tab reattach clears queued audio and stops
-active in-page sources. `/health` exposes this as `companionAudio`, including
+active in-page sources. The internal
+`/ws_collab/meet-bridge/health` route exposes this as `companionAudio`, including
 readiness, queued/speaking state, capacity, counters, and last output/error.
 Speech artifact IDs, agent/source markers, expected text, and the playback
 window are also carried into companion-heard STT suppression.
@@ -204,7 +205,7 @@ That alternative is not enabled by default because Google Meet's CSP blocks
 localhost `connect-src`; it would require `Page.setBypassCSP` before injecting
 the page WebSocket client.
 
-Each finalized caption is pushed into `/ws_collab/v1/stt/ingest` with engine
+Each finalized caption is pushed into `/ws_collab/stt/ingest` with engine
 `google_meet`, so the STT page and durable transcript stream identify Meet as
 the source. Browser Web Speech remains a separate optional microphone test.
 
@@ -284,7 +285,8 @@ The companion's `audio`/`video` elements remain muted at volume zero. The
 bridge taps their underlying remote `MediaStream`, sends bounded PCM batches to
 the shared secondary-capture input, and that input fans out to every configured
 non-Meet STT engine (for example Whisper and Vosk). It never feeds Meet caption
-text into this route. `/audio/secondary-capture`, bridge `/health` under
+text into this route. `/ws_collab/audio/secondary-capture`, the internal
+bridge health response under
 `companionHeardStt`, and the existing Devices secondary-capture panel expose
 connection, frame/byte/segment, drop, disconnect, and reconnect counters.
 Companion synthetic-mic `/say` and click windows are excluded before ingestion.
@@ -292,11 +294,16 @@ The old virtual-cable `--companion-listen-device` options are retained only for
 CLI compatibility and no longer make companion playback audible.
 
 The Chrome/CDP automation remains in a child worker because it has blocking
-browser and audio loops. Its loopback-only port (`48699` by default) is an
-internal implementation detail, so the UI does not need direct access and a
-worker failure cannot take down the REST/WebSocket server.
+browser and audio loops. Its loopback-only port (`48699` by default) uses only
+the internal namespace `/ws_collab/meet-bridge`: `GET /health` and
+`GET /captions`, plus `POST /command`, `/speech`, `/speech/status`,
+`/speech/cancel`, `/wire-companion-audio`, and
+`/disconnect-companion-audio` relative to that namespace. Root paths on port
+48699 are not compatibility aliases and return 404. The UI uses the
+authenticated main-service proxy rather than accessing this port directly.
 
-`ws_collab.drivers.stt.google_meet` polls `/captions` for whatever wall-clock
+`ws_collab.drivers.stt.google_meet` polls the internal
+`/ws_collab/meet-bridge/captions` route for whatever wall-clock
 window an `AudioSegment` covers and resolves it through the normal
 disambiguator/timeline pipeline, exactly like a native engine. The admin
 UI's **Google Meet** page (deep ops view: HOST+COMPANION connector rows,
@@ -306,7 +313,7 @@ transcript + join/new front door) both consume the authenticated server API.
 ## Mailbox integration
 
 Unlike the original design (which imported a sibling plugin's in-process
-mailbox client), the bridge talks to ws_collab's own `/v1/mailbox` REST API
+mailbox client), the bridge talks to ws_collab's own `/ws_collab/mailbox` REST API
 over loopback HTTP (`--mailbox-base`, default the local server). Finished
 captions post to `conversation` by default (`--to` to change); the bridge
 watches the `google-meet` mailbox (`--outbox`) for `/join`, `/new`, `/say`,

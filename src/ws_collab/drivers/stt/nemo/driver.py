@@ -8,7 +8,7 @@ reports ``fallback=True`` so a deterministic double keeps the pipeline working.
 
 Note: the Copilot app manages its own downloaded model internally; that artifact
 is not a supported public API. To feed the Copilot app's recognizer into
-WS_COLLAB, prefer the external ingest bridge (POST /ws_collab/v1/stt/ingest)
+WS_COLLAB, prefer the external ingest bridge (POST /ws_collab/stt/ingest)
 instead of loading the app's model file directly.
 """
 

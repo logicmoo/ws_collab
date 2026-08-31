@@ -54,8 +54,8 @@ def test_silences_page_owns_backchannel_editor_and_observation_harness() -> None
 def test_silences_backchannel_routes_conditionals_and_absence_safe_metrics() -> None:
     _index, app, _logic = _admin_source()
 
-    assert 'api(`${V1}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`)' in app
-    assert 'api(`${V1}/meet/companion-click`, { method: "POST", body })' in app
+    assert 'api(`${API_BASE}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`)' in app
+    assert 'api(`${API_BASE}/meet/companion-click`, { method: "POST", body })' in app
     assert 'method: "DELETE"' in app
     assert 'action: $("meet-companion-action").value' in app
     assert 'document.querySelectorAll(".companion-silence-field")' in app
@@ -92,7 +92,7 @@ def test_continue_ui_disables_interval_and_queues_test_agent_turns() -> None:
     assert 'if (isContinue && mode.value === "fixed") mode.value = "reactive"' in app
     assert 'field.hidden = isContinue' not in app
     assert 'control.disabled = isContinue' not in app
-    assert 'api(`${V1}/meet/floor/queue`' in app
+    assert 'api(`${API_BASE}/meet/floor/queue`' in app
     assert 'agent_id: "companion"' in app
     assert 'if (role !== "companion"' in app
 

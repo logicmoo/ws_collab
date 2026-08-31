@@ -49,6 +49,11 @@ python -m ws_collab.server 127.0.0.1 8802
 
 Then open <http://127.0.0.1:8802/ws_collab/admin> and sign in with that token.
 
+Public URLs have one namespace: REST is `/ws_collab/*`, WebSocket is
+`/ws_collab/ws`, the admin UI is `/ws_collab/admin/*`, and OpenAPI is beneath
+`/ws_collab/openapi`. Root and versioned aliases are intentionally not
+mounted. `GET /ws_collab/endpoints` returns the categorized inventory.
+
 If you do not configure a token, a random administrator token is generated and
 written to `collab_state/generated_admin_token.txt` — it is never printed.
 

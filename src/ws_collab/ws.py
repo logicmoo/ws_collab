@@ -20,15 +20,15 @@ from .context import AppContext
 from .errors import AuthenticationError, ValidationError, WsCollabError
 from .events import STREAM_WS_EVENTS, utc_now_iso
 from .notify import Subscription
+from .urls import DEFAULT_ROUTE_PREFIX, websocket_path
 
 
-def create_ws_router(ctx: AppContext, mount: str = "/ws_collab") -> APIRouter:
-    mount = mount.rstrip("/")
+def create_ws_router(ctx: AppContext, mount: str = DEFAULT_ROUTE_PREFIX) -> APIRouter:
     router = APIRouter()
     service = ctx.service
     security = ctx.security
 
-    @router.websocket(f"{mount}/ws")
+    @router.websocket(websocket_path(mount))
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await ctx.ensure_started()
         client_ip = websocket.client.host if websocket.client else None

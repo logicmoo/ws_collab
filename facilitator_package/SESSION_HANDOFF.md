@@ -30,7 +30,8 @@ New untracked files:
 ## Services (verify before assuming)
 
 - Admin server `127.0.0.1:8802` — `python -m ws_collab.standalone 127.0.0.1 8802`
-- Meet worker `127.0.0.1:48699` — started ONLY via `POST /v1/meet/bridge/start`
+- Meet worker `127.0.0.1:48699` — started ONLY via
+  `POST /ws_collab/meet/bridge/start`
   with `{"meeting_url": "https://meet.google.com/bgb-xqts-xjt"}`
 - Meet Chrome CDP on `9223`, profile `C:\Users\dougl\.cache\ws_collab_models\meet_bridge_profile`
 
@@ -38,8 +39,9 @@ Restart recipe that works:
 1. Find PIDs by port, `Stop-Process -Id <PID>` (PID only — name-based kills are blocked).
 2. Kill leftover `ws_collab` python processes; a stale one can hold the JSONL writer lock
    and cause `ConflictError: another writer already owns this JSONL directory`.
-3. Start admin server detached, wait for `/v1/status`.
-4. `POST /v1/meet/bridge/start`, then poll `/v1/meet/bridge/status` until `ok: true`.
+3. Start admin server detached, wait for `/ws_collab/status`.
+4. `POST /ws_collab/meet/bridge/start`, then poll
+   `/ws_collab/meet/bridge/status` until `ok: true`.
 
 ## What shipped this session
 
@@ -50,7 +52,7 @@ Restart recipe that works:
   self-heals. Status: `captionTransport`, `captionTransportByRole`, `pushFrameCount`.
 - **Raw diagnostics** — `rawText` / `rawRows` / `rawByRole` with a two-level separator
   scheme: ` | ` between DOM children, ` \u2016 ` between rows. Per-entry `rawText` too.
-- **`?fromEnd=N`** on `/v1/meet/bridge/captions`.
+- **`?fromEnd=N`** on `/ws_collab/meet/bridge/captions`.
 - **SSO no longer re-scans** — `ssoSatisfied` steady state; health/status is cache-only and
   never triggers a live scan.
 - **Companion "uh" interjector** — silence-gated (caption stasis, 500ms) + monologue gate
@@ -91,7 +93,7 @@ seat whose mic is never touched.
 
 - Never leave this workspace (`CO-IDE-WS`); ask before inspecting anything outside it.
 - One code-mutating sub-agent at a time, unless file sets are provably disjoint.
-- Never send a mutating `/command` directly to port `48699`.
+- Never send a mutating `/ws_collab/meet-bridge/command` directly to port `48699`.
 - Do not restart live services unless asked.
 - Commit only when explicitly asked.
 - Both Google accounts display as "Douglas Miles"; roles are resolved by `authuser` +

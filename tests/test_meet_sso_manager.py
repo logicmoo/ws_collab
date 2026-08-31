@@ -9,7 +9,7 @@ import pytest
 from ws_collab.errors import ValidationError
 from ws_collab.meet_bridge import navigator
 
-V1 = "/ws_collab/v1"
+API_BASE = "/ws_collab"
 
 
 @pytest.mark.parametrize("denied", (False, True))
@@ -31,9 +31,9 @@ def test_blocking_sso_consent_scan_does_not_block_async_health(
     async def exercise():
         transport = httpx.ASGITransport(app=client.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as api:
-            scan = asyncio.create_task(api.post(f"{V1}/meet/sso/scan", headers=admin_headers))
+            scan = asyncio.create_task(api.post(f"{API_BASE}/meet/sso/scan", headers=admin_headers))
             assert await asyncio.to_thread(entered.wait, 1)
-            health = await asyncio.wait_for(api.get(f"{V1}/health"), timeout=0.25)
+            health = await asyncio.wait_for(api.get(f"{API_BASE}/health"), timeout=0.25)
             assert health.status_code == 200
             assert not scan.done()
             release.set()
@@ -59,7 +59,7 @@ def test_list_meet_sso_accounts_is_account_centric_when_bridge_offline(client, a
     host.mkdir()
     monkeypatch.setattr(service_mod, "DEFAULT_PROFILE", host)
     monkeypatch.setattr(service_mod.WsCollabService, "_meet_bridge_health", lambda self, timeout=0.5: None)
-    body = client.get(f"{V1}/meet/sso/accounts", headers=admin_headers).json()
+    body = client.get(f"{API_BASE}/meet/sso/accounts", headers=admin_headers).json()
     assert body == {
         "profile_path": str(host),
         "accounts": [],
@@ -90,7 +90,7 @@ def test_open_meet_sso_account_launches_sign_in_page(client, admin_headers, monk
         return FakePopen(argv)
 
     monkeypatch.setattr(service_mod.navigator, "launch", fake_launch)
-    body = client.post(f"{V1}/meet/sso/open", headers=admin_headers, json={"add_account": True}).json()
+    body = client.post(f"{API_BASE}/meet/sso/open", headers=admin_headers, json={"add_account": True}).json()
     assert body["ok"] is True
     assert body["pid"] == 4321
     assert any(str(host) in arg for arg in launched["argv"])
@@ -117,7 +117,7 @@ def test_open_meet_sso_account_denial_never_launches(
     monkeypatch.setattr(service_mod.subprocess, "Popen", lambda *args, **kwargs: launched.append(args))
 
     response = client.post(
-        f"{V1}/meet/sso/open", headers=admin_headers, json={"add_account": True},
+        f"{API_BASE}/meet/sso/open", headers=admin_headers, json={"add_account": True},
     )
 
     assert response.status_code >= 400
@@ -143,7 +143,7 @@ def test_status_polling_uses_cached_state_and_never_prompts(
     )
 
     for _ in range(3):
-        response = client.get(f"{V1}/meet/sso/accounts", headers=admin_headers)
+        response = client.get(f"{API_BASE}/meet/sso/accounts", headers=admin_headers)
         assert response.status_code == 200
 
 
@@ -164,7 +164,7 @@ def test_list_meet_sso_accounts_reports_only_live_sign_ins_as_ready(
         ],
     )
 
-    body = client.get(f"{V1}/meet/sso/accounts", headers=admin_headers).json()
+    body = client.get(f"{API_BASE}/meet/sso/accounts", headers=admin_headers).json()
 
     assert body["ready_for_meet"] is True
     assert body["signed_in_count"] == 2
@@ -201,7 +201,7 @@ def test_open_meet_sso_account_reuses_and_foregrounds_bridge_window(
         host,
         accounts={"sso_1": {"id": "sso_1", "email": "one@example.test", "authuser": 0}},
     )
-    body = client.post(f"{V1}/meet/sso/open", headers=admin_headers, json={"account_id": "sso_1"}).json()
+    body = client.post(f"{API_BASE}/meet/sso/open", headers=admin_headers, json={"account_id": "sso_1"}).json()
     assert body["ok"] is True
     assert body["reused_bridge_window"] is True
     assert commands == ["/sso 0"]
@@ -247,7 +247,7 @@ def test_open_meet_sso_account_reuses_existing_account_tab_without_opening_anoth
 
     for _ in range(2):
         body = client.post(
-            f"{V1}/meet/sso/open",
+            f"{API_BASE}/meet/sso/open",
             headers=admin_headers,
             json={"account_id": "sso_1"},
         ).json()
@@ -283,7 +283,7 @@ def test_foreground_meet_sso_account_checks_existing_tabs_without_creating_one(
     )
 
     body = client.post(
-        f"{V1}/meet/sso/foreground",
+        f"{API_BASE}/meet/sso/foreground",
         headers=admin_headers,
         json={"account_id": "sso_1"},
     ).json()
@@ -302,7 +302,7 @@ def test_forget_meet_sso_profile_refuses_when_bridge_reports_profile_in_use(clie
     monkeypatch.setattr(service_mod.WsCollabService, "_meet_bridge_health", lambda self, timeout=0.5: {
         "processes": [{"role": "host", "profile": str(host), "alive": True, "pid": 999}],
     })
-    response = client.post(f"{V1}/meet/sso/forget", headers=admin_headers, json={})
+    response = client.post(f"{API_BASE}/meet/sso/forget", headers=admin_headers, json={})
     assert response.status_code == 409
     assert "Close the bridge browser window first" in response.text
 

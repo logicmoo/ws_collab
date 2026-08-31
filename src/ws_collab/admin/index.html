@@ -688,7 +688,22 @@
     <!-- ------------------------------------------------------ system & audit -->
     <section class="page" data-page="system">
       <div class="toolbar"><button class="primary" id="sy-refresh">Refresh</button></div>
-      <div class="panel-body"><div id="sy-body"></div></div>
+      <div class="panel-body">
+        <div id="sy-body"></div>
+        <div class="panel lifecycle-controls" aria-labelledby="lifecycle-title">
+          <div class="panel-title" id="lifecycle-title">Server lifecycle</div>
+          <div class="panel-content">
+            <p class="hint">These operator controls affect this server process. No action runs without confirmation.</p>
+            <div class="lifecycle-actions">
+              <button id="sy-restart" class="secondary" aria-describedby="sy-restart-help">Restart server</button>
+              <span id="sy-restart-help" class="hint">Briefly disconnects, then reconnects when the canonical status endpoint returns.</span>
+              <button id="sy-shutdown" class="danger" aria-describedby="sy-shutdown-help">Shutdown server</button>
+              <span id="sy-shutdown-help" class="hint">Gracefully stops the server; this UI will go offline.</span>
+            </div>
+            <div id="sy-lifecycle-result" class="mono lifecycle-result" role="status" aria-live="polite"></div>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
 

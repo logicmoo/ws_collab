@@ -25,11 +25,11 @@ def test_secondary_capture_rest_start_stop(
     client, admin_headers, worker_headers, viewer_headers, app_context
 ) -> None:
     device_id = next(d["id"] for d in app_context.service.list_devices()["devices"] if d["direction"] in ("input", "loopback", "virtual"))
-    started = client.post("/ws_collab/v1/audio/secondary-capture/start", headers=admin_headers, json={"device_id": device_id})
+    started = client.post("/ws_collab/audio/secondary-capture/start", headers=admin_headers, json={"device_id": device_id})
     assert started.status_code == 200
     assert started.json()["device_id"] == device_id
     browser = client.post(
-        "/ws_collab/v1/audio/secondary-capture/browser",
+        "/ws_collab/audio/secondary-capture/browser",
         headers=admin_headers,
         json={
             "stream_id": "remote-track-rest",
@@ -43,7 +43,7 @@ def test_secondary_capture_rest_start_stop(
     assert browser.json()["input_mode"] == "browser"
     assert browser.json()["browser_connected"] is True
     worker = client.post(
-        "/ws_collab/v1/audio/secondary-capture/browser",
+        "/ws_collab/audio/secondary-capture/browser",
         headers=worker_headers,
         json={
             "stream_id": "remote-track-worker",
@@ -55,22 +55,22 @@ def test_secondary_capture_rest_start_stop(
     )
     assert worker.status_code == 200
     assert client.post(
-        "/ws_collab/v1/audio/secondary-capture/browser",
+        "/ws_collab/audio/secondary-capture/browser",
         headers=viewer_headers,
         json={"sample_rate": 16000, "chunks": []},
     ).status_code == 403
     assert client.post(
-        "/ws_collab/v1/audio/secondary-capture/browser",
+        "/ws_collab/audio/secondary-capture/browser",
         headers={"Authorization": "Bearer wrong-token"},
         json={"sample_rate": 16000, "chunks": []},
     ).status_code == 401
     assert client.post(
-        "/ws_collab/v1/audio/secondary-capture/start",
+        "/ws_collab/audio/secondary-capture/start",
         headers=worker_headers,
         json={"device_id": device_id},
     ).status_code == 403
     too_many_chunks = client.post(
-        "/ws_collab/v1/audio/secondary-capture/browser",
+        "/ws_collab/audio/secondary-capture/browser",
         headers=worker_headers,
         json={
             "sample_rate": 16000,
@@ -80,7 +80,7 @@ def test_secondary_capture_rest_start_stop(
     )
     assert too_many_chunks.status_code == 400
     assert "at most 96" in str(too_many_chunks.json())
-    stopped = client.post("/ws_collab/v1/audio/secondary-capture/stop", headers=admin_headers)
+    stopped = client.post("/ws_collab/audio/secondary-capture/stop", headers=admin_headers)
     assert stopped.status_code == 200
     assert stopped.json()["listening"] is False
 

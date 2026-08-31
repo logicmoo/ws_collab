@@ -25,12 +25,26 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .config import Config
 from .context import AppContext, build_context
 from .errors import WsCollabError
+from .lifecycle import LifecycleController
 from .rest import create_rest_router, create_static_router
+from .urls import (
+    DEFAULT_ROUTE_PREFIX,
+    admin_base,
+    openapi_base,
+    rest_base,
+    websocket_path,
+)
 from .ws import create_ws_router
 
-# Our own markdown documentation is served at <mount>/docs, which on the bare
-# mount is "/docs" -- so the interactive OpenAPI UI moves aside to /openapi/docs.
-_DOC_URLS = {"docs_url": "/openapi/docs", "redoc_url": "/openapi/redoc", "openapi_url": "/openapi.json"}
+_OPENAPI_BASE = openapi_base(DEFAULT_ROUTE_PREFIX)
+_DOC_URLS = {
+    "docs_url": f"{_OPENAPI_BASE}/docs",
+    "redoc_url": f"{_OPENAPI_BASE}/redoc",
+    "openapi_url": f"{_OPENAPI_BASE}.json",
+    "swagger_ui_oauth2_redirect_url": f"{_OPENAPI_BASE}/oauth2-redirect",
+}
+
+RESTART_EXIT_CODE = 75
 
 
 def build_app(ctx: AppContext, *, with_lifespan: bool = True) -> FastAPI:
@@ -62,20 +76,10 @@ def build_app(ctx: AppContext, *, with_lifespan: bool = True) -> FastAPI:
             {"error": {"code": "http_error", "message": str(detail)}}, status_code=exc.status_code
         )
 
-    # The same API is mounted at several roots so any of these answer identically:
-    #   /health   /v1/health   /ws_collab/health   /ws_collab/v1/health
-    # Only the canonical mount is documented, so each operation appears once in
-    # the OpenAPI schema.
-    CANONICAL_MOUNT = "/ws_collab"
-    ALIAS_MOUNTS = ["", "/v1", "/ws_collab/v1"]
-
-    app.include_router(create_rest_router(ctx, CANONICAL_MOUNT))
-    app.include_router(create_ws_router(ctx, CANONICAL_MOUNT))
-    for alias in ALIAS_MOUNTS:
-        app.include_router(create_rest_router(ctx, alias, in_schema=False))
-        app.include_router(create_ws_router(ctx, alias))
-    # Static assets and SPA fallback go last so no API route is shadowed.
-    app.include_router(create_static_router(ctx))
+    app.include_router(create_rest_router(ctx, DEFAULT_ROUTE_PREFIX))
+    app.include_router(create_ws_router(ctx, DEFAULT_ROUTE_PREFIX))
+    # Static assets go last so no API route is shadowed.
+    app.include_router(create_static_router(ctx, DEFAULT_ROUTE_PREFIX))
     return app
 
 
@@ -130,13 +134,19 @@ def build_startup_report(config: Config, bound: list[dict[str, Any]], failed: li
         ws_scheme = "wss" if scheme == "https" else "ws"
         base = f"{scheme}://{entry['host']}:{entry['port']}"
         lines.append(f"  bound   {base}")
-        lines.append(f"          REST  {base}/ws_collab/v1")
-        lines.append(f"          WS    {ws_scheme}://{entry['host']}:{entry['port']}/ws_collab/ws")
-        lines.append(f"          ADMIN {base}/ws_collab/admin")
+        lines.append(f"          REST  {base}{rest_base()}")
+        lines.append(
+            f"          WS    {ws_scheme}://{entry['host']}:{entry['port']}"
+            f"{websocket_path()}"
+        )
+        lines.append(f"          ADMIN {base}{admin_base()}")
     loopback = [e for e in bound if e["host"] in {"127.0.0.1", "::1", "localhost"}]
     if loopback:
         first = loopback[0]
-        lines.append(f"  loopback admin: {first['scheme']}://127.0.0.1:{first['port']}/ws_collab/admin")
+        lines.append(
+            f"  loopback admin: {first['scheme']}://127.0.0.1:{first['port']}"
+            f"{admin_base()}"
+        )
     lan = _local_ipv4_addresses()
     if lan and config.exposed_all_interfaces:
         for ip in lan:
@@ -164,14 +174,29 @@ def build_startup_report(config: Config, bound: list[dict[str, Any]], failed: li
     return "\n".join(lines)
 
 
-async def _serve(config: Config) -> None:
+async def _serve(config: Config) -> bool:
     import uvicorn
 
     ctx = build_context(config)
+    servers: list[tuple[dict[str, Any], Any]] = []
+    restart_requested = False
+
+    def stop_servers() -> None:
+        for _, server in servers:
+            server.should_exit = True
+
+    def restart_servers() -> None:
+        nonlocal restart_requested
+        restart_requested = True
+        stop_servers()
+
+    ctx.lifecycle = LifecycleController(
+        shutdown=stop_servers,
+        restart=restart_servers,
+    )
     app = build_app(ctx, with_lifespan=False)
     await ctx.ensure_started()
 
-    servers: list[tuple[dict[str, Any], Any]] = []
     failed: list[dict[str, Any]] = []
     tasks: list[asyncio.Task] = []
     for plan in _binding_plans(config):
@@ -202,18 +227,21 @@ async def _serve(config: Config) -> None:
         await asyncio.gather(*tasks)
     finally:
         await ctx.aclose()
+    return restart_requested
 
 
-def run(config: Config | None = None) -> None:
+def run(config: Config | None = None) -> int:
     config = config or Config.from_env()
     config.prepare_state_dir()
     try:
-        asyncio.run(_serve(config))
+        restart_requested = asyncio.run(_serve(config))
     except KeyboardInterrupt:
         print("WS_COLLAB shutting down", flush=True)
+        return 0
+    return RESTART_EXIT_CODE if restart_requested else 0
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     env_overrides: dict[str, str] = {}
     # Optional positional args: host [http_port] [https_port] (matches workbench style)
@@ -230,8 +258,8 @@ def main(argv: list[str] | None = None) -> None:
     # plugin.json "env:variables" are the lowest-precedence defaults; the real OS
     # environment and CLI positional args still override them.
     merged = {**_plugin_env_variables(), **os.environ, **env_overrides}
-    run(Config.from_env(merged))
+    return run(Config.from_env(merged))
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

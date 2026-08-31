@@ -25,7 +25,7 @@ from ws_collab.meet_bridge.bridge import (
 from ws_collab.meet_bridge.scripts_js import CAPTION_OBSERVER_JS, CAPTIONS_JS
 from ws_collab.meet_bridge.tracker import CaptionTracker
 
-V1 = "/ws_collab/v1"
+API_BASE = "/ws_collab"
 
 
 def test_status_sso_payload_uses_cache_without_live_scan(monkeypatch) -> None:
@@ -756,7 +756,9 @@ def test_service_captions_proxy_preserves_raw_payload_and_query(service, monkeyp
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
 
     assert service.meet_bridge_captions(since="12.25", from_end="3") == worker_payload
-    query = parse_qs(urlparse(calls[0][0]).query)
+    parsed = urlparse(calls[0][0])
+    assert parsed.path == "/ws_collab/meet-bridge/captions"
+    query = parse_qs(parsed.query)
     assert query == {"since": ["12.25"], "fromEnd": ["3"]}
     assert calls[0][1] == 2.0
 
@@ -784,7 +786,7 @@ def test_rest_captions_route_preserves_worker_payload_and_query(client, viewer_h
     monkeypatch.setattr(app_context.service, "meet_bridge_captions", fake_captions)
 
     response = client.get(
-        f"{V1}/meet/bridge/captions",
+        f"{API_BASE}/meet/bridge/captions",
         headers=viewer_headers,
         params={"since": "12.25", "fromEnd": "3"},
     )

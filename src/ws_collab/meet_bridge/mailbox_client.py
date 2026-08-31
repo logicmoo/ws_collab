@@ -3,7 +3,7 @@
 Replaces the original design's cross-plugin import (a fallback chain that
 reached into a *sibling* plugin's source tree, ``workbench/plugins/
 mailbox_chat/src``, and a workbench-wide ``AGENT_MAILBOX_DIR``) with a plain
-HTTP client against ws_collab's own ``/v1/mailbox`` REST API. The bridge runs
+HTTP client against ws_collab's own ``/ws_collab/mailbox`` REST API. The bridge runs
 as its own OS process (it drives a real Chrome over CDP, which cannot share
 an event loop with the main asyncio server), so talking to ws_collab over
 loopback HTTP -- the same way the admin SPA and every other external
@@ -11,7 +11,7 @@ consumer already does -- is the natural fit, not a workaround.
 
 Two honest simplifications versus the original in-process mailbox client:
 
-* ``mailbox_send`` (``POST /v1/mailbox/send``) accepts ``to``/``text``/
+* ``mailbox_send`` (``POST /ws_collab/mailbox/send``) accepts ``to``/``text``/
   ``sender``/``source_kind`` but no free-form ``metadata`` dict. The original
   attached rich metadata (``key``/``final``/``replaces``/``meetingUrl``) to
   every mailbox message; ws_collab's native send does not have that field, so
@@ -38,7 +38,9 @@ import urllib.request
 from collections import deque
 from typing import Any
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8802/ws_collab"
+from ..urls import rest_base
+
+DEFAULT_BASE_URL = f"http://127.0.0.1:8802{rest_base()}"
 
 
 class MailboxClient:
@@ -79,7 +81,7 @@ class MailboxClient:
                 line = f"{text} [{', '.join(f'{k}={v}' for k, v in interesting.items())}]"
         try:
             return self._call(
-                "/v1/mailbox/send", method="POST",
+                "/mailbox/send", method="POST",
                 body={"to": to, "text": line, "sender": sender, "source_kind": "system"},
             )
         except urllib.error.URLError as error:
@@ -91,7 +93,7 @@ class MailboxClient:
         docstring). The very first call for a mailbox baselines silently
         (returns nothing) so a bridge restart never replays old commands."""
         try:
-            payload = self._call(f"/v1/mailbox/messages?mailbox={mailbox}&limit={limit}")
+            payload = self._call(f"/mailbox/messages?mailbox={mailbox}&limit={limit}")
         except urllib.error.URLError as error:
             raise ConnectionError(f"ws_collab mailbox read failed ({self.base_url}): {error}") from error
         messages = payload.get("messages") or []
@@ -119,7 +121,7 @@ class MailboxClient:
     ) -> dict[str, Any]:
         """Push one finalized Meet caption into ws_collab's STT pipeline."""
         return self._call(
-            "/v1/stt/ingest",
+            "/stt/ingest",
             method="POST",
             body={
                 "engine": "google_meet",
@@ -136,67 +138,67 @@ class MailboxClient:
 
     def list_audio_devices(self) -> dict[str, Any]:
         """Return ws_collab's audio device catalog."""
-        return self._call("/v1/audio/devices")
+        return self._call("/audio/devices")
 
     def secondary_capture_state(self) -> dict[str, Any]:
         """Return the current companion-heard secondary capture state."""
-        return self._call("/v1/audio/secondary-capture")
+        return self._call("/audio/secondary-capture")
 
     def start_secondary_capture(self, device_id: str) -> dict[str, Any]:
         """Start server-side secondary capture on the virtual cable input side."""
         return self._call(
-            "/v1/audio/secondary-capture/start",
+            "/audio/secondary-capture/start",
             method="POST",
             body={"device_id": device_id},
         )
 
     def stop_secondary_capture(self) -> dict[str, Any]:
-        return self._call("/v1/audio/secondary-capture/stop", method="POST")
+        return self._call("/audio/secondary-capture/stop", method="POST")
 
     def start_companion_wiring_capture(self, device_id: str) -> dict[str, Any]:
         return self._call(
-            "/v1/meet/companion-cable-wiring/capture/start",
+            "/meet/companion-cable-wiring/capture/start",
             method="POST",
             body={"device_id": device_id},
         )
 
     def stop_companion_wiring_capture(self) -> dict[str, Any]:
         return self._call(
-            "/v1/meet/companion-cable-wiring/capture/stop", method="POST"
+            "/meet/companion-cable-wiring/capture/stop", method="POST"
         )
 
     def companion_cable_wiring(self) -> dict[str, Any]:
         """Fetch the machine wiring config for bounded post-join auto-wire."""
 
-        return self._call("/v1/meet/companion-cable-wiring/runtime")
+        return self._call("/meet/companion-cable-wiring/runtime")
 
     def ingest_companion_browser_audio(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Push muted companion remote-media PCM into shared secondary capture."""
         return self._call(
-            "/v1/audio/secondary-capture/browser",
+            "/audio/secondary-capture/browser",
             method="POST",
             body=payload,
         )
 
     def post_browser_nav_intent(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._call("/v1/browser/nav-intents", method="POST", body=payload)
+        return self._call("/browser/nav-intents", method="POST", body=payload)
 
     def continue_meeting_floor(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Publish a durable floor-open edge to the shared agent/TTS coordinator."""
 
-        return self._call("/v1/meet/floor/continue", method="POST", body=payload)
+        return self._call("/meet/floor/continue", method="POST", body=payload)
 
     def evaluate_meeting_silence_action(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Evaluate one canonical configured silence action."""
 
-        return self._call("/v1/meet/silence-action/evaluate", method="POST", body=payload)
+        return self._call("/meet/silence-action/evaluate", method="POST", body=payload)
 
     def invalidate_meeting_floor(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._call("/v1/meet/floor/invalidate", method="POST", body=payload)
+        return self._call("/meet/floor/invalidate", method="POST", body=payload)
 
     def meeting_floor_status(self, meeting_url: str) -> dict[str, Any]:
         return self._call(
-            f"/v1/meet/floor/status?meeting_url={urllib.parse.quote(meeting_url, safe='')}"
+            f"/meet/floor/status?meeting_url={urllib.parse.quote(meeting_url, safe='')}"
         )
 
 

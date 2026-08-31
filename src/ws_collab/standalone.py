@@ -54,12 +54,16 @@ def is_listening(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: fl
         return False
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Run the standalone server in the foreground."""
+def main(argv: list[str] | None = None) -> int:
+    """Run the standalone server, restarting only after complete shutdown."""
 
-    from ws_collab.server import main as server_main
+    from ws_collab.server import RESTART_EXIT_CODE, main as server_main
 
-    server_main(argv)
+    original_argv = list(sys.argv[1:] if argv is None else argv)
+    while True:
+        exit_code = server_main(original_argv)
+        if exit_code != RESTART_EXIT_CODE:
+            return exit_code
 
 
 def launch(
@@ -145,4 +149,4 @@ def create_router(manifest: dict[str, Any] | None = None):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

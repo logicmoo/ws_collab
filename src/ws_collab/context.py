@@ -10,11 +10,12 @@ first request).
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from .config import Config
 from .jsonl_store import JsonlStore
+from .lifecycle import LifecycleController
 from .security import Security
 from .service import WsCollabService
 
@@ -25,6 +26,7 @@ class AppContext:
     store: JsonlStore
     service: WsCollabService
     security: Security
+    lifecycle: LifecycleController = field(default_factory=LifecycleController)
 
     def __post_init__(self) -> None:
         self._started = False

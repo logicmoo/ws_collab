@@ -34,7 +34,7 @@ def post_transcript(base_url: str, token: str, engine: str, text: str, *, confid
     if correlation_id:
         payload["correlation_id"] = correlation_id
     request = urllib.request.Request(
-        f"{base_url.rstrip('/')}/ws_collab/v1/stt/ingest",
+        f"{base_url.rstrip('/')}/ws_collab/stt/ingest",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         method="POST",

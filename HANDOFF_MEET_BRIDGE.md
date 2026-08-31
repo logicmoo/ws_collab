@@ -16,9 +16,11 @@ pre-existing environment quirk, unrelated to this code).
   Never touch the outer `symbolic_learner_workbench` monorepo.
 - There may be a REAL, LIVE Meet bridge process running on
   `127.0.0.1:48699` (the actual, in-use Google Meet call) and a real admin
-  server on `127.0.0.1:8802`. GET requests against them (`/health`,
-  `/captions`) are fine and expected. Never POST an untested/mutating
-  `/command` to the live bridge. Never `Stop-Process`/kill either of those
+  server on `127.0.0.1:8802`. The bridge's canonical loopback reads are
+  `/ws_collab/meet-bridge/health` and
+  `/ws_collab/meet-bridge/captions`. Never POST an untested/mutating
+  `/ws_collab/meet-bridge/command` to the live bridge. Never
+  `Stop-Process`/kill either of those
   processes unless the user explicitly asks you to restart them — if you
   do restart the bridge, use the same launch args it was last using
   (check `Get-CimInstance Win32_Process` for the live command line first).
@@ -33,8 +35,9 @@ pre-existing environment quirk, unrelated to this code).
 
 `ws_collab` runs a Google Meet caption bridge as a **separate OS process**
 (`src\ws_collab\meet_bridge\bridge.py`, console script
-`ws-collab-meet-bridge`) that HTTP-serves `/health` + `/captions` +
-`/command` on port 48699. The main FastAPI admin server (`src\ws_collab\
+`ws-collab-meet-bridge`) that HTTP-serves the internal
+`/ws_collab/meet-bridge/{health,captions,command}` namespace on port 48699.
+The main FastAPI admin server (`src\ws_collab\
 service.py` + `rest.py` + `admin\{index.html,app.js,app.css}`) polls that
 bridge and renders a rich "Google Meet" ops page (`#meet`) plus a merged
 "SSO / Browser" settings page (`#browser`). The two processes are
@@ -169,8 +172,9 @@ you just want what's left.)
       `run_stt()` path everything else uses, tagged with a distinct
       `source_id` (e.g. `"meet-companion-incoming"`).
     - New REST pair mirroring the primary capture's shape but scoped to
-      this named secondary source: `POST /v1/audio/secondary-capture/start`
-      (body `{device_id}`), `POST /v1/audio/secondary-capture/stop`, plus a
+      this named secondary source:
+      `POST /ws_collab/audio/secondary-capture/start`
+      (body `{device_id}`), `POST /ws_collab/audio/secondary-capture/stop`, plus a
       way to read its state.
     - `bridge.py`'s `companion_loop()`: tab-muting is now conditional on a
       new `--companion-listen-device <name>` flag (parallel naming to

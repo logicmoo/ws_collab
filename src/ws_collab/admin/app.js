@@ -21,18 +21,15 @@ const BASE = (() => {
   if (match) return match[1];
   return "/ws_collab";
 })();
-/* The API answers at /, /v1, /ws_collab, and /ws_collab/v1, and the admin page
- * is served beneath each of them. When the page is already inside a versioned
- * mount the prefix ends with /v1, so appending it again would ask for the
- * nonexistent /v1/v1. */
-const V1 = /\/v1$/.test(BASE) ? BASE : BASE + "/v1";
-const ADMIN_UI_STATE_BASE = `${V1}/admin/ui-state`;
+/* REST and WebSocket share one canonical unversioned namespace. */
+const API_BASE = BASE;
+const ADMIN_UI_STATE_BASE = `${API_BASE}/admin/ui-state`;
 const ROW_H = 22;
 const MAX_BUFFER = 5000;
 
 /* The server owns the blocking Chrome/CDP worker and proxies its API so the
  * workbench never depends on a separately reachable unauthenticated port. */
-const MEET_BRIDGE_BASE = `${V1}/meet/bridge`;
+const MEET_BRIDGE_BASE = `${API_BASE}/meet/bridge`;
 /* Known driver meetings (host+companion secret-servant rooms this bridge
  * has been pointed at) — shown as placeholder entries even when the bridge
  * isn't currently attached to them (e.g. Google ended one and auto-recreate
@@ -113,7 +110,7 @@ const state = {
 };
 
 // Stream names are NOT hard-coded here: they are discovered from
-// /ws_collab/v1/capabilities so the server remains the single source of truth.
+// /ws_collab/capabilities so the server remains the single source of truth.
 // STREAM_ROLES maps behaviour (which streams feed which view) to capability
 // flags rather than to literal names, so renaming a stream never breaks the UI.
 let STREAMS = [];
@@ -406,7 +403,7 @@ function schedulePageStateSave() {
 }
 
 function recordApiSnapshot(path, payload) {
-  if (!path.startsWith(V1) || path.startsWith(ADMIN_UI_STATE_BASE) || payload === undefined) return;
+  if (!path.startsWith(API_BASE) || path.startsWith(ADMIN_UI_STATE_BASE) || payload === undefined) return;
   let key = path;
   try { key = new URL(path, location.origin).pathname; } catch (_error) {}
   const snapshots = state.pageApiSnapshots[state.page] || {};
@@ -608,7 +605,7 @@ function startRestFallback() {
       try {
         const query = new URLSearchParams({ stream, limit: "200", wait_ms: "20000" });
         if (state.cursors[stream]) query.set("after", state.cursors[stream]);
-        const page = await api(`${V1}/events?${query}`);
+        const page = await api(`${API_BASE}/events?${query}`);
         if (page) {
           state.cursors[stream] = page.next_cursor;
           page.events.forEach(ingest);
@@ -1081,7 +1078,7 @@ async function ensureConversions(events, format) {
   if (!pending.length) return;
   pending.forEach((e) => convCacheSet(format, e.id, null));   // mark in-flight
   try {
-    const res = await api(`${V1}/convert`, {
+    const res = await api(`${API_BASE}/convert`, {
       method: "POST",
       body: { to: format, items: pending.map((e) => ({ id: e.id, value: e.data || {} })) },
     });
@@ -1184,7 +1181,7 @@ function setStreamMode(mode) {
 
 /* ------------------------------------------------------- endpoint inspector */
 
-/* The URL tree is built from the server's own endpoint map (/v1/endpoints), so
+/* The URL tree is built from the server's own endpoint map (/ws_collab/endpoints), so
  * a changed prefix, port, or scheme can never leave this view lying. */
 function endpointStatus(endpoint) {
   if (endpoint.kind === "ws") {
@@ -1267,8 +1264,8 @@ function renderEndpoints() {
 async function refreshEndpointData() {
   try {
     const [map, status] = await Promise.all([
-      api(`${V1}/endpoints`).catch(() => state.endpoints),
-      fetch(`${BASE}/status`).then((r) => r.json()).catch(() => null),
+      api(`${API_BASE}/endpoints`).catch(() => state.endpoints),
+      fetch(`${API_BASE}/status`).then((r) => r.json()).catch(() => null),
     ]);
     if (map) state.endpoints = map;
     if (status) { state.serverStatus = status; checkBootId(status.boot_id); }
@@ -1330,15 +1327,15 @@ function renderInspector() {
     target.textContent = lines.join("\n");
     return;
   }
-  if (tab === "routing") { loadInto(target, `${V1}/audio/routing`); return; }
-  if (tab === "agent") { loadInto(target, `${V1}/voices`); return; }
-  if (tab === "prompt") { loadInto(target, `${V1}/prompt`); return; }
-  if (tab === "audit") { loadInto(target, `${V1}/audit?limit=50`); return; }
+  if (tab === "routing") { loadInto(target, `${API_BASE}/audio/routing`); return; }
+  if (tab === "agent") { loadInto(target, `${API_BASE}/voices`); return; }
+  if (tab === "prompt") { loadInto(target, `${API_BASE}/prompt`); return; }
+  if (tab === "audit") { loadInto(target, `${API_BASE}/audit?limit=50`); return; }
   if (tab === "docs") {
     target.textContent = [
       "WS_COLLAB — operations quick reference",
       "",
-      "Transports  REST (/ws_collab/v1) and WS (/ws_collab/ws) are at full parity.",
+      "Transports  REST (/ws_collab) and WS (/ws_collab/ws) are at full parity.",
       "Cursors     Opaque, per stream+consumer. Rewind replays; forward skips.",
       "Streams     conversation, worker_statuses, translated_audio, stt_transcripts,",
       "            tts_queue, audio_*, system_*, prompt.",
@@ -1398,7 +1395,7 @@ function pageFromHash() {
 async function loadWorkers() {
   const body = $("wk-body");
   try {
-    const data = await api(`${V1}/workers`);
+    const data = await api(`${API_BASE}/workers`);
     $("badge-workers").textContent = data.workers.length;
     $("sb-workers").textContent = `workers ${data.workers.length}`;
     const bad = data.workers.filter((w) => w.state === "overdue" || w.state === "unresponsive").length;
@@ -1412,7 +1409,7 @@ async function loadWorkers() {
         String((w.errors || []).length), mono(w.last_conversation_id || "—"),
         actionButton("Confirm terminated", "danger", async () => {
           if (!confirm(`Confirm ${w.worker_id} is terminated? Only do this when independently verified.`)) return;
-          await api(`${V1}/workers/${encodeURIComponent(w.worker_id)}/status`, { method: "POST", body: { status: "terminated_confirmed" } });
+          await api(`${API_BASE}/workers/${encodeURIComponent(w.worker_id)}/status`, { method: "POST", body: { status: "terminated_confirmed" } });
           loadWorkers();
         }),
       ])));
@@ -1423,7 +1420,7 @@ async function loadWorkers() {
 async function loadAlerts() {
   const body = $("al-body");
   try {
-    const data = await api(`${V1}/alerts?limit=200`);
+    const data = await api(`${API_BASE}/alerts?limit=200`);
     const events = data.events.slice().reverse();
     $("badge-alerts").textContent = events.filter((e) => e.type === "ALERT_RAISED").length;
     body.replaceChildren(table(["Time", "Type", "Scope", "Severity", "Detail"],
@@ -1698,7 +1695,7 @@ function groupDevicesByIdentity(rows) {
 async function loadDevices() {
   try {
     const [devices, capture, routing, secondary] = await Promise.all([
-      api(`${V1}/audio/devices`), api(`${V1}/audio/capture`), api(`${V1}/audio/routing`), api(`${V1}/audio/secondary-capture`),
+      api(`${API_BASE}/audio/devices`), api(`${API_BASE}/audio/capture`), api(`${API_BASE}/audio/routing`), api(`${API_BASE}/audio/secondary-capture`),
     ]);
 
     const capPanel = panel("Capture state");
@@ -1726,11 +1723,11 @@ async function loadDevices() {
     secondaryControls.append(
       secondarySelect,
       actionButton("Start secondary capture", "", async () => {
-        try { await api(`${V1}/audio/secondary-capture/start`, { method: "POST", body: { device_id: secondarySelect.value } }); } catch (error) { pushError(error.message); }
+        try { await api(`${API_BASE}/audio/secondary-capture/start`, { method: "POST", body: { device_id: secondarySelect.value } }); } catch (error) { pushError(error.message); }
         loadDevices();
       }),
       actionButton("Stop secondary capture", "", async () => {
-        try { await api(`${V1}/audio/secondary-capture/stop`, { method: "POST", body: {} }); } catch (error) { pushError(error.message); }
+        try { await api(`${API_BASE}/audio/secondary-capture/stop`, { method: "POST", body: {} }); } catch (error) { pushError(error.message); }
         loadDevices();
       }),
     );
@@ -1866,13 +1863,13 @@ async function loadDevices() {
             : (deviceGroup(d) === "input" && d.available
                 ? actionButton("Use", "", async () => {
                     if (!confirm(`Switch the active capture device to "${d.name}"? Listening will restart on this device.`)) return;
-                    try { await api(`${V1}/audio/capture/start`, { method: "POST", body: { device_id: d.id } }); }
+                    try { await api(`${API_BASE}/audio/capture/start`, { method: "POST", body: { device_id: d.id } }); }
                     catch (error) { pushError(error.message); }
                     loadDevices();
                   })
                 : ((d.direction === "output" || d.direction === "virtual") && d.available
                     ? actionButton("Test", "", async () => {
-                        try { await api(`${V1}/audio/devices/test`, { method: "POST", body: { device_id: d.id } }); }
+                        try { await api(`${API_BASE}/audio/devices/test`, { method: "POST", body: { device_id: d.id } }); }
                         catch (error) { pushError(error.message); }
                       })
                     : "—")),
@@ -1908,7 +1905,7 @@ async function loadDevices() {
 
     // ---- one row per STT engine, each pointing at a chosen input device
     const [engines, defaults] = await Promise.all([
-      api(`${V1}/audio/engines`), api(`${V1}/audio/defaults`),
+      api(`${API_BASE}/audio/engines`), api(`${API_BASE}/audio/defaults`),
     ]);
     const captureDevices = all.filter((d) => ["input", "loopback", "virtual"].includes(d.direction) && d.available);
     const enginePanel = panel("Speech recognition engines — choose the input each one listens on");
@@ -1925,7 +1922,7 @@ async function loadDevices() {
         select.value = row.device_id || "";
         select.onchange = async () => {
           try {
-            await api(`${V1}/audio/engines/${encodeURIComponent(row.engine)}/device`,
+            await api(`${API_BASE}/audio/engines/${encodeURIComponent(row.engine)}/device`,
                       { method: "POST", body: { device_id: select.value } });
           } catch (error) { pushError(error.message); }
           loadDevices();
@@ -1953,7 +1950,7 @@ async function loadDevices() {
     outSelect.value = defaults.agent_output_device || "";
     outSelect.onchange = async () => {
       try {
-        await api(`${V1}/audio/defaults/output`, { method: "POST", body: { device_id: outSelect.value } });
+        await api(`${API_BASE}/audio/defaults/output`, { method: "POST", body: { device_id: outSelect.value } });
       } catch (error) { pushError(error.message); }
       loadDevices();
     };
@@ -1964,7 +1961,7 @@ async function loadDevices() {
       testBtn.disabled = true;
       testNote.textContent = "testing…";
       try {
-        const r = await api(`${V1}/audio/devices/test`, { method: "POST", body: { device_id: id } });
+        const r = await api(`${API_BASE}/audio/devices/test`, { method: "POST", body: { device_id: id } });
         testNote.textContent = `✓ ${r.method === "tone" ? "tone" : "spoken test"} on ${r.device_name || id}`;
       } catch (error) {
         testNote.textContent = "";
@@ -2029,7 +2026,7 @@ async function postMeetSso(path, body, confirmText) {
   const label = body.add_account ? "add-account" : body.account_id || "profile";
   resultEl.textContent = `${path} - sending...`;
   try {
-    const result = await api(`${V1}${path}`, { method: "POST", body });
+    const result = await api(`${API_BASE}${path}`, { method: "POST", body });
     resultEl.textContent = result.warning
       ? `${label} - ok (${result.warning})`
       : `${label} - ok`;
@@ -2043,7 +2040,7 @@ async function scanMeetSsoAccounts() {
   const result = $("br-result");
   result.textContent = "scanning live Google sessions...";
   try {
-    const ssoState = await api(`${V1}/meet/sso/scan`, { method: "POST", body: {} });
+    const ssoState = await api(`${API_BASE}/meet/sso/scan`, { method: "POST", body: {} });
     await loadBrowserSettings(ssoState);
     result.textContent = ssoState.ready_for_meet
       ? `scan complete: ${ssoState.signed_in_count} signed-in accounts; ready for Meet role assignment`
@@ -2057,12 +2054,12 @@ async function loadBrowserSettings(scannedSsoState = null) {
   const body = $("br-settings");
   const result = $("br-result");
   try {
-    const data = await api(`${V1}/meet/browser-settings`);
+    const data = await api(`${API_BASE}/meet/browser-settings`);
     let accounts = data.accounts || [];
     let ssoState = scannedSsoState || { accounts };
     if (!scannedSsoState) {
       try {
-        ssoState = await api(`${V1}/meet/sso/accounts`);
+        ssoState = await api(`${API_BASE}/meet/sso/accounts`);
         accounts = ssoState.accounts || accounts;
       } catch (_error) {
         // A running pre-upgrade server already includes accounts in its browser
@@ -2164,7 +2161,7 @@ async function loadBrowserSettings(scannedSsoState = null) {
 
     $("br-save").onclick = async () => {
       try {
-        const saved = await api(`${V1}/meet/browser-settings`, {
+        const saved = await api(`${API_BASE}/meet/browser-settings`, {
           method: "POST",
           body: {
             browser_backend: backend.value,
@@ -2264,7 +2261,7 @@ async function forgetMeetChannel(url) {
     && !confirm("Discard unsaved Silence configuration changes and switch targets?")
   ) return;
   try {
-    const result = await api(`${V1}/meet/channels/forget`, {
+    const result = await api(`${API_BASE}/meet/channels/forget`, {
       method: "POST",
       body: { meeting_url: key },
     });
@@ -2346,11 +2343,11 @@ function meetSsoCombo(url, role) {
     const changes = { [role]: select.value };
     select.disabled = true;
     try {
-      await api(`${V1}/meet/role-assignments`, {
+      await api(`${API_BASE}/meet/role-assignments`, {
         method: "POST",
         body: { role_account_map: changes, meeting_url: url },
       });
-      state.meetGlobalAssignments = await api(`${V1}/meet/role-assignments`);
+      state.meetGlobalAssignments = await api(`${API_BASE}/meet/role-assignments`);
       if (state.meetAssignmentScope === meetAssignmentKey(url)) loadMeetRoleAssignments();
     } catch (error) {
       select.value = previous;
@@ -2368,7 +2365,7 @@ async function loadMeetRoleAssignments() {
   try {
     const meetingUrl = state.meetAssignmentScope;
     const query = meetingUrl ? `?meeting_url=${encodeURIComponent(meetingUrl)}` : "";
-    const data = await api(`${V1}/meet/role-assignments${query}`);
+    const data = await api(`${API_BASE}/meet/role-assignments${query}`);
     state.meetForgottenUrls = (data.forgotten_meeting_urls || []).map(meetAssignmentKey);
     rememberMeetKnownUrls([
       ...(data.known_meeting_urls || []),
@@ -2409,7 +2406,7 @@ async function loadMeetRoleAssignments() {
         }
         result.textContent = `${roleLabel}: checking for an existing browser page...`;
         try {
-          const foregrounded = await api(`${V1}/meet/sso/foreground`, {
+          const foregrounded = await api(`${API_BASE}/meet/sso/foreground`, {
             method: "POST",
             body: { account_id: accountId },
           });
@@ -2428,7 +2425,7 @@ async function loadMeetRoleAssignments() {
     const result = el("span", "mono hint");
     const save = actionButton("Save role assignments", "primary", async () => {
       try {
-        const saved = await api(`${V1}/meet/role-assignments`, {
+        const saved = await api(`${API_BASE}/meet/role-assignments`, {
           method: "POST",
           body: {
             role_account_map: Object.fromEntries(
@@ -2439,7 +2436,7 @@ async function loadMeetRoleAssignments() {
           },
         });
         if (!meetingUrl) state.meetGlobalAssignments = saved;
-        else state.meetGlobalAssignments = await api(`${V1}/meet/role-assignments`);
+        else state.meetGlobalAssignments = await api(`${API_BASE}/meet/role-assignments`);
         result.textContent = meetingUrl
           ? "saved for this meeting"
           : "saved as global defaults for unconfigured meetings";
@@ -2453,10 +2450,10 @@ async function loadMeetRoleAssignments() {
     if (meetingUrl) {
       toolbar.insertBefore(actionButton("Use global defaults", "mini", async () => {
         try {
-          await api(`${V1}/meet/role-assignments?meeting_url=${encodeURIComponent(meetingUrl)}`, {
+          await api(`${API_BASE}/meet/role-assignments?meeting_url=${encodeURIComponent(meetingUrl)}`, {
             method: "DELETE",
           });
-          state.meetGlobalAssignments = await api(`${V1}/meet/role-assignments`);
+          state.meetGlobalAssignments = await api(`${API_BASE}/meet/role-assignments`);
           result.textContent = "meeting override removed";
           loadMeetRoleAssignments();
         } catch (error) {
@@ -2643,7 +2640,7 @@ function companionConfigKey() {
 
 function companionConfigUrl(scope = companionScope()) {
   // Legacy UI clients still use:
-  // api(`${V1}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`)
+  // api(`${API_BASE}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`)
   const params = new URLSearchParams({ scope });
   const channelKey = companionTargetChannelKey();
   if (channelKey && scope === "channel") params.set("channel_key", channelKey);
@@ -2651,7 +2648,7 @@ function companionConfigUrl(scope = companionScope()) {
     params.set("test_profile", state.meetCompanion.testProfile);
     params.set("channel_key", companionTestChannelKey());
   }
-  return `${V1}/meet/companion-click?${params}`;
+  return `${API_BASE}/meet/companion-click?${params}`;
 }
 
 function updateCompanionTargetControls() {
@@ -2923,7 +2920,7 @@ async function saveCompanionInterjector(event) {
   setCompanionResult(`Saving ${scope} configuration…`);
   try {
     const data = normalizeCompanionConfig(
-      await api(`${V1}/meet/companion-click`, { method: "POST", body }),
+      await api(`${API_BASE}/meet/companion-click`, { method: "POST", body }),
       scope,
     );
     state.meetCompanion.config = data;
@@ -2997,7 +2994,7 @@ async function saveCompanionToDefaults() {
   setCompanionResult("Saving global defaults…");
   try {
     const data = normalizeCompanionConfig(
-      await api(`${V1}/meet/companion-click`, {
+      await api(`${API_BASE}/meet/companion-click`, {
         method: "POST",
         body: { scope: "global", replace_override: true, override: values },
       }),
@@ -3132,7 +3129,7 @@ async function loadCompanionCableWiring() {
   if (state.companionCableWiring.loading) return;
   state.companionCableWiring.loading = true;
   try {
-    state.companionCableWiring.payload = await api(`${V1}/meet/companion-cable-wiring`);
+    state.companionCableWiring.payload = await api(`${API_BASE}/meet/companion-cable-wiring`);
     state.companionCableWiring.dirty = false;
     renderCompanionCableWiring();
   } catch (error) {
@@ -3147,7 +3144,7 @@ async function saveCompanionCableWiring() {
   Object.entries(COMPANION_CABLE_SELECTS).forEach(([key, id]) => { body[key] = $(id).value; });
   $("companion-cable-result").textContent = "Saving only; no audio will be unmuted…";
   try {
-    state.companionCableWiring.payload = await api(`${V1}/meet/companion-cable-wiring`, { method: "POST", body });
+    state.companionCableWiring.payload = await api(`${API_BASE}/meet/companion-cable-wiring`, { method: "POST", body });
     state.companionCableWiring.dirty = false;
     $("companion-cable-result").textContent = "Saved. Use Wire now to apply.";
     renderCompanionCableWiring();
@@ -3160,7 +3157,7 @@ async function applyCompanionCableWiring() {
   const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
   $("companion-cable-result").textContent = "Wiring fail-closed…";
   try {
-    const result = await api(`${V1}/meet/companion-cable-wiring/wire`, {
+    const result = await api(`${API_BASE}/meet/companion-cable-wiring/wire`, {
       method: "POST", body: { meeting_url: meetingUrl },
     });
     $("companion-cable-result").textContent = result.idempotent ? "Already wired and verified." : "Wired and verified.";
@@ -3174,7 +3171,7 @@ async function applyCompanionCableWiring() {
 async function disconnectCompanionCableWiring() {
   const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
   try {
-    await api(`${V1}/meet/companion-cable-wiring/disconnect`, {
+    await api(`${API_BASE}/meet/companion-cable-wiring/disconnect`, {
       method: "POST", body: { meeting_url: meetingUrl },
     });
     $("companion-cable-result").textContent = "Disconnected; remote media and cable mic are muted.";
@@ -3366,7 +3363,7 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
  * path from the bridge's own SAPI call in say_into_meeting() — an agent's
  * speech only reaches a Meet call today if something explicitly relayed it
  * through /say (or the google-meet mailbox), never automatically. This
- * table is read-only, informational (real profiles from `${V1}/voices`,
+ * table is read-only, informational (real profiles from `${API_BASE}/voices`,
  * enriched server-side with actual TtsEngine/WorkerMonitor activity, never
  * fabricated) -- editing happens on the Agent Voices page, which is where
  * the Agent link goes. Listens/Speaks/Enabled are read-only checkboxes,
@@ -3633,7 +3630,7 @@ function meetDevicesLink() {
 
 async function toggleMeetCapture(listening) {
   try {
-    await api(`${V1}/audio/capture/${listening ? "stop" : "start"}`, { method: "POST", body: {} });
+    await api(`${API_BASE}/audio/capture/${listening ? "stop" : "start"}`, { method: "POST", body: {} });
   } catch (error) {
     pushError(error.message);
   }
@@ -4019,7 +4016,7 @@ async function loadMeet() {
   );
   let health;
   try {
-    const channels = await api(`${V1}/meet/channels`);
+    const channels = await api(`${API_BASE}/meet/channels`);
     state.meetForgottenUrls = (channels.forgotten || []).map(meetAssignmentKey);
     const forgotten = new Set(state.meetForgottenUrls);
     state.meetKnownUrls = (channels.known || [])
@@ -4029,7 +4026,7 @@ async function loadMeet() {
     // The bridge/status view remains useful if this auxiliary discovery call fails.
   }
   try {
-    const capture = await api(`${V1}/audio/capture`);
+    const capture = await api(`${API_BASE}/audio/capture`);
     state.meetCaptureListening = !!capture.listening;
   } catch (_error) {
     state.meetCaptureListening = false;
@@ -4090,7 +4087,7 @@ async function loadMeet() {
   paintBridgeCard(capData);
   let agentProfiles = [];
   try {
-    agentProfiles = ((await api(`${V1}/voices`)).profiles || []);
+    agentProfiles = ((await api(`${API_BASE}/voices`)).profiles || []);
   } catch (error) {
     // Non-fatal — the meeting tree still renders without the Virtual agents list.
   }
@@ -4390,7 +4387,7 @@ async function renewSilencesTestSession() {
   );
   if (!run || !meetingUrl) return;
   run.meetingUrl = meetingUrl;
-  await api(`${V1}/meet/companion-click/test-session`, {
+  await api(`${API_BASE}/meet/companion-click/test-session`, {
     method: "POST",
     body: { test_profile: run.testId, channel_key: meetingUrl },
   });
@@ -4404,7 +4401,7 @@ async function endSilencesTestSession(run = state.silences.run) {
         (run && run.meetingUrl) || state.meetCompanion.meetingUrl,
       ),
     });
-    await api(`${V1}/meet/companion-click/test-session?${params}`, { method: "DELETE" });
+    await api(`${API_BASE}/meet/companion-click/test-session?${params}`, { method: "DELETE" });
   } catch (_error) {
     // The five-second lease also prevents a disconnected test UI leaking into production.
   }
@@ -4480,7 +4477,7 @@ async function driveNextSilenceAgentTurn() {
   const role = logic.expectedRoleFor(run.nextIndex, run.firstRole);
   if (role !== "companion" || run.floorQueuedIndex === run.nextIndex) return;
   const queuedIndex = run.nextIndex;
-  const result = await api(`${V1}/meet/floor/queue`, {
+  const result = await api(`${API_BASE}/meet/floor/queue`, {
     method: "POST",
     body: {
       meeting_url: meetingUrl,
@@ -4530,7 +4527,7 @@ async function loadSilencesWithPolling() {
 async function loadVoices() {
   const body = $("vc-body");
   try {
-    const [data, fleet] = await Promise.all([api(`${V1}/voices`), api(`${V1}/workers`)]);
+    const [data, fleet] = await Promise.all([api(`${API_BASE}/voices`), api(`${API_BASE}/workers`)]);
     body.replaceChildren();
 
     // Combine configured voice profiles with connected workers, so a worker that
@@ -4559,7 +4556,7 @@ async function loadVoices() {
       return inp;
     };
     const saveProfile = (agentId, patch) =>
-      api(`${V1}/voices/${encodeURIComponent(agentId)}`, { method: "POST", body: patch });
+      api(`${API_BASE}/voices/${encodeURIComponent(agentId)}`, { method: "POST", body: patch });
 
     const profPanel = panel("Agent & worker voice profiles — Speed, Pitch, Volume, Priority editable and persistent");
     profPanel.content.appendChild(table(
@@ -4576,7 +4573,7 @@ async function loadVoices() {
         }),
         p.voice_id ? (used[p.voice_id] > 1 ? badge("shared", "warn") : badge("unique", "ok")) : "—",
         actionButton("Preview", "", async () => {
-          try { await api(`${V1}/tts/speak`, { method: "POST", body: { agent_id: p.agent_id, text: `This is ${p.agent_id}.`, priority: 1 } }); }
+          try { await api(`${API_BASE}/tts/speak`, { method: "POST", body: { agent_id: p.agent_id, text: `This is ${p.agent_id}.`, priority: 1 } }); }
           catch (error) { pushError(error.message); }
         }),
       ])));
@@ -4591,13 +4588,13 @@ async function loadVoices() {
         agentIds.forEach((id) => select.appendChild(new Option(id, id)));
         select.onchange = async () => {
           if (!select.value) return;
-          try { await api(`${V1}/voices/${encodeURIComponent(select.value)}`, { method: "POST", body: { voice_id: v.id, engine: v.provider } }); loadVoices(); }
+          try { await api(`${API_BASE}/voices/${encodeURIComponent(select.value)}`, { method: "POST", body: { voice_id: v.id, engine: v.provider } }); loadVoices(); }
           catch (error) { pushError(error.message); }
         };
         const actions = el("div", "toolbar");
         actions.append(
           actionButton("Preview", "", async () => {
-            try { await api(`${V1}/voices/preview`, { method: "POST", body: { voice_id: v.id } }); }
+            try { await api(`${API_BASE}/voices/preview`, { method: "POST", body: { voice_id: v.id } }); }
             catch (error) { pushError(error.message); }
           }),
           actionButton("Clone", "", async () => {
@@ -4606,7 +4603,7 @@ async function loadVoices() {
             const rate = parseFloat(prompt("Speed (0.5 - 2.0):", "1.0") || "1");
             const pitch = parseFloat(prompt("Pitch (-10 - 10):", "0") || "0");
             try {
-              await api(`${V1}/voices/clone`, { method: "POST", body: { base_voice_id: v.id, name, rate, pitch } });
+              await api(`${API_BASE}/voices/clone`, { method: "POST", body: { base_voice_id: v.id, name, rate, pitch } });
               loadVoices();
             } catch (error) { pushError(error.message); }
           }),
@@ -4614,7 +4611,7 @@ async function loadVoices() {
         if (String(v.id).startsWith("clone:")) {
           actions.append(actionButton("Delete", "danger", async () => {
             if (!confirm(`Delete cloned voice "${v.name}"?`)) return;
-            try { await api(`${V1}/voices/clone/delete`, { method: "POST", body: { clone_id: v.id } }); loadVoices(); }
+            try { await api(`${API_BASE}/voices/clone/delete`, { method: "POST", body: { clone_id: v.id } }); loadVoices(); }
             catch (error) { pushError(error.message); }
           }));
         }
@@ -4629,7 +4626,7 @@ async function loadVoices() {
 async function loadStt() {
   const body = $("stt-body");
   try {
-    const data = await api(`${V1}/streams/stt_transcripts/tail?count=100`);
+    const data = await api(`${API_BASE}/streams/stt_transcripts/tail?count=100`);
     const events = (data.events || []).slice().sort((a, b) => {
       const at = Date.parse(a.ts || "") || 0;
       const bt = Date.parse(b.ts || "") || 0;
@@ -4688,7 +4685,7 @@ function sttSensitivityBadgeUpdate(sens) {
 }
 
 function pollSttSensitivityOnce() {
-  api(`${V1}/audio/capture`).then((capture) => {
+  api(`${API_BASE}/audio/capture`).then((capture) => {
     sttSensitivityBadgeUpdate(capture.mic_sensitivity);
     const policySelect = $("stt-echo-policy");
     if (capture.echo_policy && document.activeElement !== policySelect) policySelect.value = capture.echo_policy;
@@ -4761,7 +4758,7 @@ function sttEngineRow(engine) {
 }
 
 function primeSttEngineRows() {
-  api(`${V1}/status`).then((status) => {
+  api(`${API_BASE}/status`).then((status) => {
     let engines = (status.subsystems && status.subsystems.stt && status.subsystems.stt.engines) || [];
     engines = [...engines].sort((a, b) => a.localeCompare(b));
     $("stt-engine-hint").textContent = engines.length
@@ -4801,7 +4798,7 @@ async function sttIngest(text, opts = {}) {
   const trimmed = (text || "").trim();
   if (!trimmed) return;
   try {
-    await api(`${V1}/stt/ingest`, {
+    await api(`${API_BASE}/stt/ingest`, {
       method: "POST",
       body: {
         engine: opts.engine || $("stt-engine").value || "manual",
@@ -4982,7 +4979,7 @@ function toggleSttMic() {
 async function loadAccuracy() {
   const body = $("ac-body");
   try {
-    const data = await api(`${V1}/tts/accuracy`);
+    const data = await api(`${API_BASE}/tts/accuracy`);
     const groups = data.groups || {};
     const rows = Object.entries(groups).map(([name, g]) => [
       mono(name), String(g.count), String(g.avg_wer), String(g.avg_cer),
@@ -5002,7 +4999,7 @@ async function loadAccuracy() {
 async function loadCursors() {
   const body = $("cu-body");
   try {
-    const data = await api(`${V1}/cursors`);
+    const data = await api(`${API_BASE}/cursors`);
     body.replaceChildren();
     const p = panel("Durable cursors (per stream + consumer)");
     p.content.appendChild(table(
@@ -5028,7 +5025,7 @@ function repositionControl(cursor) {
       : `Skip ${cursor.stream}/${cursor.consumer} forward from ${cursor.seq} to ${target}?\n\nRISK: events will be SKIPPED and never processed.`;
     if (target === cursor.seq || !confirm(message)) return;
     try {
-      await api(`${V1}/cursors/${encodeURIComponent(cursor.stream)}/${encodeURIComponent(cursor.consumer)}/reposition`, {
+      await api(`${API_BASE}/cursors/${encodeURIComponent(cursor.stream)}/${encodeURIComponent(cursor.consumer)}/reposition`, {
         method: "POST",
         body: { seq: target, reason: "admin reposition", allow_replay: rewind, allow_skip: !rewind },
       });
@@ -5042,13 +5039,13 @@ function repositionControl(cursor) {
 /* ---- prompt */
 async function loadPrompt() {
   try {
-    const [current, history] = await Promise.all([api(`${V1}/prompt`), api(`${V1}/prompt/history`)]);
+    const [current, history] = await Promise.all([api(`${API_BASE}/prompt`), api(`${API_BASE}/prompt/history`)]);
     $("pr-text").value = current.text || "";
     const rows = (history.history || []).slice().reverse().map((h) => [
       String(h.version), mono(h.hash || "—"), h.operator || "—", shortTs(h.saved_at), h.note || "—",
       actionButton("Rollback", "danger", async () => {
         if (!confirm(`Roll back to version ${h.version}? This creates a NEW version; history is preserved.`)) return;
-        try { await api(`${V1}/prompt/rollback`, { method: "POST", body: { version: h.version } }); loadPrompt(); }
+        try { await api(`${API_BASE}/prompt/rollback`, { method: "POST", body: { version: h.version } }); loadPrompt(); }
         catch (error) { pushError(error.message); }
       }),
     ]);
@@ -5075,7 +5072,7 @@ async function loadSystem() {
   const body = $("sy-body");
   try {
     const [diag, config, caps, audit] = await Promise.all([
-      api(`${V1}/diagnostics`), api(`${V1}/config`), api(`${V1}/capabilities`), api(`${V1}/audit?limit=100`).catch(() => ({ events: [] })),
+      api(`${API_BASE}/diagnostics`), api(`${API_BASE}/config`), api(`${API_BASE}/capabilities`), api(`${API_BASE}/audit?limit=100`).catch(() => ({ events: [] })),
     ]);
     state.config = config;
     body.replaceChildren();
@@ -5109,6 +5106,60 @@ async function loadSystem() {
       (audit.events || []).slice().reverse().map((e) => [shortTs(e.ts), e.data.action || e.type, mono(JSON.stringify(e.data).slice(0, 140))])));
     body.appendChild(auditPanel.root);
   } catch (error) { body.textContent = `error: ${error.message}`; }
+}
+
+function pollForRestart(previousBootId, attempt = 0) {
+  const result = $("sy-lifecycle-result");
+  if (attempt >= 120) {
+    result.className = "mono lifecycle-result error";
+    result.textContent = "Restart was accepted, but the server did not return within 60 seconds.";
+    return;
+  }
+  setTimeout(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/status`, { cache: "no-store" });
+      if (response.ok) {
+        const status = await response.json();
+        if (status.boot_id && status.boot_id !== previousBootId) {
+          result.className = "mono lifecycle-result ok";
+          result.textContent = "Server restarted. Reconnecting…";
+          location.reload();
+          return;
+        }
+      }
+    } catch {
+      // A connection failure is expected while the old server releases the port.
+    }
+    result.textContent = `Restart scheduled — waiting for ${API_BASE}/status…`;
+    pollForRestart(previousBootId, attempt + 1);
+  }, 500);
+}
+
+async function requestLifecycle(action) {
+  const target = location.host || "this server";
+  const warning = action === "restart"
+    ? `Restart WS_COLLAB server ${target}? The UI will briefly disconnect and reconnect.`
+    : `Shut down WS_COLLAB server ${target}? The UI will go offline until it is started again.`;
+  if (!confirm(warning)) return;
+
+  const result = $("sy-lifecycle-result");
+  const restart = $("sy-restart");
+  const shutdown = $("sy-shutdown");
+  restart.disabled = true;
+  shutdown.disabled = true;
+  result.className = "mono lifecycle-result";
+  result.textContent = `Requesting ${action}…`;
+  try {
+    const acknowledgement = await api(`${API_BASE}/admin/${action}`, { method: "POST" });
+    result.className = "mono lifecycle-result ok";
+    result.textContent = `${action}: ${acknowledgement.status} (pid ${acknowledgement.pid}, boot ${acknowledgement.boot_id})`;
+    if (action === "restart") pollForRestart(acknowledgement.boot_id);
+  } catch (error) {
+    result.className = "mono lifecycle-result error";
+    result.textContent = `${action} failed: ${error.message}`;
+    restart.disabled = false;
+    shutdown.disabled = false;
+  }
 }
 
 /* --------------------------------------------------------------- UI helpers */
@@ -5224,7 +5275,7 @@ async function backfill(streams, view) {
   for (const stream of streams) {
     const buffer = bufferFor(stream);   // ensure the buffer exists even if empty
     try {
-      const page = await api(`${V1}/streams/${encodeURIComponent(stream)}/tail?count=300`);
+      const page = await api(`${API_BASE}/streams/${encodeURIComponent(stream)}/tail?count=300`);
       (page.events || []).forEach((event) => {
         if (!state.seen[stream].has(event.seq)) {
           state.seen[stream].add(event.seq);
@@ -5418,7 +5469,7 @@ function wireEvents() {
     const text = $("cv-text").value.trim();
     if (!text) return;
     try {
-      await api(`${V1}/conversation/events`, { method: "POST", body: { text }, headers: { "Idempotency-Key": `admin-${Date.now()}` } });
+      await api(`${API_BASE}/conversation/events`, { method: "POST", body: { text }, headers: { "Idempotency-Key": `admin-${Date.now()}` } });
       $("cv-text").value = "";
     } catch (error) { pushError(error.message); }
   };
@@ -5472,15 +5523,15 @@ function wireEvents() {
 
   // page actions
   $("wk-refresh").onclick = loadWorkers;
-  $("wk-monitor").onclick = async () => { try { await api(`${V1}/workers/monitor`, { method: "POST", body: {} }); loadWorkers(); } catch (e) { pushError(e.message); } };
+  $("wk-monitor").onclick = async () => { try { await api(`${API_BASE}/workers/monitor`, { method: "POST", body: {} }); loadWorkers(); } catch (e) { pushError(e.message); } };
   $("al-refresh").onclick = loadAlerts;
-  $("dv-refresh").onclick = async () => { try { await api(`${V1}/audio/devices/refresh`, { method: "POST", body: {} }); } catch (e) { pushError(e.message); } loadDevices(); };
-  $("dv-start").onclick = async () => { try { await api(`${V1}/audio/capture/start`, { method: "POST", body: {} }); } catch (e) { pushError(e.message); } loadDevices(); };
-  $("dv-stop").onclick = async () => { try { await api(`${V1}/audio/capture/stop`, { method: "POST", body: {} }); } catch (e) { pushError(e.message); } loadDevices(); };
+  $("dv-refresh").onclick = async () => { try { await api(`${API_BASE}/audio/devices/refresh`, { method: "POST", body: {} }); } catch (e) { pushError(e.message); } loadDevices(); };
+  $("dv-start").onclick = async () => { try { await api(`${API_BASE}/audio/capture/start`, { method: "POST", body: {} }); } catch (e) { pushError(e.message); } loadDevices(); };
+  $("dv-stop").onclick = async () => { try { await api(`${API_BASE}/audio/capture/stop`, { method: "POST", body: {} }); } catch (e) { pushError(e.message); } loadDevices(); };
   $("dv-inject").onclick = async () => {
     const text = prompt("Utterance text to inject through the pipeline:", "run the two reports");
     if (!text) return;
-    try { await api(`${V1}/audio/utterance`, { method: "POST", body: { text, source_kind: "operator" } }); }
+    try { await api(`${API_BASE}/audio/utterance`, { method: "POST", body: { text, source_kind: "operator" } }); }
     catch (error) { pushError(error.message); }
   };
   document.querySelectorAll(".filter-bar button.tristate[data-cat]")
@@ -5605,7 +5656,7 @@ function wireEvents() {
   $("ps-refresh").onclick = loadProcesses;
   $("vc-refresh").onclick = loadVoices;
   $("vc-assign").onclick = async () => {
-    try { await api(`${V1}/voices/assign`, { method: "POST", body: { policy: $("vc-policy").value } }); loadVoices(); }
+    try { await api(`${API_BASE}/voices/assign`, { method: "POST", body: { policy: $("vc-policy").value } }); loadVoices(); }
     catch (error) { pushError(error.message); }
   };
   $("stt-refresh").onclick = loadStt;
@@ -5617,7 +5668,7 @@ function wireEvents() {
     const status = $("stt-policy-status");
     status.textContent = "applying…";
     try {
-      await api(`${V1}/audio/echo-policy`, { method: "POST", body: { policy } });
+      await api(`${API_BASE}/audio/echo-policy`, { method: "POST", body: { policy } });
       status.textContent = "✓ applied";
     } catch (error) {
       status.textContent = `⚠ ${error.message}`;
@@ -5625,26 +5676,28 @@ function wireEvents() {
   };
   $("ac-refresh").onclick = loadAccuracy;
   $("ac-measure").onclick = async () => {
-    try { await api(`${V1}/tts/measure`, { method: "POST", body: { agent_id: $("ac-agent").value, text: $("ac-text").value } }); loadAccuracy(); }
+    try { await api(`${API_BASE}/tts/measure`, { method: "POST", body: { agent_id: $("ac-agent").value, text: $("ac-text").value } }); loadAccuracy(); }
     catch (error) { pushError(error.message); }
   };
   $("cu-refresh").onclick = loadCursors;
   $("pr-reload").onclick = loadPrompt;
   $("pr-diff").onclick = async () => {
     try {
-      const result = await api(`${V1}/prompt/preview-diff`, { method: "POST", body: { text: $("pr-text").value } });
+      const result = await api(`${API_BASE}/prompt/preview-diff`, { method: "POST", body: { text: $("pr-text").value } });
       $("pr-diffbody").replaceChildren(renderDiff(result.diff));
     } catch (error) { pushError(error.message); }
   };
   $("pr-save").onclick = async () => {
     if (!confirm("Save a new prompt version? The previous version is preserved and can be rolled back.")) return;
     try {
-      await api(`${V1}/prompt`, { method: "POST", body: { text: $("pr-text").value, note: $("pr-note").value } });
+      await api(`${API_BASE}/prompt`, { method: "POST", body: { text: $("pr-text").value, note: $("pr-note").value } });
       $("pr-note").value = "";
       loadPrompt();
     } catch (error) { pushError(error.message); }
   };
   $("sy-refresh").onclick = loadSystem;
+  $("sy-restart").onclick = () => requestLifecycle("restart");
+  $("sy-shutdown").onclick = () => requestLifecycle("shutdown");
 
   window.addEventListener("resize", () => Object.values(state.views).forEach((v) => v.draw()));
 }
@@ -5652,7 +5705,7 @@ function wireEvents() {
 async function refreshStatusBar() {
   $("top-clock").textContent = new Date().toLocaleTimeString();
   try {
-    const [diag, capture] = await Promise.all([api(`${V1}/diagnostics`), api(`${V1}/audio/capture`)]);
+    const [diag, capture] = await Promise.all([api(`${API_BASE}/diagnostics`), api(`${API_BASE}/audio/capture`)]);
     checkBootId(diag.boot_id);
     $("sb-backend").textContent = `backend ${capture.backend}`;
     $("sb-state").textContent = `state ${state.config ? state.config.state_dir : "—"}`;
@@ -5683,11 +5736,11 @@ async function boot() {
   $("login").hidden = true;
   $("app").hidden = false;
   try {
-    state.config = await api(`${V1}/config`);
-    state.caps = await api(`${V1}/capabilities`);
+    state.config = await api(`${API_BASE}/config`);
+    state.caps = await api(`${API_BASE}/capabilities`);
     checkBootId(state.caps && state.caps.boot_id);
     adoptStreams(state.caps);
-    state.endpoints = await api(`${V1}/endpoints`).catch(() => null);
+    state.endpoints = await api(`${API_BASE}/endpoints`).catch(() => null);
   } catch (error) {
     if (error.status === 401) { logout(); return; }
     pushError(error.message);
@@ -5709,7 +5762,7 @@ async function signIn(token) {
   if (!token) return false;
   state.token = token;
   try {
-    await api(`${V1}/auth/whoami`);
+    await api(`${API_BASE}/auth/whoami`);
     sessionStorage.setItem("ws_collab_token", token);
     boot();
     return true;
@@ -5747,7 +5800,7 @@ function consumeTokenFromUrl() {
  */
 async function tryAnonymousBoot() {
   try {
-    await api(`${V1}/auth/whoami`);
+    await api(`${API_BASE}/auth/whoami`);
     boot();
     return true;
   } catch {

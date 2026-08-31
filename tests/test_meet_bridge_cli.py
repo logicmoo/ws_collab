@@ -5,6 +5,31 @@ import sys
 import pytest
 
 from ws_collab.meet_bridge import bridge
+from ws_collab.urls import MEET_BRIDGE_HTTP_PATHS, meet_bridge_route_allowed
+
+
+def test_loopback_handler_accepts_only_canonical_namespaced_routes() -> None:
+    assert meet_bridge_route_allowed("GET", "/ws_collab/meet-bridge/health")
+    assert meet_bridge_route_allowed("GET", "/ws_collab/meet-bridge/captions")
+    for path in MEET_BRIDGE_HTTP_PATHS:
+        assert meet_bridge_route_allowed("OPTIONS", path)
+        if path.endswith(("/health", "/captions")):
+            assert meet_bridge_route_allowed("GET", path)
+        else:
+            assert meet_bridge_route_allowed("POST", path)
+    for old_path in (
+        "/health",
+        "/captions",
+        "/command",
+        "/speech",
+        "/wire-companion-audio",
+        "/v1/status",
+        "/v1/meet-bridge/health",
+        "/ws_collab/v1/meet-bridge/health",
+    ):
+        assert not meet_bridge_route_allowed("GET", old_path)
+        assert not meet_bridge_route_allowed("POST", old_path)
+        assert not meet_bridge_route_allowed("OPTIONS", old_path)
 
 
 def test_cli_exposes_single_profile_account_options(monkeypatch, tmp_path, capsys) -> None:

@@ -268,7 +268,7 @@ def test_agents_are_collected_in_declared_order(tmp_path) -> None:
 def test_report_lists_every_transport_url(tmp_path) -> None:
     config = Config.from_env(_env(tmp_path))
     report = build_startup_report(config, [{"host": "127.0.0.1", "port": 8802, "scheme": "http"}], [])
-    assert "http://127.0.0.1:8802/ws_collab/v1" in report
+    assert "http://127.0.0.1:8802/ws_collab" in report
     assert "ws://127.0.0.1:8802/ws_collab/ws" in report
     assert "/ws_collab/admin" in report
 
@@ -320,7 +320,10 @@ def test_public_config_excludes_secrets(service) -> None:
 
 def test_capabilities_describe_the_running_system(service) -> None:
     caps = service.capabilities()
-    assert caps["rest_base"] == "/ws_collab" and caps["versioned_base"] == "/ws_collab/v1"
+    assert caps["namespace"] == "/ws_collab"
+    assert caps["rest_base"] == "/ws_collab"
+    assert "versioned_base" not in caps
+    assert caps["websocket"] == "/ws_collab/ws"
     assert caps["features"]["three_stt_engines"] >= 3
     assert caps["streams"] and caps["stream_roles"]
 

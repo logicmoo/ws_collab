@@ -84,7 +84,7 @@ DYNAMIC_STREAMS: set[str] = set()
 # Semantic roles -> stream name(s). Clients, the admin UI, documentation, and
 # tests resolve streams through these roles instead of literal names, so a stream
 # can be renamed or split without breaking anything downstream. This registry is
-# the single source of truth; it is published via /ws_collab/v1/capabilities.
+# the single source of truth; it is published via /ws_collab/capabilities.
 STREAM_ROLES: dict[str, list[str] | str] = {
     "conversation": STREAM_CONVERSATION,
     "worker_status": STREAM_STATUSES,

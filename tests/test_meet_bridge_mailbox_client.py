@@ -25,7 +25,7 @@ def test_calls_use_bearer_token(monkeypatch) -> None:
     monkeypatch.setattr("urllib.request.urlopen", urlopen)
     client = MailboxClient(token="worker-token", timeout=3.0)
 
-    assert client._call("/v1/status") == {"ok": True}
+    assert client._call("/status") == {"ok": True}
     assert captured["request"].get_header("Authorization") == "Bearer worker-token"
     assert captured["timeout"] == 3.0
 
@@ -48,7 +48,7 @@ def test_final_caption_is_ingested_as_google_meet(monkeypatch) -> None:
     )
 
     assert result == {"ok": True}
-    assert captured["path"] == "/v1/stt/ingest"
+    assert captured["path"] == "/stt/ingest"
     assert captured["method"] == "POST"
     assert captured["body"]["engine"] == "google_meet"
     assert captured["body"]["text"] == "A complete Meet caption."
@@ -68,7 +68,7 @@ def test_secondary_capture_start_uses_audio_endpoint(monkeypatch) -> None:
     result = client.start_secondary_capture("dev-1")
 
     assert result["listening"] is True
-    assert captured["path"] == "/v1/audio/secondary-capture/start"
+    assert captured["path"] == "/audio/secondary-capture/start"
     assert captured["method"] == "POST"
     assert captured["body"] == {"device_id": "dev-1"}
 
@@ -88,7 +88,7 @@ def test_companion_browser_audio_uses_shared_secondary_endpoint(monkeypatch) -> 
 
     assert result["browser_connected"] is True
     assert captured == {
-        "path": "/v1/audio/secondary-capture/browser",
+        "path": "/audio/secondary-capture/browser",
         "method": "POST",
         "body": payload,
     }

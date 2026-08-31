@@ -69,7 +69,7 @@ Unknown top-level fields read from older records are preserved and re-emitted.
 ## Streams and roles
 
 Streams are registered in `events.py`. **Resolve streams by role, not by name** —
-roles are published through `/ws_collab/v1/capabilities` so a stream can be
+roles are published through `/ws_collab/capabilities` so a stream can be
 renamed or split without breaking clients, the admin UI, or tests.
 
 | Role | Purpose |

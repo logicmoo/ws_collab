@@ -8,6 +8,11 @@ import time
 import wave
 
 import pytest
+from ws_collab.urls import (
+    MEET_BRIDGE_SPEECH,
+    MEET_BRIDGE_SPEECH_CANCEL,
+    MEET_BRIDGE_SPEECH_STATUS,
+)
 
 from ws_collab.errors import ConflictError
 from ws_collab.meet_bridge.audio_out import AudioPlaybackCancelled, play_wav_bytes_to_device
@@ -273,9 +278,9 @@ def test_service_routes_requested_agent_speech_only_to_companion(service, monkey
             "companionAudio": {"companionReady": True, "lastError": None},
         },
     )
-    def bridge(payload, timeout=2.0, *, path="/speech"):
+    def bridge(payload, timeout=2.0, *, path=MEET_BRIDGE_SPEECH):
         bridge_calls.append({"path": path, **payload})
-        if path == "/speech/status":
+        if path == MEET_BRIDGE_SPEECH_STATUS:
             return {
                 "ok": True, "id": payload["utterance_id"], "state": "completed",
                 "terminal": True, "startedAt": 1.0, "completedAt": 1.2,
@@ -297,7 +302,7 @@ def test_service_routes_requested_agent_speech_only_to_companion(service, monkey
     assert bridge_calls[0]["agent_id"] == "agent-1"
     assert bridge_calls[0]["artifact_source"] == "virtual-agent-tts"
     assert bridge_calls[0]["meeting_url"] == "https://meet.google.com/abc-defg-hij"
-    assert bridge_calls[1]["path"] == "/speech/status"
+    assert bridge_calls[1]["path"] == MEET_BRIDGE_SPEECH_STATUS
 
 
 def test_service_companion_route_refuses_when_companion_not_ready(service, monkeypatch) -> None:
@@ -331,7 +336,7 @@ def test_tts_api_returns_conflict_when_companion_is_not_ready(
         },
     )
     response = client.post(
-        "/ws_collab/v1/tts/speak",
+        "/ws_collab/tts/speak",
         headers=worker_headers,
         json={"agent_id": "agent-1", "text": "hello", "destination": "companion"},
     )
@@ -381,7 +386,7 @@ def test_tts_api_exposes_destination_and_companion_status(
         },
     )
     response = client.post(
-        "/ws_collab/v1/tts/speak",
+        "/ws_collab/tts/speak",
         headers=worker_headers,
         json={
             "agent_id": "agent-api",
@@ -393,7 +398,7 @@ def test_tts_api_exposes_destination_and_companion_status(
     assert response.status_code == 200
     assert response.json()["destination"]["type"] == "companion"
 
-    state = client.get("/ws_collab/v1/tts", headers=viewer_headers)
+    state = client.get("/ws_collab/tts", headers=viewer_headers)
     assert state.status_code == 200
     companion = state.json()["destinations"]["companion"]
     assert companion["companionReady"] is True
@@ -417,11 +422,11 @@ def test_companion_tts_waits_for_remote_completion_before_finished(service, monk
     release = threading.Event()
     _ready_service_companion(service, monkeypatch)
 
-    def bridge(payload, timeout=2.0, *, path="/speech"):
-        if path == "/speech":
+    def bridge(payload, timeout=2.0, *, path=MEET_BRIDGE_SPEECH):
+        if path == MEET_BRIDGE_SPEECH:
             accepted.set()
             return {"ok": True, "accepted": True, "id": payload["utterance_id"]}
-        assert path == "/speech/status"
+        assert path == MEET_BRIDGE_SPEECH_STATUS
         release.wait(1)
         return {
             "ok": True, "id": payload["utterance_id"], "state": "completed",
@@ -468,11 +473,11 @@ def test_companion_tts_remote_failure_and_timeout_are_explicit(
     calls: list[str] = []
     _ready_service_companion(service, monkeypatch)
 
-    def bridge(payload, timeout=2.0, *, path="/speech"):
+    def bridge(payload, timeout=2.0, *, path=MEET_BRIDGE_SPEECH):
         calls.append(path)
-        if path == "/speech":
+        if path == MEET_BRIDGE_SPEECH:
             return {"ok": True, "accepted": True, "id": payload["utterance_id"]}
-        if path == "/speech/status":
+        if path == MEET_BRIDGE_SPEECH_STATUS:
             return {"id": payload["utterance_id"], **remote}
         return {"ok": True, "cancelled": True}
 
@@ -489,7 +494,7 @@ def test_companion_tts_remote_failure_and_timeout_are_explicit(
     )
     assert error in finished["data"]["error"]
     if not remote["terminal"]:
-        assert calls[-1] == "/speech/cancel"
+        assert calls[-1] == MEET_BRIDGE_SPEECH_CANCEL
 
 
 def test_companion_tts_duration_hint_allows_legitimate_over_45_second_playback(
@@ -498,9 +503,9 @@ def test_companion_tts_duration_hint_allows_legitimate_over_45_second_playback(
     calls: list[tuple[str, dict, float]] = []
     _ready_service_companion(service, monkeypatch)
 
-    def bridge(payload, timeout=2.0, *, path="/speech"):
+    def bridge(payload, timeout=2.0, *, path=MEET_BRIDGE_SPEECH):
         calls.append((path, dict(payload), timeout))
-        if path == "/speech":
+        if path == MEET_BRIDGE_SPEECH:
             return {
                 "ok": True,
                 "accepted": True,
@@ -528,7 +533,7 @@ def test_companion_tts_duration_hint_allows_legitimate_over_45_second_playback(
     )
     asyncio.run(service.tts.process_next())
 
-    status_calls = [entry for entry in calls if entry[0] == "/speech/status"]
+    status_calls = [entry for entry in calls if entry[0] == MEET_BRIDGE_SPEECH_STATUS]
     assert status_calls
     assert all(0 < entry[1]["wait_seconds"] <= 10 for entry in status_calls)
     events = service.read_events("tts_queue", limit=100)["events"]
@@ -552,11 +557,11 @@ def test_companion_tts_stuck_playing_times_out_at_firm_cap(
     monkeypatch.setattr(service_mod, "_COMPANION_TTS_STATUS_POLL_SECONDS", 0.05)
     monkeypatch.setattr(service_mod, "_COMPANION_TTS_DURATION_GRACE_SECONDS", 0.01)
 
-    def bridge(payload, timeout=2.0, *, path="/speech"):
+    def bridge(payload, timeout=2.0, *, path=MEET_BRIDGE_SPEECH):
         calls.append(path)
-        if path == "/speech":
+        if path == MEET_BRIDGE_SPEECH:
             return {"ok": True, "accepted": True, "id": payload["utterance_id"]}
-        if path == "/speech/status":
+        if path == MEET_BRIDGE_SPEECH_STATUS:
             return {
                 "ok": True,
                 "id": payload["utterance_id"],
@@ -578,7 +583,7 @@ def test_companion_tts_stuck_playing_times_out_at_firm_cap(
     elapsed = time.monotonic() - started
 
     assert 0.15 <= elapsed < 1.0
-    assert calls[-1] == "/speech/cancel"
+    assert calls[-1] == MEET_BRIDGE_SPEECH_CANCEL
     events = service.read_events("tts_queue", limit=100)["events"]
     finished = next(
         event for event in events
@@ -593,12 +598,12 @@ def test_interrupt_cancels_handed_off_companion_utterance(service, monkeypatch) 
     paths: list[tuple[str, str]] = []
     _ready_service_companion(service, monkeypatch)
 
-    def bridge(payload, timeout=2.0, *, path="/speech"):
+    def bridge(payload, timeout=2.0, *, path=MEET_BRIDGE_SPEECH):
         utterance_id = payload["utterance_id"]
         paths.append((path, utterance_id))
-        if path == "/speech":
+        if path == MEET_BRIDGE_SPEECH:
             return {"ok": True, "accepted": True, "id": utterance_id}
-        if path == "/speech/cancel":
+        if path == MEET_BRIDGE_SPEECH_CANCEL:
             cancelled.set()
             return {"ok": True, "cancelled": True}
         playing.set()
@@ -629,7 +634,7 @@ def test_interrupt_cancels_handed_off_companion_utterance(service, monkeypatch) 
         event["type"] == "TTS_CANCELLED" and event["data"]["id"] == first["id"]
         for event in events
     )
-    assert ("/speech/cancel", first["id"]) in paths
+    assert (MEET_BRIDGE_SPEECH_CANCEL, first["id"]) in paths
     assert second["id"]
 
 
@@ -647,15 +652,15 @@ def test_meeting_switch_cancellation_reaches_tts_lifecycle(service, monkeypatch)
     arbiter.start()
     _ready_service_companion(service, monkeypatch)
 
-    def bridge(payload, timeout=2.0, *, path="/speech"):
-        if path == "/speech":
+    def bridge(payload, timeout=2.0, *, path=MEET_BRIDGE_SPEECH):
+        if path == MEET_BRIDGE_SPEECH:
             return arbiter.submit(
                 kind="speech",
                 text=payload["text"],
                 meeting_url=payload["meeting_url"],
                 metadata={"utterance_id": payload["utterance_id"]},
             )
-        if path == "/speech/status":
+        if path == MEET_BRIDGE_SPEECH_STATUS:
             return arbiter.utterance_status(
                 payload["utterance_id"], wait_seconds=payload["wait_seconds"]
             )

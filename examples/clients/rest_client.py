@@ -32,7 +32,7 @@ class RestClient:
 
     def publish_conversation(self, text: str, idempotency_key: str) -> dict:
         return self._request(
-            "POST", "/ws_collab/v1/conversation/events",
+            "POST", "/ws_collab/conversation/events",
             {"text": text}, {"Idempotency-Key": idempotency_key},
         )
 
@@ -44,7 +44,7 @@ class RestClient:
             query = {"stream": stream, "limit": 100, "wait_ms": wait_ms}
             if cursor:
                 query["after"] = cursor
-            page = self._request("GET", f"/ws_collab/v1/events?{urllib.parse.urlencode(query)}")
+            page = self._request("GET", f"/ws_collab/events?{urllib.parse.urlencode(query)}")
             cursor = page["next_cursor"]
             if page["events"]:
                 yield page["events"], cursor
@@ -57,7 +57,7 @@ def main() -> None:
     parser.add_argument("--stream", default="conversation")
     args = parser.parse_args()
     client = RestClient(args.base, args.token)
-    print("capabilities:", client._request("GET", "/ws_collab/v1/capabilities")["features"])
+    print("capabilities:", client._request("GET", "/ws_collab/capabilities")["features"])
     print(client.publish_conversation("hello from rest client", "demo-key-1"))
     for events, cursor in client.consume(args.stream):
         for event in events:

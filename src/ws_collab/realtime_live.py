@@ -21,6 +21,9 @@ from .realtime_scenarios import (
     counting_scenario,
 )
 from .stt.base import normalize_text
+from .urls import rest_base
+
+API_BASE = rest_base()
 
 
 def _normal_meeting_url(value: str) -> str:
@@ -105,7 +108,7 @@ class LiveScenarioIO:
     def _agent_turn(self, turn: ExpectedTurn) -> TurnObservation:
         print(f"Turn {turn.index}: agent {self.agent_id!r} should speak {turn.spoken_token!r}.")
         result = self.api.post(
-            "/ws_collab/v1/tts/speak",
+            f"{API_BASE}/tts/speak",
             {
                 "agent_id": self.agent_id,
                 "text": turn.spoken_token,
@@ -119,7 +122,7 @@ class LiveScenarioIO:
             raise RuntimeError(f"agent turn was not queued: {result}")
         deadline = time.monotonic() + turn.deadline_ms / 1000.0
         while time.monotonic() <= deadline:
-            status = self.api.get("/ws_collab/v1/meet/bridge/status")
+            status = self.api.get(f"{API_BASE}/meet/bridge/status")
             errors = live_readiness_errors(status, self.meeting_url)
             if errors:
                 raise RuntimeError("; ".join(errors))
@@ -146,13 +149,13 @@ class LiveScenarioIO:
         deadline = time.monotonic() + turn.deadline_ms / 1000.0
         accepted = {normalize_text(value) for value in turn.accepted_asr_forms}
         while time.monotonic() <= deadline:
-            status = self.api.get("/ws_collab/v1/meet/bridge/status")
+            status = self.api.get(f"{API_BASE}/meet/bridge/status")
             errors = live_readiness_errors(status, self.meeting_url)
             if errors:
                 raise RuntimeError("; ".join(errors))
             if self.user_source == "companion-heard":
                 payload = self.api.get(
-                    "/ws_collab/v1/events?stream=translated_audio"
+                    f"{API_BASE}/events?stream=translated_audio"
                     "&source_kind=companion_heard&type=HEARD_SPEECH&since="
                     + urllib.parse.quote(str(since), safe="")
                     + "&limit=100"
@@ -160,7 +163,7 @@ class LiveScenarioIO:
                 rows = payload.get("events") or []
             else:
                 payload = self.api.get(
-                    "/ws_collab/v1/meet/bridge/captions?since="
+                    f"{API_BASE}/meet/bridge/captions?since="
                     + urllib.parse.quote(str(since), safe="")
                 )
                 rows = [
@@ -230,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     api = _Api(args.base_url, token)
     try:
-        status = api.get("/ws_collab/v1/meet/bridge/status")
+        status = api.get(f"{API_BASE}/meet/bridge/status")
         errors = live_readiness_errors(status, args.meeting_url)
         if args.user_source == "companion-heard":
             heard = status.get("companionHeardStt") or {}

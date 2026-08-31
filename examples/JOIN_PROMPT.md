@@ -16,7 +16,7 @@ You are joining a shared voice/collaboration session hosted by a local
 
 SERVER
 - Base URL:        http://127.0.0.1:8802
-- REST base:       /ws_collab/v1   (also mounted at /ws_collab)
+- REST base:       /ws_collab   (sole REST namespace)
 - WebSocket:       ws://127.0.0.1:8802/ws_collab/ws
 - Auth:            NONE required on localhost (loopback). If a token is ever
                    required, send HTTP header  Authorization: Bearer <TOKEN>
@@ -24,15 +24,15 @@ SERVER
 - Must run on THIS machine (server is loopback-only).
 
 STEP 1 - Discover (confirm you can reach it)
-  GET /status
-  GET /ws_collab/v1/capabilities     -> lists streams, roles, features
-  GET /ws_collab/v1/auth/whoami      -> your identity/role
+  GET /ws_collab/status
+  GET /ws_collab/capabilities     -> lists streams, roles, features
+  GET /ws_collab/auth/whoami      -> your identity/role
 
 STEP 2 - Register yourself as a worker
-  POST /ws_collab/v1/workers/register
+  POST /ws_collab/workers/register
     {"worker_id":"<your-unique-id>","task":"<what you do>","meta":{}}
   Then check in periodically (heartbeat; call again on state changes):
-  POST /ws_collab/v1/workers/<your-unique-id>/status
+  POST /ws_collab/workers/<your-unique-id>/status
     {"status":"active","data":{},"errors":[]}
 
 STEP 3 - Listen to the session (choose ONE)
@@ -42,8 +42,8 @@ STEP 3 - Listen to the session (choose ONE)
      3. send {"type":"subscribe","streams":["conversation","stt_transcripts","tts_queue"],"cursors":{}}
      4. receive {"type":"event","event":{...}}; reply to {"type":"ping"} with {"type":"pong"}
   B) REST long-poll (fallback, no deps):
-     GET /ws_collab/v1/conversation?after=<cursor>     # repeat with returned cursor
-     (same pattern for /ws_collab/v1/stt/transcripts)
+     GET /ws_collab/conversation?after=<cursor>     # repeat with returned cursor
+     (same pattern for /ws_collab/stt/transcripts)
 
 Key streams: conversation, stt_transcripts (heard speech), tts_queue (spoken),
 worker_statuses, system_alerts. Cursors are durable - keep the last cursor to
@@ -51,13 +51,13 @@ resume without missing or duplicating events.
 
 STEP 4 - Participate
   Post a chat/coordination message:
-    POST /ws_collab/v1/conversation/events
+    POST /ws_collab/conversation/events
       {"text":"hello, joining now","source_id":"<your-unique-id>","source_kind":"agent"}
   Speak out loud via the shared TTS:
-    POST /ws_collab/v1/tts/speak
+    POST /ws_collab/tts/speak
       {"agent_id":"<your-unique-id>","text":"ready to help","priority":5}
   Submit text you recognized (external speech-to-text):
-    POST /ws_collab/v1/stt/ingest
+    POST /ws_collab/stt/ingest
       {"engine":"<your-name>","text":"...","confidence":0.9,"is_final":true,"resolve":true}
 
 ETIQUETTE
@@ -67,7 +67,7 @@ ETIQUETTE
 
 Minimal stdlib client to prove the connection:
   import json, urllib.request
-  B="http://127.0.0.1:8802/ws_collab/v1"
+  B="http://127.0.0.1:8802/ws_collab"
   def call(path, body=None):
       r=urllib.request.Request(B+path,
           data=None if body is None else json.dumps(body).encode(),

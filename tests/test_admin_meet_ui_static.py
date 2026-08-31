@@ -69,8 +69,8 @@ def test_sso_browser_page_loads_and_saves_accessible_consent_toggle() -> None:
 def test_companion_interjector_uses_existing_scoped_routes_and_payload() -> None:
     source = _source()
 
-    assert 'api(`${V1}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`)' in source
-    assert "await api(`${V1}/meet/companion-click`, { method: \"POST\", body })" in source
+    assert 'api(`${API_BASE}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`)' in source
+    assert "await api(`${API_BASE}/meet/companion-click`, { method: \"POST\", body })" in source
     assert 'method: "DELETE"' in source
     for key in (
         "enabled",

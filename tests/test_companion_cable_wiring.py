@@ -452,35 +452,35 @@ def test_wiring_rest_is_narrow_authenticated_and_save_does_not_apply(
         "_meet_bridge_wiring",
         lambda payload, **kwargs: called.append((payload, kwargs)) or {"ok": True, "phase": "wired"},
     )
-    assert client.get("/ws_collab/v1/meet/companion-cable-wiring", headers=viewer_headers).status_code == 200
-    assert client.post("/ws_collab/v1/meet/companion-cable-wiring", headers=viewer_headers, json=body).status_code == 403
-    saved = client.post("/ws_collab/v1/meet/companion-cable-wiring", headers=admin_headers, json=body)
+    assert client.get("/ws_collab/meet/companion-cable-wiring", headers=viewer_headers).status_code == 200
+    assert client.post("/ws_collab/meet/companion-cable-wiring", headers=viewer_headers, json=body).status_code == 403
+    saved = client.post("/ws_collab/meet/companion-cable-wiring", headers=admin_headers, json=body)
     assert saved.status_code == 200
     assert called == []
-    assert client.get("/ws_collab/v1/meet/companion-cable-wiring/runtime", headers=worker_headers).status_code == 200
+    assert client.get("/ws_collab/meet/companion-cable-wiring/runtime", headers=worker_headers).status_code == 200
     assert client.post(
-        "/ws_collab/v1/meet/companion-cable-wiring/capture/start",
+        "/ws_collab/meet/companion-cable-wiring/capture/start",
         headers=worker_headers,
         json={"device_id": inputs[1]["id"]},
     ).status_code == 400
     capture = client.post(
-        "/ws_collab/v1/meet/companion-cable-wiring/capture/start",
+        "/ws_collab/meet/companion-cable-wiring/capture/start",
         headers=worker_headers,
         json={"device_id": inputs[0]["id"]},
     )
     assert capture.status_code == 200
     assert capture.json()["device_id"] == inputs[0]["id"]
     assert client.post(
-        "/ws_collab/v1/meet/companion-cable-wiring/capture/stop",
+        "/ws_collab/meet/companion-cable-wiring/capture/stop",
         headers=worker_headers,
     ).status_code == 200
     wired = client.post(
-        "/ws_collab/v1/meet/companion-cable-wiring/wire",
+        "/ws_collab/meet/companion-cable-wiring/wire",
         headers=admin_headers,
         json={"meeting_url": "https://meet.google.com/abc-defg-hij"},
     )
     assert wired.status_code == 200
-    assert called[0][1]["path"] == "/wire-companion-audio"
+    assert called[0][1]["path"] == "/ws_collab/meet-bridge/wire-companion-audio"
 
 
 def test_silences_ui_exposes_directional_four_endpoint_controls() -> None:

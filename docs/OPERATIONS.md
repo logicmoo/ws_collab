@@ -43,7 +43,7 @@ timestamp, and risk.
 ```bash
 # inspect
 curl -H "Authorization: Bearer $TOKEN" \
-  http://127.0.0.1:8802/ws_collab/v1/cursors/conversation/worker-1
+  http://127.0.0.1:8802/ws_collab/cursors/conversation/worker-1
 
 # advance after successful processing
 curl -X POST .../cursors/conversation/worker-1/commit \
@@ -95,7 +95,7 @@ Run one bounded cycle on demand:
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" \
-  http://127.0.0.1:8802/ws_collab/v1/workers/monitor
+  http://127.0.0.1:8802/ws_collab/workers/monitor
 ```
 
 ## The worker prompt
@@ -104,7 +104,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 preserved, every version is appended to durable history, and any version can be
 diffed or rolled back to (rollback creates a new version — history is
 append-only). Edit it in the admin page or via
-`/ws_collab/v1/prompt`. The default text is in
+`/ws_collab/prompt`. The default text is in
 [`examples/long_running_prompt.txt`](../examples/long_running_prompt.txt).
 
 Its key constraint: **native Codex/Copilot automation is the only approved
@@ -137,8 +137,17 @@ TTS queue worker, and bounded health monitor are normal and expected.)
 
 ## Shutdown and restart
 
+Operators can use the confirmed controls on **System & Audit**, or call
+`POST /ws_collab/admin/shutdown` and `POST /ws_collab/admin/restart`. Both
+require operator authorization and normal mutation CSRF/origin protection.
+Embedded hosts return `409` unless they explicitly supply the corresponding
+lifecycle callback.
+
 Shutdown cancels the health monitor, drains and stops the TTS queue, closes
-WebSocket subscriptions, and releases the state-directory lock. On restart the
-store re-derives each stream's position from durable data (even if the recovery
-sidecar is lost), repairs an unterminated final record, and continues without
-reusing a position. Consumers resume from their persisted cursors.
+owned child processes, ends Uvicorn serving, and releases the state-directory
+lock. Restart uses exit code `75` internally: `python -m ws_collab.standalone`
+runs a supervisor loop which waits for complete shutdown before rebinding with
+the original interpreter arguments and environment. The store then re-derives
+each stream's position from durable data, repairs an unterminated final record,
+and continues without reusing a position. Consumers resume from persisted
+cursors.

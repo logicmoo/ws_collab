@@ -29,7 +29,7 @@ Details for each agent follow below.
 
 ### Endpoints and services
 
-- WS_COLLAB standalone: `http://127.0.0.1:8802/ws_collab/v1`
+- WS_COLLAB standalone: `http://127.0.0.1:8802/ws_collab`
 - Mailbox relay standalone: `http://127.0.0.1:46667/v1`
 
 ### Recent work and notes
@@ -111,7 +111,7 @@ Details for each agent follow below.
 
 ### Recent work and notes
 
-- Current task: implement the ws_collab mailbox v1 API (`/ws_collab/v1`) into mailbox_chat.
+- Current task: implement the unversioned ws_collab mailbox API (`/ws_collab`) into mailbox_chat.
 
 ---
 
@@ -140,7 +140,7 @@ Details for each agent follow below.
 
 - emullm HTTP: `http://127.0.0.1:8801`
 - emullm worker WebSocket: `ws://127.0.0.1:8801/llm_emul/codex-ide-1/ws`
-- WS_COLLAB REST: `http://127.0.0.1:8802/ws_collab/v1`
+- WS_COLLAB REST: `http://127.0.0.1:8802/ws_collab`
 - WS_COLLAB WebSocket: `ws://127.0.0.1:8802/ws_collab/ws`
 - Activity channel: `ws_collab/conversation`
 

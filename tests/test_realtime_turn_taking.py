@@ -44,7 +44,7 @@ def test_realtime_scenarios_pass_through_production_audio_and_stt_paths(
 
     def ingest(payload):
         response = client.post(
-            "/ws_collab/v1/audio/secondary-capture/browser",
+            "/ws_collab/audio/secondary-capture/browser",
             headers=admin_headers,
             json=payload,
         )

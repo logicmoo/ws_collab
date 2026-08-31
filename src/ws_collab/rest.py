@@ -1,8 +1,8 @@
 """REST transport for WS_COLLAB.
 
-Every capability is reachable here (task section 4). The router is mounted under
-the configured prefix (default ``/ws_collab``) with versioned resources beneath
-``/ws_collab/v1``. It is a thin shell over :class:`~ws_collab.service.WsCollabService`
+Every capability is reachable here (task section 4). The router exposes exactly
+one REST base beneath the configured namespace (default ``/ws_collab``).
+It is a thin shell over :class:`~ws_collab.service.WsCollabService`
 so REST and WebSocket stay in parity. Features: bearer-token or session auth,
 CSRF for cookie mutations, origin/allowlist/rate/size limits, cursor pagination
 with ``has_more``/server time, idempotent writes, conditional (ETag) reads, and
@@ -12,16 +12,21 @@ bounded long polling.
 from __future__ import annotations
 
 import asyncio
+import inspect
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.background import BackgroundTask
 
 from .context import AppContext
 from .errors import AuthenticationError, ValidationError, WsCollabError
 from .security import Principal, Session
+from .urls import DEFAULT_ROUTE_PREFIX, admin_base, normalize_route_prefix, rest_base
 
 _ADMIN_DIR = Path(__file__).resolve().parent / "admin"
 _SESSION_COOKIE = "ws_collab_session"
@@ -94,18 +99,144 @@ def _serve_admin_asset(request: Request, relative: str) -> Response:
     return FileResponse(path, media_type=media_type)
 
 
-def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema: bool = True) -> APIRouter:
-    """Build the REST surface under ``mount``.
+_PUBLIC_PURPOSES = {
+    "GET /health": "Report whether the process is alive.",
+    "GET /status": "Report the overall state of every ws_collab subsystem.",
+    "GET /ready": "Report whether the service is ready to accept traffic.",
+    "GET /capabilities": "Describe supported transports, streams, roles, and features.",
+}
 
-    Every route is defined relative to a single mount root, so the same API can
-    be mounted at several roots by calling this more than once. The server mounts
-    it at ``/``, ``/v1``, ``/ws_collab``, and ``/ws_collab/v1`` -- any of those
-    combinations answers identically. Only the canonical mount appears in the
-    OpenAPI schema, so each operation is documented once.
-    """
+_ACTION_WORDS = {
+    "start": "Start",
+    "stop": "Stop",
+    "refresh": "Refresh",
+    "test": "Test",
+    "scan": "Scan",
+    "assign": "Assign",
+    "preview": "Preview",
+    "cancel": "Cancel",
+    "commit": "Commit",
+    "reposition": "Reposition",
+    "reset": "Reset",
+    "rollback": "Roll back",
+    "forget": "Forget",
+    "prune": "Prune",
+    "wire": "Wire",
+    "disconnect": "Disconnect",
+    "invalidate": "Invalidate",
+    "evaluate": "Evaluate",
+    "monitor": "Run monitoring for",
+    "open": "Open",
+    "foreground": "Bring to the foreground",
+}
 
-    mount = mount.rstrip("/")
-    root = mount or "/"
+
+def _route_description(path: str, methods: tuple[str, ...], mount: str) -> tuple[str, str]:
+    """Generate stable, human-facing OpenAPI metadata from method and path."""
+
+    method = methods[0] if len(methods) == 1 else "/".join(methods)
+    relative = path.removeprefix(mount) or "/"
+    explicit = _PUBLIC_PURPOSES.get(f"{method} {relative}")
+    words = [
+        f"for the {part[1:-1].replace('_', ' ')} identified in the path"
+        if part.startswith("{") and part.endswith("}")
+        else part.replace("-", " ").replace("_", " ")
+        for part in relative.strip("/").split("/")
+        if part
+    ]
+    resource = " ".join(words) or "ws collab service"
+    final = words[-1] if words else ""
+    if explicit:
+        description = explicit
+    elif method == "GET":
+        description = f"Retrieve {resource}."
+    elif method == "DELETE":
+        description = f"Delete or clear {resource}."
+    elif final in _ACTION_WORDS:
+        description = f"{_ACTION_WORDS[final]} {resource.removesuffix(' ' + final)}."
+    elif method == "POST":
+        description = f"Create, update, or execute {resource}."
+    else:
+        description = f"Use {method} to access {resource}."
+    return description.rstrip("."), description
+
+
+def _finalize_route_metadata(router: APIRouter, mount: str) -> None:
+    """Attach descriptions and capability metadata before routers are included."""
+
+    for route in router.routes:
+        methods = tuple(sorted(getattr(route, "methods", ()) or ()))
+        path = getattr(route, "path", "")
+        if not methods or not path.startswith(mount) or not getattr(route, "include_in_schema", False):
+            continue
+        summary, generated = _route_description(path, methods, mount)
+        route.summary = summary
+        route.description = (route.description or generated).strip()
+        source = inspect.getsource(route.endpoint)
+        roles = re.findall(r'_require\(request,\s*"([^"]+)"', source)
+        capability = roles[0] if roles else "public"
+        route.openapi_extra = {
+            **(route.openapi_extra or {}),
+            "x-ws-collab-auth": "none" if capability == "public" else "bearer-or-session",
+            "x-ws-collab-capability": capability,
+            "x-ws-collab-visibility": "public",
+            "x-ws-collab-category": (
+                "admin-control"
+                if path in {f"{mount}/admin/shutdown", f"{mount}/admin/restart"}
+                else "REST"
+            ),
+        }
+
+
+def _http_route_inventory(app: Any, prefix: str, origin: str) -> list[dict[str, Any]]:
+    """Derive the complete REST inventory from mounted OpenAPI routes."""
+
+    found: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
+    seen: set[int] = set()
+
+    def visit(router: Any) -> None:
+        if id(router) in seen:
+            return
+        seen.add(id(router))
+        for route in getattr(router, "routes", ()):
+            path = getattr(route, "path", "")
+            methods = tuple(sorted(getattr(route, "methods", ()) or ()))
+            if path.startswith(prefix) and methods and getattr(route, "include_in_schema", False):
+                extra = getattr(route, "openapi_extra", None) or {}
+                found[(path, methods)] = {
+                    "path": path,
+                    "url": f"{origin}{path}" if origin else path,
+                    "origin": origin or None,
+                    "methods": list(methods),
+                    "description": (
+                        getattr(route, "description", "")
+                        or getattr(route, "summary", "")
+                    ).strip(),
+                    "auth": extra.get("x-ws-collab-auth", "bearer-or-session"),
+                    "capability": extra.get("x-ws-collab-capability", "viewer"),
+                    "visibility": extra.get("x-ws-collab-visibility", "public"),
+                    "category": extra.get("x-ws-collab-category", "REST"),
+                    "kind": "http",
+                }
+            included = getattr(route, "original_router", None)
+            if included is not None:
+                visit(included)
+
+    visit(app)
+    return [found[key] for key in sorted(found)]
+
+
+def create_rest_router(
+    ctx: AppContext,
+    route_prefix: str = DEFAULT_ROUTE_PREFIX,
+    *,
+    in_schema: bool = True,
+) -> APIRouter:
+    """Build the sole unversioned REST surface and prefixed admin UI."""
+
+    prefix = normalize_route_prefix(route_prefix)
+    mount = rest_base(prefix)
+    admin = admin_base(prefix)
     router = APIRouter(tags=["ws_collab"], include_in_schema=in_schema)
     service = ctx.service
     security = ctx.security
@@ -154,38 +285,11 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         return filters
 
     # -------------------------------------------------------------- public info
-    @router.get(root, include_in_schema=False)
-    @router.get(f"{root}/" if root != "/" else "/index.html", include_in_schema=False)
     @router.get(f"{mount}/health")
-    async def health(request: Request) -> Response:
-        """Health for API clients; the workbench itself for browsers.
+    async def health() -> Response:
+        """Liveness probe for the canonical REST API."""
 
-        Hitting a mount root in a browser serves the operations workbench inline
-        (so ``/ws_collab/#voices`` works directly), while API clients and the
-        explicit ``/health`` path always get the liveness payload.
-        """
-
-        if request.url.path.rstrip("/").endswith("/health"):
-            return JSONResponse(service.health())
-        if "text/html" in request.headers.get("accept", ""):
-            if not security.is_admin_client_allowed(_client_ip(request)):
-                raise HTTPException(
-                    status_code=403,
-                    detail={"code": "forbidden", "message": "admin is loopback-only; set WS_COLLAB_ADMIN_REMOTE=1"},
-                )
-            index = _ADMIN_DIR / "index.html"
-            if index.is_file():
-                return FileResponse(index)
         return JSONResponse(service.health())
-
-    @router.get(f"{mount}/app.css", include_in_schema=False)
-    @router.get(f"{mount}/app.js", include_in_schema=False)
-    async def mount_asset(request: Request) -> Response:
-        """Fast path for the two core assets; the catch-all below serves the rest."""
-
-        if not security.is_admin_client_allowed(_client_ip(request)):
-            raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "admin is loopback-only"})
-        return _serve_admin_asset(request, Path(request.url.path).name)
 
     @router.get(f"{mount}/status")
     async def status() -> dict[str, Any]:
@@ -206,18 +310,62 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     async def endpoints(request: Request) -> dict[str, Any]:
         await _require(request, "viewer")
         origin = str(request.base_url).rstrip("/")
-        return service.endpoints(origin=origin)
+        routes = _http_route_inventory(request.app, mount, origin)
+        return service.endpoints(
+            origin=origin,
+            route_prefix=prefix,
+            rest_entries=routes,
+        )
 
     @router.get(f"{mount}/capabilities")
     async def capabilities() -> dict[str, Any]:
         await ctx.ensure_started()
-        return service.capabilities()
+        return service.capabilities(route_prefix=prefix)
+
+    # ------------------------------------------------------------ admin control
+    def _lifecycle_response(action: str) -> Response:
+        reservation = guarded(ctx.lifecycle.reserve, action)
+        security.audit(
+            "lifecycle_requested",
+            lifecycle_action=action,
+            accepted=reservation.accepted,
+        )
+        response = JSONResponse(
+            {
+                "action": action,
+                "pid": os.getpid(),
+                "scheduled": True,
+                "accepted": reservation.accepted,
+                "status": reservation.status,
+                "boot_id": service.boot_id,
+            },
+            status_code=202,
+        )
+        if reservation.accepted:
+            # Starlette runs response background tasks only after the final body
+            # frame has been sent, so lifecycle work cannot truncate this JSON.
+            response.background = BackgroundTask(ctx.lifecycle.execute, reservation)
+        return response
+
+    @router.post(f"{admin}/shutdown", status_code=202)
+    async def admin_shutdown(request: Request) -> Response:
+        """Schedule graceful shutdown after this acknowledgement is flushed."""
+
+        await _require(request, "operator", mutating=True)
+        return _lifecycle_response("shutdown")
+
+    @router.post(f"{admin}/restart", status_code=202)
+    async def admin_restart(request: Request) -> Response:
+        """Schedule a safe host-owned restart after this acknowledgement is flushed."""
+
+        await _require(request, "operator", mutating=True)
+        return _lifecycle_response("restart")
 
     # ------------------------------------------------------- docs / ui / files
     @router.get(f"{mount}/docs")
     async def list_docs(request: Request) -> dict[str, Any]:
         await _require(request, "viewer")
-        return service.list_docs()
+        return service.list_docs(route_prefix=prefix)
 
     @router.get(f"{mount}/docs/{{name}}")
     async def read_doc(request: Request, name: str) -> Response:
@@ -228,7 +376,9 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     @router.get(f"{mount}/ui/links")
     async def ui_links(request: Request) -> dict[str, Any]:
         await _require(request, "viewer")
-        return service.ui_links(origin=str(request.base_url).rstrip("/"))
+        return service.ui_links(
+            origin=str(request.base_url).rstrip("/"), route_prefix=prefix
+        )
 
     @router.get(f"{mount}/files")
     async def list_files(request: Request, path: str = Query("")) -> dict[str, Any]:
@@ -511,24 +661,6 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         props = body.get("properties") if isinstance(body.get("properties"), dict) else None
         return guarded(service.set_agent, agent_id, props)
 
-    @router.post(f"{mount}/mailbox/create")
-    async def mailbox_create(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        auth = await _require(request, "worker", mutating=True)
-        return guarded(
-            service.create_mailbox,
-            str(body.get("id") or body.get("name") or ""),
-            purpose=str(body.get("purpose") or ""),
-            hidden=bool(body.get("hidden", False)),
-            writable=bool(body.get("writable", True)),
-            global_name=str(body.get("global_name") or ""),
-            source=str(body.get("source") or "jsonl"),
-            rules=body.get("rules"),
-            policy=str(body.get("policy") or ""),
-            paging=body.get("paging"),
-            created_by=body.get("created_by") or auth.principal.label or "operator",
-        )
-
-    # Alias so the classic "add mailbox" control behaves like /mailbox/create.
     @router.post(f"{mount}/mailbox/mailboxes")
     async def mailbox_add(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         auth = await _require(request, "worker", mutating=True)
@@ -545,11 +677,6 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             paging=body.get("paging"),
             created_by=body.get("created_by") or auth.principal.label or "operator",
         )
-
-    @router.post(f"{mount}/mailbox/delete")
-    async def mailbox_delete_post(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        await _require(request, "operator", mutating=True)
-        return guarded(service.delete_mailbox, str(body.get("id") or body.get("name") or ""))
 
     @router.delete(f"{mount}/mailbox/mailboxes")
     async def mailbox_delete(request: Request, id: str = Query(...)) -> dict[str, Any]:  # noqa: A002 - matches UI param
@@ -1323,16 +1450,16 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
         return guarded(service.read_audit, after, limit)
 
     # -------------------------------------------------------------------- admin
-    @router.get(f"{mount}/admin")
+    @router.get(admin, include_in_schema=False)
     async def admin_redirect(request: Request) -> Response:
         # Redirect to the trailing-slash form so the page's relative asset URLs
         # resolve under /admin/ rather than the REST root. Keeping this relative
         # means the admin page works under any configured route prefix.
         from fastapi.responses import RedirectResponse
 
-        return RedirectResponse(url=f"{mount}/admin/", status_code=307)
+        return RedirectResponse(url=f"{admin}/", status_code=307)
 
-    @router.get(f"{mount}/admin/")
+    @router.get(f"{admin}/", include_in_schema=False)
     async def admin_index(request: Request) -> Response:
         if not security.is_admin_client_allowed(_client_ip(request)):
             raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "admin is loopback-only; set WS_COLLAB_ADMIN_REMOTE=1"})
@@ -1341,55 +1468,77 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             raise HTTPException(status_code=404, detail={"code": "not_found", "message": "admin bundle missing"})
         return FileResponse(index)
 
-    @router.get(f"{mount}/admin/{{asset:path}}", include_in_schema=False)
+    @router.get(f"{admin}/{{asset:path}}", include_in_schema=False)
     async def admin_asset(request: Request, asset: str) -> Response:
+        if asset in {"shutdown", "restart"}:
+            raise HTTPException(
+                status_code=405,
+                detail={"code": "method_not_allowed", "message": "POST required"},
+                headers={"Allow": "POST"},
+            )
         if not security.is_admin_client_allowed(_client_ip(request)):
             raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "admin is loopback-only"})
         return _serve_admin_asset(request, asset)
 
+    _finalize_route_metadata(router, mount)
     return router
 
 
-def create_static_router(ctx: AppContext) -> APIRouter:
-    """Static file serving and SPA fallback, mounted last.
-
-    This is what a dev server provides: any real asset is returned with a sane
-    content type, and an unknown HTML navigation falls back to the app shell so
-    client-side routes survive a reload.
-
-    It must be included *after* every API router, because a catch-all would
-    otherwise shadow routes registered later -- including the alias mounts.
-    """
+def create_static_router(
+    ctx: AppContext, route_prefix: str = DEFAULT_ROUTE_PREFIX
+) -> APIRouter:
+    """Serve only real UI assets beneath the configured namespace."""
 
     router = APIRouter(include_in_schema=False)
     security = ctx.security
+    prefix = normalize_route_prefix(route_prefix)
 
-    @router.get("/{asset:path}")
+    @router.api_route(
+        f"{prefix}/{{asset:path}}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    )
     async def static_or_app_shell(request: Request, asset: str) -> Response:
-        if not security.is_admin_client_allowed(_client_ip(request)):
-            raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "admin is loopback-only"})
         from .security import safe_join
 
-        # Strip any mount prefix so "/ws_collab/v1/logo.svg" finds "logo.svg".
-        relative = asset
-        for mount in ("ws_collab/v1/", "ws_collab/", "v1/"):
-            if relative.startswith(mount):
-                relative = relative[len(mount):]
-                break
+        if request.method != "GET":
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "not_found", "message": asset},
+            )
 
-        if relative:
+        # API, transport, docs, and admin misses must remain 404 rather than
+        # falling through to an SPA or an asset with the same basename.
+        top = asset.split("/", 1)[0]
+        if top in {"v1", "ws", "openapi", "admin", "meet-bridge"}:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "not_found", "message": asset},
+            )
+
+        candidate: Path | None = None
+        if asset:
             try:
-                candidate = safe_join(_ADMIN_DIR, relative)
-                if candidate.is_file():
-                    media_type = _EXTRA_MEDIA_TYPES.get(candidate.suffix.lower())
-                    return FileResponse(candidate, media_type=media_type)
+                possible = safe_join(_ADMIN_DIR, asset)
+                if possible.is_file():
+                    candidate = possible
             except WsCollabError:
-                pass  # traversal attempt: fall through to the 404 below
+                pass
 
-        if "text/html" in request.headers.get("accept", ""):
+        if candidate is None and not asset and "text/html" in request.headers.get("accept", ""):
             index = _ADMIN_DIR / "index.html"
             if index.is_file():
-                return FileResponse(index)
-        raise HTTPException(status_code=404, detail={"code": "not_found", "message": asset or "/"})
+                candidate = index
+        if candidate is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "not_found", "message": asset or "/"},
+            )
+        if not security.is_admin_client_allowed(_client_ip(request)):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "forbidden", "message": "admin is loopback-only"},
+            )
+        media_type = _EXTRA_MEDIA_TYPES.get(candidate.suffix.lower())
+        return FileResponse(candidate, media_type=media_type)
 
     return router

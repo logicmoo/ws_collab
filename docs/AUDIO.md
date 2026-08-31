@@ -36,9 +36,9 @@ export WS_COLLAB_AUDIO_ENABLED=1
 ```
 
 ```bash
-POST /ws_collab/v1/audio/capture/start   {"device_id": "..."}
-GET  /ws_collab/v1/audio/capture
-POST /ws_collab/v1/audio/capture/stop
+POST /ws_collab/audio/capture/start   {"device_id": "..."}
+GET  /ws_collab/audio/capture
+POST /ws_collab/audio/capture/stop
 ```
 
 With a real device this opens a PortAudio stream. A callback pushes frames onto a
@@ -53,7 +53,7 @@ privacy indicator.
 Inject an utterance instead (used by the admin page and tests):
 
 ```bash
-curl -X POST http://127.0.0.1:8802/ws_collab/v1/audio/utterance \
+curl -X POST http://127.0.0.1:8802/ws_collab/audio/utterance \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"text": "run the two reports", "source_kind": "operator"}'
 ```
@@ -72,7 +72,7 @@ capture (`Stereo Mix`, `What U Hear`, `loopback`, `monitor of`) are classified a
 **loopback**, which is what makes TTS-accuracy measurement possible without a
 physical microphone.
 
-Refresh at startup, on demand (`POST /ws_collab/v1/audio/devices/refresh`), or
+Refresh at startup, on demand (`POST /ws_collab/audio/devices/refresh`), or
 after hot-plug; the generation counter increments each time. If the active input
 disappears, capture recovers to the default input and emits an event.
 
@@ -87,7 +87,7 @@ eligibility flags:
 * `tts_accuracy_eligible` — may be used for loopback accuracy measurement
 
 ```bash
-curl -X POST http://127.0.0.1:8802/ws_collab/v1/audio/routing \
+curl -X POST http://127.0.0.1:8802/ws_collab/audio/routing \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"source":"microphone","engine":"whisper","device_id":"fake-input-...","gain":1.0}'
 ```
@@ -168,7 +168,7 @@ To feed a recognizer that WS_COLLAB does not host (for example a desktop
 application's dictation engine), push its results in:
 
 ```bash
-POST /ws_collab/v1/stt/ingest
+POST /ws_collab/stt/ingest
 {"engine": "external-asr", "text": "...", "confidence": 0.94, "is_final": true}
 ```
 
@@ -241,7 +241,7 @@ are marked as previews and never masquerade as conversation events.
 
 ## TTS transcription accuracy
 
-Known TTS output is a diagnostic reference. `POST /ws_collab/v1/tts/measure`
+Known TTS output is a diagnostic reference. `POST /ws_collab/tts/measure`
 speaks a phrase, captures the loopback echo, and correlates expected text,
 playback, microphone segment, all engine hypotheses, and the resolved transcript.
 
@@ -249,7 +249,7 @@ Per engine and for the final result it computes WER, CER, word accuracy,
 normalized exact match, insertions/deletions/substitutions, missing words,
 latency, word-level diffs, and whether the disambiguator improved or regressed
 against the best single engine. Rolling accuracy with sample sizes and worst
-examples is available at `GET /ws_collab/v1/tts/accuracy`.
+examples is available at `GET /ws_collab/tts/accuracy`.
 
 Semantic similarity is recorded only as a clearly-labelled secondary metric —
 never as the sole measure of accuracy.

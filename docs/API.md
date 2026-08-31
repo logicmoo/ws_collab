@@ -3,10 +3,24 @@
 Everything below works over plain HTTP and over HTTPS. Every capability also has
 a WebSocket equivalent — nothing is WebSocket-only, and nothing is REST-only.
 
-* REST root: `/ws_collab`
-* Versioned resources: `/ws_collab/v1/...`
-* WebSocket: `/ws_collab/ws` (`ws://` or `wss://`)
-* Interactive OpenAPI: `/docs` (standalone server)
+## Canonical URL policy
+
+REST resources are unversioned beneath one canonical namespace. No operation is
+mounted at multiple paths.
+
+| Surface | Canonical path |
+| --- | --- |
+| REST (discovery, auth, events, mailbox, workers, audio, STT/TTS, Meet, cursors, prompt, diagnostics) | `/ws_collab/*` |
+| Full-parity WebSocket | `/ws_collab/ws` |
+| Admin UI, assets, and operator lifecycle controls | `/ws_collab/admin/*` |
+| OpenAPI UI / ReDoc / schema | `/ws_collab/openapi/docs`, `/ws_collab/openapi/redoc`, `/ws_collab/openapi.json` |
+| Internal Meet bridge loopback API (port 48699) | `/ws_collab/meet-bridge/*` |
+
+Root aliases, `/v1/*`, and `/ws_collab/v1/*` are intentionally not mounted and
+return 404. Fetch
+the machine-readable categorized inventory from
+`GET /ws_collab/endpoints`; its `rest.endpoints` list is generated from
+the running router and includes each canonical path and HTTP method.
 
 ## Authentication
 
@@ -14,15 +28,15 @@ Send a bearer token:
 
 ```bash
 curl -H "Authorization: Bearer $WS_COLLAB_ADMIN_TOKEN" \
-     http://127.0.0.1:8802/ws_collab/v1/capabilities
+     http://127.0.0.1:8802/ws_collab/capabilities
 ```
 
 Or exchange a token for a cookie session (used by the admin page):
 
 ```
-POST /ws_collab/v1/auth/login    {"token": "..."}   -> sets cookie, returns csrf
-POST /ws_collab/v1/auth/logout
-GET  /ws_collab/v1/auth/whoami
+POST /ws_collab/auth/login    {"token": "..."}   -> sets cookie, returns csrf
+POST /ws_collab/auth/logout
+GET  /ws_collab/auth/whoami
 ```
 
 Cookie-authenticated mutations must send the CSRF token in
@@ -55,7 +69,7 @@ Every failure — on both transports — uses the same envelope and codes:
 ## Reading events
 
 ```http
-GET /ws_collab/v1/events?stream=conversation&after=<cursor>&limit=100
+GET /ws_collab/events?stream=conversation&after=<cursor>&limit=100
 ```
 
 | Parameter | Meaning |
@@ -86,15 +100,15 @@ together with `after` yields `304 Not Modified` instead of an empty page.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
-  "http://127.0.0.1:8802/ws_collab/v1/events?stream=conversation&after=$CURSOR&wait_ms=25000"
+  "http://127.0.0.1:8802/ws_collab/events?stream=conversation&after=$CURSOR&wait_ms=25000"
 ```
 
-Bounded history without cursors: `GET /ws_collab/v1/streams/{stream}/tail?count=200`.
+Bounded history without cursors: `GET /ws_collab/streams/{stream}/tail?count=200`.
 
 ## Writing events
 
 ```bash
-curl -X POST http://127.0.0.1:8802/ws_collab/v1/conversation/events \
+curl -X POST http://127.0.0.1:8802/ws_collab/conversation/events \
   -H "Authorization: Bearer $TOKEN" \
   -H "Idempotency-Key: $(uuidgen)" \
   -H "Content-Type: application/json" \
@@ -111,7 +125,7 @@ reported after the event is durably accepted:
 Replaying the same `Idempotency-Key` returns the original id with
 `"duplicate": true` and writes nothing.
 
-Generic form: `POST /ws_collab/v1/events` with `{"stream", "type", "data",
+Generic form: `POST /ws_collab/events` with `{"stream", "type", "data",
 "correlation_id", "idempotency_key"}`.
 
 ## Endpoint reference
@@ -120,34 +134,34 @@ Generic form: `POST /ws_collab/v1/events` with `{"stream", "type", "data",
 | Method | Path | Role |
 | --- | --- | --- |
 | GET | `/ws_collab/health` | public |
-| GET | `/ws_collab/v1/capabilities` | public |
-| GET | `/ws_collab/v1/config` | viewer |
-| GET | `/ws_collab/v1/diagnostics` | viewer |
-| GET | `/ws_collab/v1/audit` | operator |
+| GET | `/ws_collab/capabilities` | public |
+| GET | `/ws_collab/config` | viewer |
+| GET | `/ws_collab/diagnostics` | viewer |
+| GET | `/ws_collab/audit` | operator |
 
 ### Conversation and events
 | Method | Path | Role |
 | --- | --- | --- |
-| GET | `/ws_collab/v1/events` | viewer |
-| POST | `/ws_collab/v1/events` | worker |
-| GET | `/ws_collab/v1/streams/{stream}/tail` | viewer |
-| GET | `/ws_collab/v1/conversation` | viewer |
-| POST | `/ws_collab/v1/conversation/events` | worker |
+| GET | `/ws_collab/events` | viewer |
+| POST | `/ws_collab/events` | worker |
+| GET | `/ws_collab/streams/{stream}/tail` | viewer |
+| GET | `/ws_collab/conversation` | viewer |
+| POST | `/ws_collab/conversation/events` | worker |
 
 ### Browser navigation
 | Method | Path | Role |
 | --- | --- | --- |
-| GET | `/ws_collab/v1/browser/nav-intents?after=<cursor>&limit=100` | viewer |
-| POST | `/ws_collab/v1/browser/nav-intents` | worker |
-| GET | `/ws_collab/v1/meet/browser-settings` | viewer |
-| POST | `/ws_collab/v1/meet/browser-settings` | operator |
-| GET | `/ws_collab/v1/meet/companion-cable-wiring` | viewer |
-| POST | `/ws_collab/v1/meet/companion-cable-wiring` | operator |
-| POST | `/ws_collab/v1/meet/companion-cable-wiring/wire` | operator |
-| POST | `/ws_collab/v1/meet/companion-cable-wiring/disconnect` | operator |
-| GET | `/ws_collab/v1/meet/channels` | viewer |
-| POST | `/ws_collab/v1/meet/channels/forget` | operator |
-| POST | `/ws_collab/v1/meet/channels/prune` | operator |
+| GET | `/ws_collab/browser/nav-intents?after=<cursor>&limit=100` | viewer |
+| POST | `/ws_collab/browser/nav-intents` | worker |
+| GET | `/ws_collab/meet/browser-settings` | viewer |
+| POST | `/ws_collab/meet/browser-settings` | operator |
+| GET | `/ws_collab/meet/companion-cable-wiring` | viewer |
+| POST | `/ws_collab/meet/companion-cable-wiring` | operator |
+| POST | `/ws_collab/meet/companion-cable-wiring/wire` | operator |
+| POST | `/ws_collab/meet/companion-cable-wiring/disconnect` | operator |
+| GET | `/ws_collab/meet/channels` | viewer |
+| POST | `/ws_collab/meet/channels/forget` | operator |
+| POST | `/ws_collab/meet/channels/prune` | operator |
 
 The POST route ingests redacted intent/outcome records from browser worker
 processes. Both phases share a `nav_id`; GET returns the durable `events` page
@@ -180,31 +194,31 @@ role/Silence settings and test leases, but preserve transcript/event history.
 ### Workers
 | Method | Path | Role |
 | --- | --- | --- |
-| POST | `/ws_collab/v1/workers/register` | worker |
-| POST | `/ws_collab/v1/workers/{id}/status` | worker |
-| GET | `/ws_collab/v1/workers` | viewer |
-| POST | `/ws_collab/v1/workers/monitor` | operator |
-| GET | `/ws_collab/v1/alerts` | viewer |
+| POST | `/ws_collab/workers/register` | worker |
+| POST | `/ws_collab/workers/{id}/status` | worker |
+| GET | `/ws_collab/workers` | viewer |
+| POST | `/ws_collab/workers/monitor` | operator |
+| GET | `/ws_collab/alerts` | viewer |
 
 ### Audio
 | Method | Path | Role |
 | --- | --- | --- |
-| GET | `/ws_collab/v1/audio/capture` | viewer |
-| POST | `/ws_collab/v1/audio/capture/start` · `/stop` | operator |
-| GET | `/ws_collab/v1/audio/secondary-capture` | viewer |
-| POST | `/ws_collab/v1/audio/secondary-capture/start` · `/stop` | operator |
-| POST | `/ws_collab/v1/audio/secondary-capture/browser` | operator |
-| POST | `/ws_collab/v1/audio/utterance` | operator |
-| GET | `/ws_collab/v1/audio/devices` | viewer |
-| POST | `/ws_collab/v1/audio/devices/refresh` | operator |
-| GET/POST | `/ws_collab/v1/audio/routing` | viewer / operator |
+| GET | `/ws_collab/audio/capture` | viewer |
+| POST | `/ws_collab/audio/capture/start` · `/stop` | operator |
+| GET | `/ws_collab/audio/secondary-capture` | viewer |
+| POST | `/ws_collab/audio/secondary-capture/start` · `/stop` | operator |
+| POST | `/ws_collab/audio/secondary-capture/browser` | operator |
+| POST | `/ws_collab/audio/utterance` | operator |
+| GET | `/ws_collab/audio/devices` | viewer |
+| POST | `/ws_collab/audio/devices/refresh` | operator |
+| GET/POST | `/ws_collab/audio/routing` | viewer / operator |
 
 ### Transcription
 | Method | Path | Role |
 | --- | --- | --- |
-| GET | `/ws_collab/v1/stt/transcripts` | viewer |
-| POST | `/ws_collab/v1/stt/ingest` | worker |
-| GET | `/ws_collab/v1/transcripts` | viewer |
+| GET | `/ws_collab/stt/transcripts` | viewer |
+| POST | `/ws_collab/stt/ingest` | worker |
+| GET | `/ws_collab/transcripts` | viewer |
 
 `stt/ingest` is the bridge for an **external recognizer** (for example a desktop
 app's dictation engine). The transcript is recorded as a hypothesis and, when
@@ -212,7 +226,7 @@ final, flows through the same disambiguation, classification, and timeline path
 as a local engine:
 
 ```bash
-curl -X POST http://127.0.0.1:8802/ws_collab/v1/stt/ingest \
+curl -X POST http://127.0.0.1:8802/ws_collab/stt/ingest \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"engine": "external-asr", "text": "deploy the staging build", "confidence": 0.94}'
 ```
@@ -220,14 +234,14 @@ curl -X POST http://127.0.0.1:8802/ws_collab/v1/stt/ingest \
 ### Speech output
 | Method | Path | Role |
 | --- | --- | --- |
-| POST | `/ws_collab/v1/tts/speak` | worker |
-| GET | `/ws_collab/v1/tts` | viewer |
-| POST | `/ws_collab/v1/tts/cancel` | operator |
-| POST | `/ws_collab/v1/tts/measure` | operator |
-| GET | `/ws_collab/v1/tts/accuracy` | viewer |
-| GET | `/ws_collab/v1/voices` | viewer |
-| POST | `/ws_collab/v1/voices/{agent_id}` | operator |
-| POST | `/ws_collab/v1/voices/assign` | operator |
+| POST | `/ws_collab/tts/speak` | worker |
+| GET | `/ws_collab/tts` | viewer |
+| POST | `/ws_collab/tts/cancel` | operator |
+| POST | `/ws_collab/tts/measure` | operator |
+| GET | `/ws_collab/tts/accuracy` | viewer |
+| GET | `/ws_collab/voices` | viewer |
+| POST | `/ws_collab/voices/{agent_id}` | operator |
+| POST | `/ws_collab/voices/assign` | operator |
 
 `POST /tts/speak` accepts `destination: "local" | "companion"` and optional
 `meeting_url`. The default remains `local` for compatibility unless
@@ -241,7 +255,7 @@ the server queue and any matching companion output.
 
 ### Meet companion backchannels
 
-`GET`, `POST`, and `DELETE /ws_collab/v1/meet/companion-click` retain the
+`GET`, `POST`, and `DELETE /ws_collab/meet/companion-click` retain the
 historical route name. The Silences admin page is the sole editor. Pass
 `meeting_url` to select an exact room; GET reports `source: "override"` or
 `"default"` plus `globalDefault`.
@@ -288,12 +302,12 @@ launches or joins a meeting.
 ### Cursors
 | Method | Path | Role |
 | --- | --- | --- |
-| GET | `/ws_collab/v1/cursors` | viewer |
-| GET | `/ws_collab/v1/cursors/{stream}/{consumer}` | viewer |
-| GET | `/ws_collab/v1/cursors/{stream}/{consumer}/history` | viewer |
-| POST | `/ws_collab/v1/cursors/{stream}/{consumer}/commit` | worker |
-| POST | `/ws_collab/v1/cursors/{stream}/{consumer}/reposition` | operator |
-| POST | `/ws_collab/v1/cursors/{stream}/{consumer}/reset` | operator |
+| GET | `/ws_collab/cursors` | viewer |
+| GET | `/ws_collab/cursors/{stream}/{consumer}` | viewer |
+| GET | `/ws_collab/cursors/{stream}/{consumer}/history` | viewer |
+| POST | `/ws_collab/cursors/{stream}/{consumer}/commit` | worker |
+| POST | `/ws_collab/cursors/{stream}/{consumer}/reposition` | operator |
+| POST | `/ws_collab/cursors/{stream}/{consumer}/reset` | operator |
 
 Repositioning backwards requires `"allow_replay": true`; forwards requires
 `"allow_skip": true`. Both are refused otherwise, and both are audited.
@@ -301,10 +315,10 @@ Repositioning backwards requires `"allow_replay": true`; forwards requires
 ### Prompt
 | Method | Path | Role |
 | --- | --- | --- |
-| GET | `/ws_collab/v1/prompt` · `/prompt/history` | viewer |
-| POST | `/ws_collab/v1/prompt` | operator |
-| POST | `/ws_collab/v1/prompt/preview-diff` | operator |
-| POST | `/ws_collab/v1/prompt/rollback` | operator |
+| GET | `/ws_collab/prompt` · `/prompt/history` | viewer |
+| POST | `/ws_collab/prompt` | operator |
+| POST | `/ws_collab/prompt/preview-diff` | operator |
+| POST | `/ws_collab/prompt/rollback` | operator |
 
 ### Administration
 `GET /ws_collab/admin` — loopback-only unless `WS_COLLAB_ADMIN_REMOTE=1` (which
@@ -312,12 +326,18 @@ requires TLS).
 
 | Method | Path | Role |
 | --- | --- | --- |
-| GET | `/ws_collab/v1/admin/ui-state/{page}` | viewer |
-| POST | `/ws_collab/v1/admin/ui-state/{page}` | operator |
+| GET | `/ws_collab/admin/ui-state/{page}` | viewer |
+| POST | `/ws_collab/admin/ui-state/{page}` | operator |
+| POST | `/ws_collab/admin/shutdown` | operator |
+| POST | `/ws_collab/admin/restart` | operator |
 
 The page-state endpoint stores JSON snapshots in
 `collab_state/admin_ui_state.json`. Credential-like fields are removed before
 the atomic write.
+
+Lifecycle controls acknowledge before acting and permit only one pending action.
+They return `409` when actions conflict or when an embedded host has not supplied
+the corresponding lifecycle callback.
 
 ### Google Meet bridge
 
@@ -327,10 +347,10 @@ loopback API. `POST /meet/bridge/command` starts the worker automatically for
 
 | Method | Path | Role |
 | --- | --- | --- |
-| GET | `/ws_collab/v1/meet/bridge/status` | viewer |
-| GET | `/ws_collab/v1/meet/bridge/captions?since=<epoch>` | viewer |
-| POST | `/ws_collab/v1/meet/bridge/command` | operator |
-| POST | `/ws_collab/v1/meet/bridge/start` | operator |
+| GET | `/ws_collab/meet/bridge/status` | viewer |
+| GET | `/ws_collab/meet/bridge/captions?since=<epoch>` | viewer |
+| POST | `/ws_collab/meet/bridge/command` | operator |
+| POST | `/ws_collab/meet/bridge/start` | operator |
 
 ## WebSocket protocol
 

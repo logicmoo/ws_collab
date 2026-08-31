@@ -9,14 +9,18 @@
   "routePrefix": "/ws_collab",
   "configPage": "http://127.0.0.1:5173/ws_collab/admin",
   "mailboxEndpoint": {
-    "path": "/ws_collab/v1/mailbox/mailboxes",
+    "path": "/ws_collab/mailbox/mailboxes",
     "protocol": "ws_collab",
     "websocket": "/ws_collab/ws",
     "description": "Mailbox directory (unread counts, activity, virtual mailboxes); sibling routes /messages, /agents, /send, /cursor share this base."
   },
   "servicesEndpoint": {
+    "method": "GET",
     "path": "/ws_collab/endpoints",
-    "description": "Native self-description: every REST/WS/admin endpoint with auth level and docs (token-gated when auth is enabled)."
+    "auth": "bearer-or-session",
+    "capability": "viewer",
+    "visibility": "public",
+    "description": "Generated endpoint inventory containing every supported route, method, purpose, authentication requirement, and visibility classification."
   },
   "docs": "README.md",
   "kind": "custom",
@@ -68,14 +72,90 @@
       "workspaceShutdown": null,
       "workspaceShutdownAfter": null
     },
-    "note": "Runs as its own standalone server by default (set WS_COLLAB_PLUGIN_MODE=embedded to mount it in-process instead). A standalone plugin owns its own process start/stop, so a workbench restart does not restart it -- workbenchShutdown, if implemented, is only a heads-up notification, never a signal to stop or restart this plugin's own server."
+    "note": "Runs as its own standalone server by default (set WS_COLLAB_PLUGIN_MODE=embedded to mount it in-process instead). The operator lifecycle API gracefully controls the standalone host; embedded mounts expose the same routes but return 409 unless their host supplies lifecycle callbacks."
   },
   "plugin-api": {
-    "status": { "method": "GET", "path": "/ws_collab/status", "description": "Subsystem rollup with an overall verdict." },
-    "config": { "method": "GET", "path": "/ws_collab/admin/", "description": "Token-gated operations workbench (same page as configPage)." },
-    "restart": null,
-    "shutdown": null,
-    "note": "The standalone server self-describes its full endpoint list at GET /ws_collab/endpoints (token-gated) -- this block only names the handful worth surfacing directly on the Plugins page. It has no HTTP restart/shutdown route of its own; stop/start its process the same way you started it."
+    "base": {
+      "path": "/ws_collab",
+      "versioned": false,
+      "description": "Canonical unversioned HTTP and WebSocket namespace, derived from routePrefix."
+    },
+    "inventory": {
+      "method": "GET",
+      "path": "/ws_collab/endpoints",
+      "auth": "bearer-or-session",
+      "capability": "viewer",
+      "description": "Generated inventory for every supported route, method, purpose, authentication requirement, and visibility classification."
+    },
+    "status": {
+      "method": "GET",
+      "path": "/ws_collab/status",
+      "auth": "none",
+      "description": "Public, secret-free subsystem rollup with an overall verdict."
+    },
+    "health": {
+      "method": "GET",
+      "path": "/ws_collab/health",
+      "auth": "none",
+      "description": "Public process liveness probe."
+    },
+    "ready": {
+      "method": "GET",
+      "path": "/ws_collab/ready",
+      "auth": "none",
+      "description": "Public readiness probe; returns 503 when the service cannot accept traffic."
+    },
+    "websocket": {
+      "method": "WEBSOCKET",
+      "path": "/ws_collab/ws",
+      "auth": "bearer-token",
+      "capability": "viewer",
+      "description": "Bidirectional event transport with subscriptions, publication, cursors, and liveness; message-specific roles are enforced."
+    },
+    "config": {
+      "method": "GET",
+      "path": "/ws_collab/admin/",
+      "auth": "loopback-policy",
+      "description": "Operations workbench served through the workbench proxy (same page as configPage)."
+    },
+    "openapi": {
+      "method": "GET",
+      "path": "/ws_collab/openapi.json",
+      "auth": "none",
+      "description": "Public machine-readable OpenAPI schema."
+    },
+    "openapiDocs": {
+      "method": "GET",
+      "path": "/ws_collab/openapi/docs",
+      "auth": "none",
+      "description": "Public interactive Swagger API documentation."
+    },
+    "openapiRedoc": {
+      "method": "GET",
+      "path": "/ws_collab/openapi/redoc",
+      "auth": "none",
+      "description": "Public interactive ReDoc API documentation."
+    },
+    "restart": {
+      "method": "POST",
+      "path": "/ws_collab/admin/restart",
+      "auth": "bearer-or-session",
+      "capability": "operator",
+      "description": "Requires operator capability (admin qualifies). After a 202 acknowledgement is flushed, standalone mode safely stops and rebinds under its supervisor; embedded mode returns 409 unless the host supplies a restart callback. Authenticated-session requests also enforce CSRF and origin checks."
+    },
+    "shutdown": {
+      "method": "POST",
+      "path": "/ws_collab/admin/shutdown",
+      "auth": "bearer-or-session",
+      "capability": "operator",
+      "description": "Requires operator capability (admin qualifies). After a 202 acknowledgement is flushed, standalone mode gracefully stops its servers; embedded mode returns 409 unless the host supplies a shutdown callback. Authenticated-session requests also enforce CSRF and origin checks."
+    },
+    "compatibility": {
+      "versionedPaths": false,
+      "v1Aliases": false,
+      "legacyRootAliases": false
+    },
+    "note": "Only discovery and control surfaces useful to the plugin host are listed here; GET /ws_collab/endpoints is authoritative. Paths are canonical values composed from routePrefix, and no /v1 compatibility paths are supported. An embedding host that overrides routePrefix must compose runtime URLs from its configured value and consult its endpoint inventory."
   },
   "ui": {
     "pages": [

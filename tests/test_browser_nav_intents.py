@@ -796,16 +796,16 @@ def test_rest_ingest_redacts_and_lists_merged_records(client, worker_headers, vi
         "phase": "intent",
         "outcome": "awaiting-consent",
     }
-    first = client.post("/ws_collab/v1/browser/nav-intents", headers=worker_headers, json=base)
+    first = client.post("/ws_collab/browser/nav-intents", headers=worker_headers, json=base)
     assert first.status_code == 200
     second = client.post(
-        "/ws_collab/v1/browser/nav-intents",
+        "/ws_collab/browser/nav-intents",
         headers=worker_headers,
         json={**base, "phase": "outcome", "outcome": "opened", "tab_id": "tab-1"},
     )
     assert second.status_code == 200
     response = client.get(
-        "/ws_collab/v1/browser/nav-intents?limit=10", headers=viewer_headers,
+        "/ws_collab/browser/nav-intents?limit=10", headers=viewer_headers,
     )
     assert response.status_code == 200
     body = response.json()

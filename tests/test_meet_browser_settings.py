@@ -17,7 +17,7 @@ from ws_collab.meet_browser_settings import (
     prune_meeting_channels,
 )
 
-V1 = "/ws_collab/v1"
+API_BASE = "/ws_collab"
 
 
 def _write_meet_setting(directory: str, key: str, value: str) -> None:
@@ -158,7 +158,7 @@ def test_meet_browser_settings_endpoint_round_trip(client, admin_headers, monkey
     monkeypatch.setattr(service_mod, "DEFAULT_PROFILE", tmp_path / "default_profile")
     monkeypatch.setattr(service_mod.WsCollabService, "_meet_bridge_health", lambda self, timeout=0.5: None)
     body = client.post(
-        f"{V1}/meet/browser-settings",
+        f"{API_BASE}/meet/browser-settings",
         headers=admin_headers,
         json={
             "browser_backend": "wsl",
@@ -173,14 +173,14 @@ def test_meet_browser_settings_endpoint_round_trip(client, admin_headers, monkey
     assert "--role-authuser" not in body["next_launch_command"]
     assert "role_account_map" not in body
     assert "role_assignments" not in body
-    fetched = client.get(f"{V1}/meet/browser-settings", headers=admin_headers).json()
+    fetched = client.get(f"{API_BASE}/meet/browser-settings", headers=admin_headers).json()
     assert fetched["browser_backend"] == "wsl"
     assert fetched["require_sso_consent"] is True
     assert "profile_mode" not in fetched
     assert "companion_profile_path" not in fetched
 
     disabled = client.post(
-        f"{V1}/meet/browser-settings",
+        f"{API_BASE}/meet/browser-settings",
         headers=admin_headers,
         json={
             "browser_backend": "wsl",
@@ -190,7 +190,7 @@ def test_meet_browser_settings_endpoint_round_trip(client, admin_headers, monkey
     ).json()
     assert disabled["require_sso_consent"] is False
     assert client.get(
-        f"{V1}/meet/browser-settings", headers=admin_headers
+        f"{API_BASE}/meet/browser-settings", headers=admin_headers
     ).json()["require_sso_consent"] is False
 
 
@@ -200,7 +200,7 @@ def test_meet_browser_settings_rejects_non_boolean_consent(
 ) -> None:
     before = app_context.service.get_meet_browser_settings()
     response = client.post(
-        f"{V1}/meet/browser-settings",
+        f"{API_BASE}/meet/browser-settings",
         headers=admin_headers,
         json={
             "browser_backend": before["browser_backend"],
@@ -506,7 +506,7 @@ def test_meeting_backchannel_accepts_legacy_sound_mode_and_snake_case_payload(
     service.meet_browser_settings.set("profile_path", str(tmp_path / "profile"))
 
     response = client.post(
-        f"{V1}/meet/companion-click",
+        f"{API_BASE}/meet/companion-click",
         headers=admin_headers,
         json={
             "meeting_url": "abc-defg-hij",
@@ -542,7 +542,7 @@ def test_meet_companion_click_rest_routes(client, admin_headers, app_context, mo
     service.meet_browser_settings.set("profile_path", str(profile))
 
     saved = client.post(
-        f"{V1}/meet/companion-click",
+        f"{API_BASE}/meet/companion-click",
         headers=admin_headers,
         json={
             "meeting_url": "https://meet.google.com/abc-defg-hij?authuser=0",
@@ -565,11 +565,11 @@ def test_meet_companion_click_rest_routes(client, admin_headers, app_context, mo
         },
     )
     fetched = client.get(
-        f"{V1}/meet/companion-click?meeting_url=https://meet.google.com/abc-defg-hij?authuser=1",
+        f"{API_BASE}/meet/companion-click?meeting_url=https://meet.google.com/abc-defg-hij?authuser=1",
         headers=admin_headers,
     )
     cleared = client.delete(
-        f"{V1}/meet/companion-click?meeting_url=abc-defg-hij",
+        f"{API_BASE}/meet/companion-click?meeting_url=abc-defg-hij",
         headers=admin_headers,
     )
 
@@ -836,7 +836,7 @@ def test_canonical_action_api_round_trip_has_no_phrase_family(
     service.meet_browser_settings.set("profile_path", str(tmp_path / "profile"))
 
     saved = client.post(
-        f"{V1}/meet/companion-click",
+        f"{API_BASE}/meet/companion-click",
         headers=admin_headers,
         json={
             "scope": "global",
@@ -844,7 +844,7 @@ def test_canonical_action_api_round_trip_has_no_phrase_family(
         },
     )
     fetched = client.get(
-        f"{V1}/meet/companion-click?scope=global", headers=admin_headers
+        f"{API_BASE}/meet/companion-click?scope=global", headers=admin_headers
     )
 
     assert saved.status_code == fetched.status_code == 200
@@ -872,7 +872,7 @@ def test_legacy_phrase_and_sound_inputs_return_canonical_action_only(
     monkeypatch.setattr(service, "_meet_bridge_health", lambda timeout=0.5: None)
     service.meet_browser_settings.set("profile_path", str(tmp_path / "profile"))
     response = client.post(
-        f"{V1}/meet/companion-click",
+        f"{API_BASE}/meet/companion-click",
         headers=admin_headers,
         json={"scope": "global", "override": legacy},
     )
@@ -948,7 +948,7 @@ def test_scoped_companion_rest_payloads_and_test_lease(
     service.meet_browser_settings.set("profile_path", str(profile))
 
     saved = client.post(
-        f"{V1}/meet/companion-click",
+        f"{API_BASE}/meet/companion-click",
         headers=admin_headers,
         json={
             "scope": "channel",
@@ -957,11 +957,11 @@ def test_scoped_companion_rest_payloads_and_test_lease(
         },
     )
     fetched = client.get(
-        f"{V1}/meet/companion-click?scope=channel&channel_key=abc-defg-hij",
+        f"{API_BASE}/meet/companion-click?scope=channel&channel_key=abc-defg-hij",
         headers=admin_headers,
     )
     activated = client.post(
-        f"{V1}/meet/companion-click/test-session",
+        f"{API_BASE}/meet/companion-click/test-session",
         headers=admin_headers,
         json={"test_profile": "count20", "channel_key": "abc-defg-hij"},
     )
@@ -969,7 +969,7 @@ def test_scoped_companion_rest_payloads_and_test_lease(
         "active_test_companion_click"
     ]
     stopped = client.delete(
-        f"{V1}/meet/companion-click/test-session"
+        f"{API_BASE}/meet/companion-click/test-session"
         "?test_profile=count20&channel_key=abc-defg-hij",
         headers=admin_headers,
     )
@@ -1004,27 +1004,27 @@ def test_test_scope_room_context_retargets_effective_config_and_lease(
     )
 
     room_a = client.get(
-        f"{V1}/meet/companion-click"
+        f"{API_BASE}/meet/companion-click"
         "?scope=test&test_profile=count20&channel_key=abc-defg-hij",
         headers=admin_headers,
     ).json()
     room_b = client.get(
-        f"{V1}/meet/companion-click"
+        f"{API_BASE}/meet/companion-click"
         "?scope=test&test_profile=count20&channel_key=xyz-abcd-efg",
         headers=admin_headers,
     ).json()
     client.post(
-        f"{V1}/meet/companion-click/test-session",
+        f"{API_BASE}/meet/companion-click/test-session",
         headers=admin_headers,
         json={"test_profile": "count20", "channel_key": "xyz-abcd-efg"},
     )
     stale_stop = client.delete(
-        f"{V1}/meet/companion-click/test-session"
+        f"{API_BASE}/meet/companion-click/test-session"
         "?test_profile=count20&channel_key=abc-defg-hij",
         headers=admin_headers,
     ).json()
     stopped = client.delete(
-        f"{V1}/meet/companion-click/test-session"
+        f"{API_BASE}/meet/companion-click/test-session"
         "?test_profile=count20&channel_key=xyz-abcd-efg",
         headers=admin_headers,
     ).json()
@@ -1071,7 +1071,7 @@ def test_continue_floor_api_releases_queued_agent_once_and_records_durable_statu
     monkeypatch.setattr(service.tts, "_signal", lambda: None)
 
     queued = client.post(
-        f"{V1}/meet/floor/queue",
+        f"{API_BASE}/meet/floor/queue",
         headers=admin_headers,
         json={
             "meeting_url": meeting,
@@ -1081,12 +1081,12 @@ def test_continue_floor_api_releases_queued_agent_once_and_records_durable_statu
         },
     )
     opened = client.post(
-        f"{V1}/meet/floor/continue",
+        f"{API_BASE}/meet/floor/continue",
         headers=admin_headers,
         json={"meeting_url": meeting, "event_key": "silence-edge-1", "role": "companion"},
     )
     duplicate = client.post(
-        f"{V1}/meet/floor/continue",
+        f"{API_BASE}/meet/floor/continue",
         headers=admin_headers,
         json={"meeting_url": meeting, "event_key": "silence-edge-1", "role": "companion"},
     )
@@ -1377,21 +1377,21 @@ def test_channel_forget_api_requires_operator_and_is_idempotent(
     monkeypatch.setattr(service, "_meet_bridge_health", lambda timeout=0.5: None)
 
     denied = client.post(
-        f"{V1}/meet/channels/forget",
+        f"{API_BASE}/meet/channels/forget",
         headers=viewer_headers,
         json={"meeting_url": meeting},
     )
     unauthenticated = client.post(
-        f"{V1}/meet/channels/forget",
+        f"{API_BASE}/meet/channels/forget",
         json={"meeting_url": meeting},
     )
     first = client.post(
-        f"{V1}/meet/channels/forget",
+        f"{API_BASE}/meet/channels/forget",
         headers=admin_headers,
         json={"meeting_url": meeting},
     )
     second = client.post(
-        f"{V1}/meet/channels/forget",
+        f"{API_BASE}/meet/channels/forget",
         headers=admin_headers,
         json={"meeting_url": meeting},
     )
@@ -1401,7 +1401,7 @@ def test_channel_forget_api_requires_operator_and_is_idempotent(
     assert first.status_code == 200
     assert first.json()["forgotten"] == [meeting]
     assert second.json()["alreadyForgotten"] == [meeting]
-    route = client.get("/openapi.json").json()["paths"][
+    route = client.get("/ws_collab/openapi.json").json()["paths"][
         "/ws_collab/meet/channels/forget"
     ]
     assert set(route) == {"post"}
@@ -1418,15 +1418,15 @@ def test_channel_prune_api_requires_operator_and_rejects_paths(
     payload = {"keep": ["https://meet.google.com/bgb-xqts-xjt"]}
 
     assert client.post(
-        f"{V1}/meet/channels/prune", headers=viewer_headers, json=payload
+        f"{API_BASE}/meet/channels/prune", headers=viewer_headers, json=payload
     ).status_code == 403
     assert client.post(
-        f"{V1}/meet/channels/prune",
+        f"{API_BASE}/meet/channels/prune",
         headers=admin_headers,
         json={"keep": ["../meet_browser_settings.json"]},
     ).status_code == 400
     allowed = client.post(
-        f"{V1}/meet/channels/prune", headers=admin_headers, json=payload
+        f"{API_BASE}/meet/channels/prune", headers=admin_headers, json=payload
     )
     assert allowed.status_code == 200
     assert allowed.json()["kept"] == payload["keep"]
@@ -1634,9 +1634,9 @@ def test_server_managed_bridge_routes_use_authenticated_api(
         lambda self, command: {"ok": True, "verdict": f"accepted {command}"},
     )
 
-    health = client.get(f"{V1}/meet/bridge/status", headers=admin_headers)
+    health = client.get(f"{API_BASE}/meet/bridge/status", headers=admin_headers)
     command = client.post(
-        f"{V1}/meet/bridge/command",
+        f"{API_BASE}/meet/bridge/command",
         headers=admin_headers,
         json={"command": "/new"},
     )

@@ -4,7 +4,8 @@ Uses Google Meet's own live-caption model as a speech recognizer: a real
 Chrome tab is driven over the DevTools Protocol (CDP), Meet's live-caption DOM
 region is polled, and finished caption lines are relayed both into ws_collab's
 own mailbox (for chat visibility) and exposed over a small local HTTP API
-(``/health``, ``/captions``, ``/command``) that :mod:`ws_collab.drivers.stt.
+(``/ws_collab/meet-bridge/{health,captions,command}``) that
+:mod:`ws_collab.drivers.stt.
 google_meet.driver` already knows how to consume as an STT engine.
 
 This subpackage is a from-scratch reimplementation of the design that used to
@@ -26,7 +27,7 @@ Submodules:
 * :mod:`.audio_out`      -- Windows SAPI text-to-speech and virtual-cable audio
   playback helpers for the ``/say`` command.
 * :mod:`.mailbox_client` -- a tiny native HTTP client for ws_collab's own
-  ``/v1/mailbox`` REST API (replaces the old cross-plugin mailbox import).
+  ``/ws_collab/mailbox`` REST API (replaces the old cross-plugin mailbox import).
 * :mod:`.bridge`         -- orchestration: CLI, the companion/out/poll loops,
   and the bridge's own status HTTP server.
 """

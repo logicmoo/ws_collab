@@ -7,7 +7,7 @@ recognizer -- and a mouthpiece:
 
   IN   Meet live captions  ->  ws_collab mailbox (one message per finished
        line, sender "meet-<speaker>"), AND exposed at this process's own
-       GET /captions HTTP endpoint, which ws_collab's `google_meet` STT
+       GET /ws_collab/meet-bridge/captions HTTP endpoint, which ws_collab's `google_meet` STT
        driver polls and resolves through the normal disambiguator/timeline
        pipeline.
   OUT  ws_collab mailbox messages addressed to the bridge (default mailbox
@@ -18,7 +18,8 @@ ALWAYS-ON: run with no arguments and the bridge keeps a meeting of its own in
 the background as the STT surface -- it signs into the popup browser (SSO
 persists), CREATES an instant meeting, and transcribes whoever talks in it.
 While running you can point it at any other meeting by MAILBOX COMMAND --
-send to the "google-meet" mailbox, or via POST /command on this process's own
+send to the "google-meet" mailbox, or via POST
+/ws_collab/meet-bridge/command on this process's own
 status port (what the ws_collab admin UI's Google Meet page uses):
 
     /join https://meet.google.com/xxx-yyyy-zzz   switch to that meeting
@@ -136,6 +137,18 @@ from .scripts_js import (
 )
 from .tracker import CaptionTracker
 from ..meet_browser_settings import MeetBrowserSettings, companion_click_runtime_layers
+from ..urls import (
+    MEET_BRIDGE_CAPTIONS,
+    MEET_BRIDGE_COMMAND,
+    MEET_BRIDGE_DISCONNECT_AUDIO,
+    MEET_BRIDGE_HEALTH,
+    MEET_BRIDGE_SPEECH,
+    MEET_BRIDGE_SPEECH_CANCEL,
+    MEET_BRIDGE_SPEECH_STATUS,
+    MEET_BRIDGE_WIRE_AUDIO,
+    meet_bridge_route_allowed,
+    meet_bridge_url,
+)
 
 DEFAULT_RECIPIENTS = ["conversation"]
 DEFAULT_SENDER_PREFIX = "meet-"
@@ -146,8 +159,8 @@ CAPTION_DUPLICATE_RECENT_LIMIT = 400
 CAPTION_PUSH_BINDING = "__wsCollabCaptionPush"
 CAPTION_PUSH_HEALTH_SECONDS = 5.0
 _BRIDGE_WIRING_ROUTES = {
-    "/wire-companion-audio",
-    "/disconnect-companion-audio",
+    MEET_BRIDGE_WIRE_AUDIO,
+    MEET_BRIDGE_DISCONNECT_AUDIO,
 }
 
 
@@ -2863,7 +2876,7 @@ def main() -> None:
             holder["host_account"] = account
         return {"path": path, "known": True, "label": path, "account": account, "authuser": role_authuser("host")}
 
-    # ---- STT-subsystem integration: /health + /captions for consumers ------
+    # ---- STT-subsystem integration: canonical loopback API for consumers ----
     # `captionCount` = distinct stored rows (add/edit collapses to one per
     # key); `emitCount` = total raw emit() calls ever made (every add AND
     # every edit counted separately).
@@ -3429,7 +3442,13 @@ def main() -> None:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
                 parsed = urlparse(self.path)
-                if parsed.path.rstrip("/") == "/captions":
+                route = parsed.path.rstrip("/") or "/"
+                if not meet_bridge_route_allowed("GET", route):
+                    self.send_response(404)
+                    self.send_header("content-length", "0")
+                    self.end_headers()
+                    return
+                if route == MEET_BRIDGE_CAPTIONS:
                     qs = parse_qs(parsed.query)
                     since = 0.0
                     try:
@@ -3528,9 +3547,14 @@ def main() -> None:
                 # makes, not just POST /command: its shared api() helper
                 # always attaches an Authorization header (meant for
                 # ws_collab's own API), which turns even a plain GET
-                # /health or /captions into a "non-simple" request that the
+                # bridge health or captions reads into a "non-simple" request that the
                 # browser preflights first.
                 route = urlparse(self.path).path.rstrip("/")
+                if not meet_bridge_route_allowed("OPTIONS", route):
+                    self.send_response(404)
+                    self.send_header("content-length", "0")
+                    self.end_headers()
+                    return
                 if route in _BRIDGE_WIRING_ROUTES:
                     body = json.dumps(
                         {
@@ -3552,19 +3576,12 @@ def main() -> None:
                 self.end_headers()
 
             def do_POST(self) -> None:  # noqa: N802
-                # POST /command {"command": "/join <url>" | "/new" | "/say <text>" | "/click on"}
+                # Canonical command POST accepts /join, /new, /say, and /click.
                 # -- lets a UI (the ws_collab admin's Google Meet page) drive
                 # the bridge directly over HTTP.
                 parsed = urlparse(self.path)
                 route = parsed.path.rstrip("/")
-                if route not in {
-                    "/command",
-                    "/speech",
-                    "/speech/cancel",
-                    "/speech/status",
-                    "/wire-companion-audio",
-                    "/disconnect-companion-audio",
-                }:
+                if not meet_bridge_route_allowed("POST", route):
                     self.send_response(404)
                     self.send_header("access-control-allow-origin", "*")
                     self.send_header("content-length", "0")
@@ -3589,10 +3606,10 @@ def main() -> None:
                     length = int(self.headers.get("content-length") or 0)
                     raw = self.rfile.read(length) if length else b"{}"
                     payload = json.loads(raw or b"{}")
-                    if route == "/wire-companion-audio":
+                    if route == MEET_BRIDGE_WIRE_AUDIO:
                         body_obj = _run_companion_wiring(payload)
                         status_code = 200 if body_obj.get("ok") else 409
-                    elif route == "/disconnect-companion-audio":
+                    elif route == MEET_BRIDGE_DISCONNECT_AUDIO:
                         requested = meeting_key(payload.get("meeting_url")) if payload.get("meeting_url") else meeting_key(holder.get("url"))
                         active = meeting_key(holder.get("url"))
                         if requested and requested != active:
@@ -3603,19 +3620,19 @@ def main() -> None:
                                 str(payload.get("reason") or "manual-disconnect")
                             )
                             status_code = 200
-                    elif route == "/speech/status":
+                    elif route == MEET_BRIDGE_SPEECH_STATUS:
                         utterance_id = str(payload.get("utterance_id") or "").strip()
                         wait_seconds = float(payload.get("wait_seconds") or 0.0)
                         body_obj = companion_audio.utterance_status(
                             utterance_id, wait_seconds=wait_seconds
                         )
                         status_code = 200 if body_obj.get("ok") else 404
-                    elif route == "/speech/cancel":
+                    elif route == MEET_BRIDGE_SPEECH_CANCEL:
                         utterance_id = str(payload.get("utterance_id") or "").strip()
                         cancelled = bool(utterance_id and companion_audio.cancel(utterance_id))
                         body_obj = {"ok": True, "cancelled": cancelled, "utterance_id": utterance_id}
                         status_code = 200
-                    elif route == "/speech":
+                    elif route == MEET_BRIDGE_SPEECH:
                         destination = str(payload.get("destination") or "companion").strip().lower()
                         if destination != "companion":
                             body_obj = {
@@ -3667,7 +3684,11 @@ def main() -> None:
         except OSError as error:
             print(f"[status] health port {args.status_port} unavailable: {error}", file=sys.stderr, flush=True)
             return
-        print(f"[status] health endpoint: http://127.0.0.1:{args.status_port}/health", flush=True)
+        print(
+            f"[status] health endpoint: "
+            f"{meet_bridge_url(MEET_BRIDGE_HEALTH, f'http://127.0.0.1:{args.status_port}')}",
+            flush=True,
+        )
         server.timeout = 1.0
         while not stop.is_set():
             server.handle_request()
@@ -4576,7 +4597,7 @@ def main() -> None:
         and /disconnect [host|companion] (+ alias /hangup); return a short
         verdict string if `command` was one of those and has been acted on, or
         None if it isn't a recognized control command. Shared by the
-        mailbox-driven out_loop and the bridge's own HTTP /command endpoint so
+        mailbox-driven out_loop and the bridge's own canonical HTTP command endpoint so
         both paths behave identically.
         """
         lowered = command.lower()
