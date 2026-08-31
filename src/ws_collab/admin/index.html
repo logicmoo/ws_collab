@@ -310,7 +310,7 @@
               <button id="meet-say-btn">🔊 Say</button>
             </div>
             <div class="toolbar" id="meet-kind-toolbar"></div>
-            <div class="mono hint" id="meet-command-result"></div>
+            <div class="mono hint" id="meet-command-result" aria-live="polite"></div>
             <!-- One <details> per meeting the bridge has ever captioned, each
                  with 5 independently-expandable subsections: Connector
                  agents (host/companion/client identities we control + which
@@ -345,34 +345,40 @@
           </select>
         </label>
         <span class="toolbar-sep"></span>
-        <button id="sil-drive-next" disabled title="agent-voices-via-companion is not wired yet">Drive next agent turn</button>
-        <span class="hint">Drive mode disabled — agent voice not yet wired.</span>
+        <button id="sil-drive-next" disabled title="Queues the next companion turn for a Continue silence edge">Queue next agent turn</button>
+        <span class="hint">Continue mode releases one queued companion turn after the user's silence.</span>
         <span class="spacer" style="flex:1"></span>
         <span class="mono hint" id="sil-status">ready</span>
       </div>
       <div class="panel-body">
         <div class="panel" id="meet-companion-panel">
-          <div class="panel-title">Automatic companion backchannels</div>
+          <div class="panel-title">Silence actions</div>
           <div class="panel-content">
             <p class="hint companion-aid-note">
-              Silences is the authoritative operator surface. A selected phrase is queued through
-              the companion output arbiter, never over virtual-agent speech. On-silence sends once
-              per quiet event and rearms only after speech or caption growth resumes.
+              Every action uses the same trigger, detector, and scoped inheritance settings.
+              Continue opens the conversational floor; Say nothing records an intentional no-op;
+              audible Say actions queue one companion backchannel.
             </p>
             <div class="companion-scope-row">
-              <label for="meet-companion-meeting">Exact meeting</label>
-              <select id="meet-companion-meeting" required>
-                <option value="">Select a specific meeting…</option>
+              <label for="meet-companion-target">Configuration target</label>
+              <select id="meet-companion-target" aria-describedby="meet-companion-target-hint">
+                <option value="global">Default Config</option>
+                <option value="test">Tests here</option>
+                <optgroup label="Channels" id="meet-companion-channels"></optgroup>
               </select>
-              <span id="meet-companion-source" class="badge">No meeting selected</span>
+              <span id="meet-companion-source" class="badge">Default config</span>
             </div>
+            <p class="hint" id="meet-companion-target-hint">
+              Tests here follows the selected harness scenario. Channel entries use stable channel
+              identities; test settings never become live channel settings.
+            </p>
             <form id="meet-companion-form">
               <fieldset id="meet-companion-fields" disabled>
                 <legend class="sr-only">Automatic companion backchannel settings</legend>
                 <div class="companion-settings-grid">
                   <label class="companion-check">
                     <input type="checkbox" id="meet-companion-enabled" />
-                    Enable automatic backchannels for this meeting
+                    Enable automatic silence action
                   </label>
                   <label>Trigger mode
                     <select id="meet-companion-mode">
@@ -380,16 +386,22 @@
                       <option value="fixed">Every N seconds</option>
                     </select>
                   </label>
-                  <label>Phrase
-                    <select id="meet-companion-sound">
-                      <option value="uh">uh</option>
-                      <option value="uhuh">uhuh</option>
-                      <option value="hmm">hmm</option>
+                  <label>Action
+                    <select id="meet-companion-action">
+                      <option value="continue">Continue</option>
+                      <option value="nothing">Say nothing</option>
+                      <option value="say:uh">Say “uh”</option>
+                      <option value="say:uhuh">Say “uhuh”</option>
+                      <option value="say:hmm">Say “hmm”</option>
                     </select>
                   </label>
                   <label class="companion-interval-field">Interval N (seconds)
                     <input type="number" id="meet-companion-interval" min="0.1" max="3600" step="0.1" required />
                   </label>
+                  <div class="hint companion-continue-note" hidden>
+                    Every N seconds is unavailable for Continue because periodic floor grants could
+                    start agent turns without a real conversational pause.
+                  </div>
                   <label class="companion-silence-field">Silence detector
                     <select id="meet-companion-trigger">
                       <option value="caption">Caption stasis</option>
@@ -412,33 +424,79 @@
                   <label class="companion-silence-field">Audio RMS threshold
                     <input type="number" id="meet-companion-rms" min="0" max="1" step="0.001" required />
                   </label>
-                  <label>Phrase base duration (ms)
+                  <label class="companion-phrase-field">Phrase base duration (ms) · audible Say actions
                     <input type="number" id="meet-companion-duration" min="10" max="1000" step="1" required />
                   </label>
-                  <label>Gain
+                  <label class="companion-phrase-field">Gain · audible Say actions
                     <input type="number" id="meet-companion-gain" min="0.001" max="1" step="0.001" required />
                   </label>
-                  <label>Fundamental f0 (Hz)
+                  <label class="companion-phrase-field">Fundamental f0 (Hz) · audible Say actions
                     <input type="number" id="meet-companion-f0" min="40" max="500" step="1" required />
                   </label>
-                  <label>Formant F1 (Hz)
+                  <label class="companion-phrase-field">Formant F1 (Hz) · audible Say actions
                     <input type="number" id="meet-companion-f1" min="100" max="5000" step="1" required />
                   </label>
-                  <label>Formant F2 (Hz)
+                  <label class="companion-phrase-field">Formant F2 (Hz) · audible Say actions
                     <input type="number" id="meet-companion-f2" min="200" max="8000" step="1" required />
                   </label>
                 </div>
                 <p class="hint" id="meet-companion-rearm-note">
-                  On-silence is edge-triggered: one backchannel per continuous silence, then rearm after speech or caption growth.
+                  On-silence is edge-triggered: each action evaluates once, then rearms after speech
+                  or caption growth. Audio shaping is retained for every action but used only by Say.
                 </p>
                 <div class="toolbar companion-actions">
-                  <button type="submit" class="primary" id="meet-companion-save">Save meeting override</button>
-                  <button type="button" id="meet-companion-reset">Reset to inherited defaults</button>
+                  <button type="submit" class="primary" id="meet-companion-save" disabled title="Default Config is global, not an override.">Save override</button>
+                  <button type="button" id="meet-companion-reset">Reset from defaults</button>
+                  <button type="button" id="meet-companion-save-defaults">Save to defaults</button>
                   <span id="meet-companion-result" class="mono hint" role="status" aria-live="polite"></span>
                 </div>
+                <details class="companion-advanced-actions">
+                  <summary>Advanced defaults action</summary>
+                  <button type="button" id="meet-companion-restore-builtins">Restore built-in defaults</button>
+                  <span class="hint">Replaces saved global defaults; channel and test override patches remain.</span>
+                </details>
               </fieldset>
             </form>
             <div id="meet-companion-metrics" class="silences-summary" aria-live="polite"></div>
+          </div>
+        </div>
+        <div class="panel" id="companion-cable-wiring-panel">
+          <div class="panel-title">Companion cable wiring</div>
+          <div class="panel-content">
+            <p class="hint">
+              Uses two different virtual cables. RECEIVE carries what the companion hears from Meet
+              into Silence/STT. TRANSMIT carries agent TTS/backchannels into the companion mic.
+              Saving does not unmute or apply anything.
+            </p>
+            <fieldset id="companion-cable-fields">
+              <legend class="sr-only">Exact two-cable audio endpoints</legend>
+              <div class="companion-settings-grid">
+                <label>RECEIVE · browser playback sink
+                  <select id="companion-cable-receive-playback" aria-describedby="companion-cable-receive-playback-help"></select>
+                  <span class="hint" id="companion-cable-receive-playback-help">Virtual PLAYBACK side; often product-labeled “Input”. Remote Meet media is sent here.</span>
+                </label>
+                <label>RECEIVE · server capture input
+                  <select id="companion-cable-receive-capture" aria-describedby="companion-cable-receive-capture-help"></select>
+                  <span class="hint" id="companion-cable-receive-capture-help">Paired RECORDING side; often product-labeled “Output”. Silence VAD and non-Meet STT read this PCM.</span>
+                </label>
+                <label>TRANSMIT · TTS playback output
+                  <select id="companion-cable-transmit-output" aria-describedby="companion-cable-transmit-output-help"></select>
+                  <span class="hint" id="companion-cable-transmit-output-help">A DIFFERENT virtual PLAYBACK endpoint for serialized agent TTS/backchannels.</span>
+                </label>
+                <label>TRANSMIT · companion mic input
+                  <select id="companion-cable-transmit-mic" aria-describedby="companion-cable-transmit-mic-help"></select>
+                  <span class="hint" id="companion-cable-transmit-mic-help">That different cable’s paired RECORDING endpoint, attached as the companion outbound mic track.</span>
+                </label>
+              </div>
+            </fieldset>
+            <div class="toolbar companion-actions">
+              <button type="button" class="primary" id="companion-cable-save">Save wiring config</button>
+              <button type="button" id="companion-cable-wire" disabled>Wire now</button>
+              <button type="button" id="companion-cable-disconnect" disabled>Disconnect / mute wiring</button>
+              <span id="companion-cable-result" class="mono hint" role="status" aria-live="polite"></span>
+            </div>
+            <p class="hint" id="companion-cable-eligibility">Loading endpoint and companion status…</p>
+            <div id="companion-cable-status" class="silences-summary" aria-live="polite"></div>
           </div>
         </div>
         <div class="panel">

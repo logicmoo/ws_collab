@@ -80,13 +80,23 @@ const state = {
   reconnectDelay: 1000,
   meetAssignmentScope: "",
   meetKnownUrls: [...DEFAULT_DRIVER_MEETING_URLS, ...DEFAULT_CLIENT_MEETING_URLS],
+  meetForgottenUrls: [],
   meetGlobalAssignments: null,
   meetCompanion: {
+    target: "global",
     meetingUrl: "",
+    testProfile: "count20",
     config: null,
-    configMeetingUrl: "",
+    configKey: "",
+    loadedSnapshot: "",
     health: null,
     loading: false,
+    pendingMeetingUrl: "",
+  },
+  companionCableWiring: {
+    payload: null,
+    loading: false,
+    dirty: false,
   },
   silences: {
     run: null,
@@ -2000,6 +2010,12 @@ async function postMeetCommand(command) {
   try {
     const result = await api(`${MEET_BRIDGE_BASE}/command`, { method: "POST", body: { command } });
     resultEl.textContent = `${command} → ${result.verdict}`;
+    const joined = /^\/join\s+(.+)$/i.exec(command);
+    if (joined) {
+      const key = meetAssignmentKey(joined[1]);
+      state.meetForgottenUrls = state.meetForgottenUrls.filter((url) => meetAssignmentKey(url) !== key);
+      rememberMeetKnownUrls([key]);
+    }
     if (result.started) setTimeout(loadMeet, 2000);
   } catch (error) {
     resultEl.textContent = `${command} → error: ${error.message}`;
@@ -2191,13 +2207,105 @@ function meetAssignmentKey(url) {
   }
 }
 
+function deletableMeetChannelUrl(url) {
+  const text = String(url || "").trim();
+  const match = /^(?:https?:\/\/meet\.google\.com\/|google-meet:)?([a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4})(?:[/?#].*)?$/i.exec(text);
+  return match ? `https://meet.google.com/${match[1].toLowerCase()}` : "";
+}
+
 function rememberMeetKnownUrls(urls) {
-  const known = new Set(state.meetKnownUrls.map(meetAssignmentKey).filter(Boolean));
+  const forgotten = new Set(state.meetForgottenUrls.map(meetAssignmentKey).filter(Boolean));
+  const known = new Set(
+    state.meetKnownUrls.map(meetAssignmentKey).filter((url) => url && !forgotten.has(url)),
+  );
   (urls || []).forEach((url) => {
     const key = meetAssignmentKey(url);
-    if (key) known.add(key);
+    if (key && !forgotten.has(key)) known.add(key);
   });
   state.meetKnownUrls = [...known];
+}
+
+function meetChannelIsSelectedInSilences(key) {
+  const select = $("meet-companion-target");
+  if (!select || !String(select.value).startsWith("channel:")) return false;
+  const optionUrl = companionMeetingKey(select.selectedOptions[0] && select.selectedOptions[0].dataset.channelUrl);
+  const targetKey = companionTargetChannelKey(select.value);
+  return optionUrl === key
+    || companionMeetingKey(targetKey) === key
+    || targetKey === `google-meet:${meetRoomId(key)}`;
+}
+
+function removeMeetChannelFromRenderedList(key) {
+  const container = $("meet-driver-tree");
+  if (!container) return;
+  container.querySelectorAll(".meet-tree-meeting").forEach((meeting) => {
+    if (deletableMeetChannelUrl(meeting.dataset.url) === key) meeting.remove();
+  });
+  if (!container.querySelector(".meet-tree-meeting")) {
+    container.appendChild(el("div", "hint", "No configured meetings."));
+  }
+}
+
+async function forgetMeetChannel(url) {
+  const key = deletableMeetChannelUrl(url);
+  if (!key) return;
+  const code = meetRoomId(key);
+  const confirmation = [
+    `Delete meeting ${code} (${key})?`,
+    "",
+    "This removes it from the Driver/Client lists and deletes its per-channel role and Silence overrides.",
+    "Transcript, caption, and event history is preserved.",
+  ].join("\n");
+  if (!confirm(confirmation)) return;
+  const deletingSelectedSilenceTarget = meetChannelIsSelectedInSilences(key);
+  if (
+    deletingSelectedSilenceTarget
+    && companionFormIsDirty()
+    && !confirm("Discard unsaved Silence configuration changes and switch targets?")
+  ) return;
+  try {
+    const result = await api(`${V1}/meet/channels/forget`, {
+      method: "POST",
+      body: { meeting_url: key },
+    });
+    state.meetForgottenUrls = [...new Set([
+      ...state.meetForgottenUrls.map(meetAssignmentKey),
+      ...(result.forgotten || []).map(meetAssignmentKey),
+      ...(result.alreadyForgotten || []).map(meetAssignmentKey),
+    ].filter(Boolean))];
+    const kept = Array.isArray(result.kept) ? result.kept : state.meetKnownUrls;
+    state.meetKnownUrls = kept
+      .map(meetAssignmentKey)
+      .filter((candidate) => candidate && candidate !== key);
+    if (state.meetAssignmentScope === key) state.meetAssignmentScope = "";
+    removeMeetChannelFromRenderedList(key);
+    if (deletingSelectedSilenceTarget) {
+      state.meetCompanion.target = "global";
+      state.meetCompanion.config = null;
+      state.meetCompanion.configKey = "";
+    }
+    syncCompanionTargetOptions(
+      state.meetCompanion.health && state.meetCompanion.health.meetingUrl,
+    );
+    if (deletingSelectedSilenceTarget) {
+      updateCompanionTargetControls();
+      loadCompanionInterjectorConfig();
+    }
+    const resultEl = $("meet-command-result");
+    resultEl.textContent = `Deleted ${code} from Driver/Client lists. Transcript, caption, and event history is preserved.`;
+    resultEl.className = "mono hint ok";
+    loadMeetRoleAssignments();
+    loadMeet();
+  } catch (error) {
+    const detail = error.status === 405
+      ? "The running server does not provide the new delete route yet. Restart/update the server, then try again."
+      : error.message;
+    const message = `Could not delete ${code}: ${detail}`;
+    const resultEl = $("meet-command-result");
+    resultEl.textContent = message;
+    resultEl.className = "mono hint error";
+    pushError(message);
+  }
 }
 
 function meetRoleOverride(url, role) {
@@ -2261,6 +2369,7 @@ async function loadMeetRoleAssignments() {
     const meetingUrl = state.meetAssignmentScope;
     const query = meetingUrl ? `?meeting_url=${encodeURIComponent(meetingUrl)}` : "";
     const data = await api(`${V1}/meet/role-assignments${query}`);
+    state.meetForgottenUrls = (data.forgotten_meeting_urls || []).map(meetAssignmentKey);
     rememberMeetKnownUrls([
       ...(data.known_meeting_urls || []),
       ...Object.keys(data.meeting_role_account_maps || {}),
@@ -2415,28 +2524,262 @@ function setCompanionResult(message, kind = "") {
   result.classList.toggle("ok", kind === "ok");
 }
 
-function syncCompanionMeetingOptions(currentMeeting = "") {
-  const select = $("meet-companion-meeting");
-  if (!select) return;
-  const current = companionMeetingKey(currentMeeting);
-  if (current) rememberMeetKnownUrls([current]);
-  const urls = [...new Set(state.meetKnownUrls.map(companionMeetingKey).filter(Boolean))];
-  const previous = companionMeetingKey(state.meetCompanion.meetingUrl);
-  const selected = previous || current;
-  const signature = `${selected}|${current}|${urls.join("|")}`;
-  if (select.dataset.signature !== signature) {
-    select.replaceChildren(new Option("Select a specific meeting…", ""));
-    urls.forEach((url) => {
-      const room = meetRoomId(url) || url;
-      select.appendChild(new Option(`${room}${url === current ? " (current)" : ""}`, url));
+function companionTestLabel(profile = state.meetCompanion.testProfile) {
+  return profile === "abcs" ? "ABCs" : "Count to 20";
+}
+
+function companionTarget() {
+  return $("meet-companion-target") ? $("meet-companion-target").value : state.meetCompanion.target;
+}
+
+function companionTargetChannelKey(target = companionTarget()) {
+  if (!String(target).startsWith("channel:")) return "";
+  try {
+    return decodeURIComponent(String(target).slice("channel:".length));
+  } catch (_error) {
+    return "";
+  }
+}
+
+function companionTestChannelKey() {
+  return companionMeetingKey(state.meetCompanion.meetingUrl);
+}
+
+function companionScope() {
+  const target = companionTarget();
+  return target === "global" ? "global" : target === "test" ? "test" : "channel";
+}
+
+function companionChannelTarget(key) {
+  return `channel:${encodeURIComponent(key)}`;
+}
+
+function companionKnownChannels(payload = null) {
+  const channels = [];
+  const seen = new Set();
+  const add = (raw) => {
+    const item = typeof raw === "string" ? { url: raw } : (raw || {});
+    const url = String(item.url || item.meetingUrl || "").trim();
+    const meetUrl = companionMeetingKey(url || item.key || item.channelKey);
+    const meetCode = meetRoomId(meetUrl);
+    const key = String(item.key || item.channelKey || (meetCode ? `google-meet:${meetCode}` : meetUrl || url) || "").trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    if (url || meetUrl) seen.add(url || meetUrl);
+    const code = String(item.code || meetCode || key).trim();
+    const provider = String(item.provider || (meetUrl ? "Google Meet" : "Channel")).trim();
+    const displayName = String(item.label || code).trim();
+    channels.push({
+      key,
+      url: meetUrl || url,
+      label: `${provider} · ${displayName}${url || meetUrl ? ` — ${url || meetUrl}` : ""}`,
     });
-    select.dataset.signature = signature;
+  };
+  ((payload && payload.knownChannels) || []).forEach(add);
+  state.meetKnownUrls.forEach(add);
+  return channels.sort((left, right) => left.label.localeCompare(right.label));
+}
+
+function syncCompanionTargetOptions(currentMeeting = "", payload = null) {
+  const select = $("meet-companion-target");
+  const group = $("meet-companion-channels");
+  if (!select || !group) return;
+  const current = companionMeetingKey(currentMeeting);
+  if (current) {
+    rememberMeetKnownUrls([current]);
+    const selectedMeeting = companionMeetingKey(state.meetCompanion.meetingUrl);
+    const canFollowLiveRoom = companionScope() !== "channel";
+    if (canFollowLiveRoom && current !== selectedMeeting) {
+      const pendingCurrent = state.meetCompanion.pendingMeetingUrl === current;
+      if (
+        companionScope() === "test"
+        && companionFormIsDirty()
+        && (!pendingCurrent || !state.meetCompanion.pendingMeetingUrl)
+        && !confirm("Discard unsaved Tests here changes and switch to the bridge's current room?")
+      ) {
+        state.meetCompanion.pendingMeetingUrl = current;
+        setCompanionResult(
+          `Unsaved Tests here changes remain bound to ${meetRoomId(selectedMeeting)}; they will not be saved to ${meetRoomId(current)}.`,
+        );
+      } else if (!(companionScope() === "test" && companionFormIsDirty() && pendingCurrent)) {
+        state.meetCompanion.meetingUrl = current;
+        state.meetCompanion.pendingMeetingUrl = "";
+      }
+    }
   }
-  select.value = selected;
-  if (selected && selected !== state.meetCompanion.meetingUrl) {
-    state.meetCompanion.meetingUrl = selected;
-    loadCompanionInterjectorConfig();
+  const testOption = [...select.options].find((option) => option.value === "test");
+  if (testOption) {
+    const room = meetRoomId(companionTestChannelKey());
+    testOption.textContent = `Tests here — ${companionTestLabel()}${room ? ` · ${room}` : ""}`;
   }
+  const channels = companionKnownChannels(payload);
+  const signature = `${current}|${channels.map((channel) => `${channel.key}|${channel.label}`).join("|")}`;
+  if (group.dataset.signature !== signature) {
+    group.replaceChildren();
+    channels.forEach((channel) => {
+      const option = new Option(
+        `${channel.label}${channel.url === current ? " (current)" : ""}`,
+        companionChannelTarget(channel.key),
+      );
+      option.dataset.channelUrl = channel.url;
+      group.appendChild(option);
+    });
+    group.dataset.signature = signature;
+  }
+  if (![...select.options].some((option) => option.value === state.meetCompanion.target)) {
+    state.meetCompanion.target = "global";
+  }
+  select.value = state.meetCompanion.target;
+}
+
+function companionConfigKey() {
+  const scope = companionScope();
+  if (scope === "global") return "global";
+  if (scope === "test") {
+    return `test:${state.meetCompanion.testProfile}:${companionTestChannelKey()}`;
+  }
+  return `channel:${companionTargetChannelKey()}`;
+}
+
+function companionConfigUrl(scope = companionScope()) {
+  // Legacy UI clients still use:
+  // api(`${V1}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`)
+  const params = new URLSearchParams({ scope });
+  const channelKey = companionTargetChannelKey();
+  if (channelKey && scope === "channel") params.set("channel_key", channelKey);
+  if (scope === "test") {
+    params.set("test_profile", state.meetCompanion.testProfile);
+    params.set("channel_key", companionTestChannelKey());
+  }
+  return `${V1}/meet/companion-click?${params}`;
+}
+
+function updateCompanionTargetControls() {
+  const scope = companionScope();
+  const saveOverride = $("meet-companion-save");
+  saveOverride.disabled = scope === "global";
+  saveOverride.title = scope === "global"
+    ? "Default Config is global, not an override. Use Save to defaults."
+    : "Save only values that differ from the current global defaults.";
+  $("meet-companion-reset").title = scope === "global"
+    ? "Discard unsaved edits and reload the saved global defaults."
+    : "Delete this stored override and inherit the current global defaults.";
+}
+
+function normalizeCompanionConfig(data, requestedScope = companionScope()) {
+  const row = data && typeof data === "object" ? data : {};
+  const effective = row.effective && typeof row.effective === "object"
+    ? row.effective
+    : Object.fromEntries(
+      ["enabled", "action", "mode", "trigger", ...Object.keys(COMPANION_FIELD_MAP)]
+        .filter((key) => row[key] !== undefined)
+        .map((key) => [key, row[key]]),
+    );
+  const scope = ["global", "test", "channel"].includes(row.scope) ? row.scope : requestedScope;
+  const hasOverride = row.hasOverride !== undefined
+    ? !!row.hasOverride
+    : scope !== "global" && row.source === "override";
+  const override = row.override && typeof row.override === "object" ? row.override : {};
+  const sources = row.sources && typeof row.sources === "object"
+    ? row.sources
+    : Object.fromEntries(Object.keys(effective).map((key) => [
+      key,
+      scope === "global" ? "global" : hasOverride ? scope : "global",
+    ]));
+  return {
+    ...row,
+    ...effective,
+    effective,
+    scope,
+    hasOverride,
+    override,
+    sources,
+    globalDefault: row.globalDefault && typeof row.globalDefault === "object"
+      ? row.globalDefault
+      : (scope === "global" ? effective : null),
+  };
+}
+
+function companionFormValues({ validate = false } = {}) {
+  const form = $("meet-companion-form");
+  if (validate && !form.checkValidity()) {
+    form.reportValidity();
+    throw new Error("Correct the highlighted setting values before saving.");
+  }
+  const values = {
+    enabled: $("meet-companion-enabled").checked,
+    action: $("meet-companion-action").value,
+    mode: $("meet-companion-mode").value,
+    trigger: $("meet-companion-trigger").value,
+  };
+  Object.entries(COMPANION_FIELD_MAP).forEach(([key, id]) => {
+    values[key] = $(id).valueAsNumber;
+  });
+  if (validate && !(values.f0Hz < values.f1Hz && values.f1Hz < values.f2Hz)) {
+    throw new Error("Frequencies must be ordered f0 < F1 < F2.");
+  }
+  return values;
+}
+
+function companionSnapshot(values = companionFormValues()) {
+  return JSON.stringify(values);
+}
+
+function companionFormIsDirty() {
+  const fields = $("meet-companion-fields");
+  return !!state.meetCompanion.loadedSnapshot && !fields.disabled
+    && companionSnapshot() !== state.meetCompanion.loadedSnapshot;
+}
+
+function companionDelta(values, defaults) {
+  return Object.fromEntries(
+    Object.entries(values).filter(([key, value]) => value !== defaults[key]),
+  );
+}
+
+function refreshCompanionDraftState() {
+  const config = state.meetCompanion.config;
+  if (!config || state.meetCompanion.configKey !== companionConfigKey()) return;
+  const scope = companionScope();
+  const values = companionFormValues();
+  if (scope !== "global" && config.globalDefault) {
+    const delta = companionDelta(values, config.globalDefault);
+    paintCompanionFieldSources({
+      ...config,
+      sources: Object.fromEntries(Object.keys(values).map((key) => [
+        key, key in delta ? scope : "global",
+      ])),
+    });
+  }
+  setCompanionResult(companionFormIsDirty() ? "Unsaved changes." : "");
+}
+
+function paintCompanionFieldSources(config) {
+  const sources = (config && config.sources) || {};
+  const ids = {
+    enabled: "meet-companion-enabled",
+    action: "meet-companion-action",
+    mode: "meet-companion-mode",
+    trigger: "meet-companion-trigger",
+    ...COMPANION_FIELD_MAP,
+  };
+  Object.entries(ids).forEach(([key, id]) => {
+    const control = $(id);
+    const label = control && control.closest("label");
+    if (!label) return;
+    let marker = label.querySelector(".companion-field-source");
+    if (!marker) {
+      marker = el("span", "companion-field-source");
+      label.appendChild(marker);
+    }
+    const fieldSource = sources[key] || "built-in";
+    marker.textContent = config.scope === "global"
+      ? (fieldSource === "global" ? "Saved global" : "Built-in default")
+      : fieldSource === "channel" || fieldSource === "test"
+        ? `Overridden · ${fieldSource}`
+        : `Inherited · ${fieldSource}`;
+    marker.classList.toggle("overridden", fieldSource === "channel" || fieldSource === "test");
+  });
 }
 
 function paintCompanionConfig(config) {
@@ -2444,30 +2787,42 @@ function paintCompanionConfig(config) {
   const fields = $("meet-companion-fields");
   if (!source || !fields) return;
   if (!config) {
-    source.textContent = state.meetCompanion.meetingUrl ? "Loading…" : "No meeting selected";
+    source.textContent = "Loading…";
     source.className = "badge";
     fields.disabled = true;
+    state.meetCompanion.loadedSnapshot = "";
     return;
   }
   $("meet-companion-enabled").checked = !!config.enabled;
   $("meet-companion-mode").value = config.mode || "reactive";
   $("meet-companion-trigger").value = config.trigger || "caption";
-  $("meet-companion-sound").value = ["uh", "uhuh", "hmm"].includes(config.phrase)
-    ? config.phrase
-    : (["uh", "uhuh", "hmm"].includes(config.sound) ? config.sound : "uh");
+  $("meet-companion-action").value = ["continue", "nothing", "say:uh", "say:uhuh", "say:hmm"].includes(config.action)
+    ? config.action
+    : "say:uh";
   Object.entries(COMPANION_FIELD_MAP).forEach(([key, id]) => {
     $(id).value = config[key] ?? "";
   });
-  const inherited = config.source !== "override";
-  source.textContent = inherited ? "Inherited global defaults" : "Persisted meeting override";
-  source.className = `badge ${inherited ? "" : "ok"}`.trim();
+  const scope = companionScope();
+  const inherited = !config.hasOverride;
+  source.textContent = scope === "global"
+    ? "Default config"
+    : `${scope === "test" ? "Test" : "Channel"} ${inherited ? "inherited" : "override active"}`;
+  source.className = `badge ${scope !== "global" && !inherited ? "ok" : ""}`.trim();
   fields.disabled = false;
-  $("meet-companion-reset").disabled = inherited;
+  paintCompanionFieldSources(config);
   updateCompanionConditionalFields();
+  state.meetCompanion.loadedSnapshot = companionSnapshot();
+  updateCompanionTargetControls();
 }
 
 function updateCompanionConditionalFields() {
-  const onSilence = $("meet-companion-mode").value === "reactive";
+  const action = $("meet-companion-action").value;
+  const isContinue = action === "continue";
+  const mode = $("meet-companion-mode");
+  const intervalOption = [...mode.options].find((option) => option.value === "fixed");
+  if (intervalOption) intervalOption.disabled = isContinue;
+  if (isContinue && mode.value === "fixed") mode.value = "reactive";
+  const onSilence = mode.value === "reactive";
   document.querySelectorAll(".companion-silence-field").forEach((field) => {
     field.hidden = !onSilence;
     field.querySelectorAll("input,select").forEach((control) => { control.disabled = !onSilence; });
@@ -2477,13 +2832,18 @@ function updateCompanionConditionalFields() {
     field.querySelectorAll("input,select").forEach((control) => { control.disabled = onSilence; });
   });
   $("meet-companion-rearm-note").hidden = !onSilence;
+  const continueNote = document.querySelector(".companion-continue-note");
+  if (continueNote) continueNote.hidden = !isContinue;
 }
 
 async function loadCompanionInterjectorConfig() {
-  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
-  if (!meetingUrl) {
+  const scope = companionScope();
+  if (
+    (scope === "channel" && !companionTargetChannelKey())
+    || (scope === "test" && !companionTestChannelKey())
+  ) {
     state.meetCompanion.config = null;
-    state.meetCompanion.configMeetingUrl = "";
+    state.meetCompanion.configKey = "";
     paintCompanionConfig(null);
     renderCompanionMetrics(state.meetCompanion.health);
     return;
@@ -2491,22 +2851,27 @@ async function loadCompanionInterjectorConfig() {
   state.meetCompanion.loading = true;
   paintCompanionConfig(null);
   setCompanionResult("Loading effective settings…");
+  const requestedKey = companionConfigKey();
   try {
-    const data = await api(`${V1}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`);
-    if (companionMeetingKey(state.meetCompanion.meetingUrl) !== meetingUrl) return;
+    const raw = await api(companionConfigUrl());
+    if (companionConfigKey() !== requestedKey) return;
+    const data = normalizeCompanionConfig(raw, scope);
     rememberMeetKnownUrls(data.knownMeetingUrls || []);
+    syncCompanionTargetOptions(state.meetCompanion.health && state.meetCompanion.health.meetingUrl, data);
     state.meetCompanion.config = data;
-    state.meetCompanion.configMeetingUrl = meetingUrl;
+    state.meetCompanion.configKey = requestedKey;
     paintCompanionConfig(data);
     setCompanionResult(
-      data.source === "override"
-        ? "Showing this meeting’s persisted override."
-        : "Showing inherited defaults; saving creates an override.",
+      data.hasOverride
+        ? `Showing ${scope} override with field-level inheritance.`
+        : scope === "global"
+          ? "Showing saved global defaults."
+          : "Inherited from current global defaults; saving creates an override.",
     );
   } catch (error) {
-    if (companionMeetingKey(state.meetCompanion.meetingUrl) !== meetingUrl) return;
+    if (companionConfigKey() !== requestedKey) return;
     state.meetCompanion.config = null;
-    state.meetCompanion.configMeetingUrl = "";
+    state.meetCompanion.configKey = "";
     paintCompanionConfig(null);
     $("meet-companion-source").textContent = "Settings unavailable";
     $("meet-companion-source").className = "badge danger";
@@ -2516,91 +2881,158 @@ async function loadCompanionInterjectorConfig() {
   }
 }
 
-function companionPayload(meetingUrl) {
-  const form = $("meet-companion-form");
-  if (!form.checkValidity()) {
-    form.reportValidity();
-    throw new Error("Correct the highlighted setting values before saving.");
-  }
-  const values = {};
-  Object.entries(COMPANION_FIELD_MAP).forEach(([key, id]) => {
-    values[key] = $(id).valueAsNumber;
-  });
-  if (!(values.f0Hz < values.f1Hz && values.f1Hz < values.f2Hz)) {
-    throw new Error("Frequencies must be ordered f0 < F1 < F2.");
+async function companionPayload() {
+  const scope = companionScope();
+  if (scope === "global") throw new Error("Default Config is not an override. Use Save to defaults.");
+  const values = companionFormValues({ validate: true });
+  let defaults = state.meetCompanion.config && state.meetCompanion.config.globalDefault;
+  if (!defaults) {
+    defaults = normalizeCompanionConfig(
+      await api(companionConfigUrl("global")),
+      "global",
+    ).effective;
   }
   return {
-    meeting_url: meetingUrl,
-    enabled: $("meet-companion-enabled").checked,
-    interval_seconds: values.intervalSeconds,
-    mode: $("meet-companion-mode").value,
-    trigger: $("meet-companion-trigger").value,
-    after_seconds: values.afterSeconds,
-    silence_ms: values.silenceMs,
-    min_gap_seconds: values.minGapSeconds,
-    max_wait_seconds: values.maxWaitSeconds,
-    audio_rms_threshold: values.audioRmsThreshold,
-    click_ms: values.clickMs,
-    gain: values.gain,
-    phrase: $("meet-companion-sound").value,
-    sound: "uh",
-    f0_hz: values.f0Hz,
-    f1_hz: values.f1Hz,
-    f2_hz: values.f2Hz,
+    scope,
+    channel_key: scope === "channel"
+      ? companionTargetChannelKey()
+      : scope === "test"
+        ? companionTestChannelKey()
+        : undefined,
+    test_profile: scope === "test" ? state.meetCompanion.testProfile : undefined,
+    replace_override: true,
+    override: companionDelta(values, defaults),
   };
 }
 
 async function saveCompanionInterjector(event) {
   event.preventDefault();
-  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
-  if (!meetingUrl) {
-    setCompanionResult("Select a specific meeting before saving.", "error");
+  const scope = companionScope();
+  if (scope === "global") {
+    setCompanionResult("Default Config is not an override. Use Save to defaults.", "error");
     return;
   }
   let body;
   try {
-    body = companionPayload(meetingUrl);
+    body = await companionPayload();
   } catch (error) {
     setCompanionResult(error.message, "error");
     return;
   }
   $("meet-companion-fields").disabled = true;
-  setCompanionResult(`Saving override for ${meetRoomId(meetingUrl)}…`);
+  setCompanionResult(`Saving ${scope} configuration…`);
   try {
-    const data = await api(`${V1}/meet/companion-click`, { method: "POST", body });
-    if (companionMeetingKey(state.meetCompanion.meetingUrl) !== meetingUrl) return;
+    const data = normalizeCompanionConfig(
+      await api(`${V1}/meet/companion-click`, { method: "POST", body }),
+      scope,
+    );
     state.meetCompanion.config = data;
-    state.meetCompanion.configMeetingUrl = meetingUrl;
+    state.meetCompanion.configKey = companionConfigKey();
     paintCompanionConfig(data);
-    setCompanionResult(`Saved override for ${meetRoomId(meetingUrl)}.`, "ok");
+    setCompanionResult(
+      data.hasOverride ? "Saved override differences from current global defaults." : "No differences; this target now inherits global defaults.",
+      "ok",
+    );
   } catch (error) {
-    setCompanionResult(`Could not save ${meetRoomId(meetingUrl)}: ${error.message}`, "error");
-    paintCompanionConfig(state.meetCompanion.configMeetingUrl === meetingUrl ? state.meetCompanion.config : null);
+    setCompanionResult(`Could not save override: ${error.message}`, "error");
+    paintCompanionConfig(state.meetCompanion.configKey === companionConfigKey() ? state.meetCompanion.config : null);
   }
 }
 
 async function resetCompanionInterjector() {
-  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
-  if (!meetingUrl) {
-    setCompanionResult("Select a specific meeting before resetting.", "error");
+  const scope = companionScope();
+  if (scope === "global") {
+    $("meet-companion-fields").disabled = true;
+    setCompanionResult("Reloading saved global defaults…");
+    try {
+      const data = normalizeCompanionConfig(
+        await api(companionConfigUrl("global")),
+        "global",
+      );
+      state.meetCompanion.config = data;
+      state.meetCompanion.configKey = "global";
+      paintCompanionConfig(data);
+      setCompanionResult("Reloaded saved global defaults; unsaved edits were discarded.", "ok");
+    } catch (error) {
+      setCompanionResult(`Could not reload saved global defaults: ${error.message}`, "error");
+      paintCompanionConfig(state.meetCompanion.config);
+    }
     return;
   }
-  const room = meetRoomId(meetingUrl);
-  if (!confirm(`Remove the companion interjector override for ${room} and use inherited defaults?`)) return;
+  const config = state.meetCompanion.config;
+  if (config && config.hasOverride && !confirm(
+    `Reset from defaults deletes this ${scope} override. Continue?`,
+  )) return;
   $("meet-companion-fields").disabled = true;
-  setCompanionResult(`Removing override for ${room}…`);
+  setCompanionResult(`Deleting ${scope} override…`);
   try {
-    const data = await api(`${V1}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`, {
-      method: "DELETE",
-    });
-    if (companionMeetingKey(state.meetCompanion.meetingUrl) !== meetingUrl) return;
+    const data = normalizeCompanionConfig(
+      await api(companionConfigUrl(), { method: "DELETE" }),
+      scope,
+    );
     state.meetCompanion.config = data;
-    state.meetCompanion.configMeetingUrl = meetingUrl;
+    state.meetCompanion.configKey = companionConfigKey();
     paintCompanionConfig(data);
-    setCompanionResult(`Override removed for ${room}; inherited defaults are active.`, "ok");
+    setCompanionResult("Override deleted; current global defaults are inherited immediately.", "ok");
   } catch (error) {
-    setCompanionResult(`Could not reset ${room}: ${error.message}`, "error");
-    paintCompanionConfig(state.meetCompanion.configMeetingUrl === meetingUrl ? state.meetCompanion.config : null);
+    setCompanionResult(`Could not reset from defaults: ${error.message}`, "error");
+    paintCompanionConfig(state.meetCompanion.configKey === companionConfigKey() ? state.meetCompanion.config : null);
+  }
+}
+
+async function saveCompanionToDefaults() {
+  const scope = companionScope();
+  let values;
+  try {
+    values = companionFormValues({ validate: true });
+  } catch (error) {
+    setCompanionResult(error.message, "error");
+    return;
+  }
+  if (
+    scope !== "global"
+    && !confirm("Save this target's effective settings to global defaults? This affects every inheriting test and channel.")
+  ) return;
+  $("meet-companion-fields").disabled = true;
+  setCompanionResult("Saving global defaults…");
+  try {
+    const data = normalizeCompanionConfig(
+      await api(`${V1}/meet/companion-click`, {
+        method: "POST",
+        body: { scope: "global", replace_override: true, override: values },
+      }),
+      "global",
+    );
+    if (scope === "global") {
+      state.meetCompanion.config = data;
+      state.meetCompanion.configKey = "global";
+      paintCompanionConfig(data);
+    } else {
+      await loadCompanionInterjectorConfig();
+    }
+    setCompanionResult(
+      "Saved to global defaults; existing test and channel override patches were preserved.",
+      "ok",
+    );
+  } catch (error) {
+    setCompanionResult(`Could not save to defaults: ${error.message}`, "error");
+    paintCompanionConfig(state.meetCompanion.configKey === companionConfigKey() ? state.meetCompanion.config : null);
+  }
+}
+
+async function restoreCompanionBuiltInDefaults() {
+  if (!confirm(
+    "Restore built-in defaults as the saved global defaults? Existing channel and test override patches remain.",
+  )) return;
+  $("meet-companion-fields").disabled = true;
+  setCompanionResult("Restoring built-in defaults…");
+  try {
+    await api(companionConfigUrl("global"), { method: "DELETE" });
+    await loadCompanionInterjectorConfig();
+    setCompanionResult("Built-in values restored as global defaults; scoped overrides were preserved.", "ok");
+  } catch (error) {
+    setCompanionResult(`Could not restore built-in defaults: ${error.message}`, "error");
+    paintCompanionConfig(state.meetCompanion.configKey === companionConfigKey() ? state.meetCompanion.config : null);
   }
 }
 
@@ -2608,10 +3040,155 @@ function companionMetricValue(value, suffix = "") {
   return value === null || value === undefined || value === "" ? "\u2014" : `${value}${suffix}`;
 }
 
+const COMPANION_CABLE_SELECTS = {
+  receive_playback_sink: "companion-cable-receive-playback",
+  receive_capture_input: "companion-cable-receive-capture",
+  transmit_tts_output: "companion-cable-transmit-output",
+  transmit_companion_mic: "companion-cable-transmit-mic",
+};
+
+function companionCableDeviceLabel(device) {
+  const capability = [
+    device.supports_output ? "PLAYBACK" : "",
+    device.supports_input ? "RECORDING" : "",
+  ].filter(Boolean).join("+");
+  return `${device.name} — ${device.host_api} · ${capability} · index ${device.backend_index} · ${device.id}`;
+}
+
+function renderCompanionCableWiring(health = state.meetCompanion.health) {
+  const payload = state.companionCableWiring.payload;
+  if (!payload) return;
+  const config = payload.config || {};
+  const virtualDevices = (payload.devices || []).filter((device) => (device.classes || []).includes("virtual"));
+  Object.entries(COMPANION_CABLE_SELECTS).forEach(([key, id]) => {
+    const select = $(id);
+    if (!select || state.companionCableWiring.dirty) return;
+    const wantsOutput = key === "receive_playback_sink" || key === "transmit_tts_output";
+    const choices = virtualDevices.filter((device) => wantsOutput ? device.supports_output : device.supports_input);
+    const selected = config[key] && config[key].serverDeviceId;
+    select.replaceChildren(
+      el("option", "", "Choose exact virtual endpoint…"),
+      ...choices.map((device) => {
+        const option = el("option", "", companionCableDeviceLabel(device));
+        option.value = device.id;
+        option.selected = device.id === selected;
+        return option;
+      }),
+    );
+  });
+  const applied = (health && health.companionCableWiring) || payload.applied || {};
+  const activeMeeting = companionMeetingKey(health && health.meetingUrl);
+  const selectedMeeting = companionMeetingKey(state.meetCompanion.meetingUrl);
+  const companion = ((health && health.clients) || []).find((client) => client.role === "companion");
+  const endpointsValid = !!(payload.validation && payload.validation.valid);
+  const connected = !!activeMeeting && (!selectedMeeting || activeMeeting === selectedMeeting)
+    && !!companion && companion.state === "in-call";
+  const wire = $("companion-cable-wire");
+  const disconnect = $("companion-cable-disconnect");
+  if (wire) {
+    wire.disabled = !(endpointsValid && connected);
+    wire.textContent = applied.wired ? "Re-wire now" : "Wire now";
+    wire.title = wire.disabled
+      ? (!endpointsValid ? "Save four valid, non-overlapping virtual endpoints first." : "The selected companion must be connected and in-call.")
+      : "Apply the saved four endpoints to the current companion.";
+  }
+  if (disconnect) disconnect.disabled = !applied.wired && applied.phase !== "failed";
+  const validationErrors = (payload.validation && payload.validation.errors) || [];
+  $("companion-cable-eligibility").textContent = endpointsValid && connected
+    ? "Ready to apply to the current in-call companion. Wiring is fail-closed and RECEIVE remains muted until capture verifies healthy."
+    : validationErrors.length
+      ? `Not ready: ${validationErrors.join("; ")}`
+      : "Not ready: select the currently active channel and wait for its companion to be in-call.";
+  const desired = applied.desired || config;
+  const actual = applied.actual || {};
+  const statusTarget = $("companion-cable-status");
+  if (statusTarget) statusTarget.replaceChildren(
+    silencesMetric("Wiring phase", companionMetricValue(applied.phase || "unwired")),
+    silencesMetric("Meeting / tab", `${companionMetricValue(applied.meetingUrl)} · ${companionMetricValue(applied.tabId)}`),
+    silencesMetric("Applied reason", companionMetricValue(applied.reason)),
+    silencesMetric("Wired at", applied.wiredAt ? new Date(applied.wiredAt * 1000).toISOString() : "—"),
+    silencesMetric("Retry count", companionMetricValue(applied.retryCount, " / 3")),
+    silencesMetric("RECEIVE playback desired", companionMetricValue(desired && desired.receive_playback_sink && desired.receive_playback_sink.label)),
+    silencesMetric("RECEIVE playback actual", companionMetricValue(actual.receivePlaybackSink && actual.receivePlaybackSink.actualLabel)),
+    silencesMetric("RECEIVE capture desired", companionMetricValue(desired && desired.receive_capture_input && desired.receive_capture_input.label)),
+    silencesMetric("RECEIVE capture actual", companionMetricValue(actual.receiveCaptureInput && (actual.receiveCaptureInput.deviceName || actual.receiveCaptureInput.deviceId))),
+    silencesMetric("TRANSMIT TTS desired", companionMetricValue(desired && desired.transmit_tts_output && desired.transmit_tts_output.label)),
+    silencesMetric("TRANSMIT TTS actual", companionMetricValue(actual.transmitTtsOutput && actual.transmitTtsOutput.actual && `${actual.transmitTtsOutput.actual.name} · ${actual.transmitTtsOutput.actual.hostApi} · index ${actual.transmitTtsOutput.actual.index}`)),
+    silencesMetric("TRANSMIT mic desired", companionMetricValue(desired && desired.transmit_companion_mic && desired.transmit_companion_mic.label)),
+    silencesMetric("TRANSMIT mic actual", companionMetricValue(actual.transmitCompanionMic && actual.transmitCompanionMic.actualLabel)),
+    silencesMetric("Sink / mic / TTS verified", `${applied.sinkVerified ? "yes" : "no"} / ${applied.micVerified ? "yes" : "no"} / ${applied.ttsOutputVerified ? "yes" : "no"}`),
+    silencesMetric("Capture health", applied.captureHealth && applied.captureHealth.live_capture
+      ? `live · RMS ${applied.captureHealth.meter_level ?? "—"} · chunks ${applied.captureHealth.chunks_forwarded ?? 0}`
+      : "not healthy"),
+    silencesMetric("Silence decision source", companionMetricValue(applied.detectorSource || "unknown")),
+    silencesMetric("Feedback-safe state", applied.feedbackSafe
+      ? (applied.feedbackSafeMuted ? "muted fail-closed" : "virtual sink verified before unmute")
+      : "unsafe"),
+    silencesMetric("Last error", companionMetricValue(applied.lastError)),
+  );
+}
+
+async function loadCompanionCableWiring() {
+  if (state.companionCableWiring.loading) return;
+  state.companionCableWiring.loading = true;
+  try {
+    state.companionCableWiring.payload = await api(`${V1}/meet/companion-cable-wiring`);
+    state.companionCableWiring.dirty = false;
+    renderCompanionCableWiring();
+  } catch (error) {
+    $("companion-cable-result").textContent = `Could not load wiring: ${error.message}`;
+  } finally {
+    state.companionCableWiring.loading = false;
+  }
+}
+
+async function saveCompanionCableWiring() {
+  const body = {};
+  Object.entries(COMPANION_CABLE_SELECTS).forEach(([key, id]) => { body[key] = $(id).value; });
+  $("companion-cable-result").textContent = "Saving only; no audio will be unmuted…";
+  try {
+    state.companionCableWiring.payload = await api(`${V1}/meet/companion-cable-wiring`, { method: "POST", body });
+    state.companionCableWiring.dirty = false;
+    $("companion-cable-result").textContent = "Saved. Use Wire now to apply.";
+    renderCompanionCableWiring();
+  } catch (error) {
+    $("companion-cable-result").textContent = `Not saved: ${error.message}`;
+  }
+}
+
+async function applyCompanionCableWiring() {
+  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
+  $("companion-cable-result").textContent = "Wiring fail-closed…";
+  try {
+    const result = await api(`${V1}/meet/companion-cable-wiring/wire`, {
+      method: "POST", body: { meeting_url: meetingUrl },
+    });
+    $("companion-cable-result").textContent = result.idempotent ? "Already wired and verified." : "Wired and verified.";
+    await loadSilencesCompanionStatus();
+  } catch (error) {
+    $("companion-cable-result").textContent = `Wiring failed; RECEIVE remains muted: ${error.message}`;
+    await loadSilencesCompanionStatus();
+  }
+}
+
+async function disconnectCompanionCableWiring() {
+  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
+  try {
+    await api(`${V1}/meet/companion-cable-wiring/disconnect`, {
+      method: "POST", body: { meeting_url: meetingUrl },
+    });
+    $("companion-cable-result").textContent = "Disconnected; remote media and cable mic are muted.";
+    await loadSilencesCompanionStatus();
+  } catch (error) {
+    $("companion-cable-result").textContent = `Disconnect failed: ${error.message}`;
+  }
+}
+
 function renderCompanionMetrics(health) {
   const target = $("meet-companion-metrics");
   if (!target) return;
   state.meetCompanion.health = health || null;
+  renderCompanionCableWiring(health);
   const selected = companionMeetingKey(state.meetCompanion.meetingUrl);
   const active = companionMeetingKey(health && health.meetingUrl);
   const sameMeeting = !!selected && selected === active;
@@ -2630,6 +3207,7 @@ function renderCompanionMetrics(health) {
   else if (sameMeeting && !runtime) status = "Runtime metrics unavailable (older worker)";
   else if (runtime && !runtime.enabled) status = "Disabled";
   else if (runtime && runtime.lastError) status = "Error";
+  else if (runtime && runtime.action === "continue" && runtime.companionReady) status = "Eligible · monitoring floor";
   else if (runtime && runtime.installed) status = "Eligible · monitoring";
   else if (runtime) status = "Enabled · waiting for companion";
   const lastTime = runtime && (runtime.lastClickIso
@@ -2637,6 +3215,14 @@ function renderCompanionMetrics(health) {
   target.replaceChildren(
     silencesMetric("Status / eligibility", status),
     silencesMetric("Backchannels sent", companionMetricValue(runtime && runtime.clicksSent)),
+    silencesMetric("Actions evaluated", companionMetricValue(runtime && runtime.actionEvaluated)),
+    silencesMetric("Say nothing no-ops", companionMetricValue(runtime && runtime.noOpSelections)),
+    silencesMetric("Floor grants", companionMetricValue(runtime && runtime.floorGrantCount)),
+    silencesMetric("Floor open", runtime ? (runtime.floorOpen ? "Available" : "Closed") : "\u2014"),
+    silencesMetric("Floor granted to", companionMetricValue(runtime && runtime.floorGrantedTo)),
+    silencesMetric("Floor deferred", companionMetricValue(runtime && runtime.floorDeferredCount)),
+    silencesMetric("Last deferred reason", companionMetricValue(runtime && runtime.lastDeferredReason)),
+    silencesMetric("Last action", companionMetricValue(runtime && runtime.lastAction)),
     silencesMetric("Suppressed / skipped", companionMetricValue(runtime && runtime.suppressed)),
     silencesMetric("Row breaks observed", companionMetricValue(runtime && runtime.rowBreaksObserved)),
     silencesMetric("Phrase last sent", companionMetricValue(runtime && (runtime.lastPhrase || runtime.phrase))),
@@ -3215,7 +3801,8 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
   const meetingEls = [];
 
   groups.forEach(({ url, captions, kind }) => {
-    const isCurrent = url === currentUrl;
+    const stableChannelUrl = deletableMeetChannelUrl(url);
+    const isCurrent = !!stableChannelUrl && stableChannelUrl === deletableMeetChannelUrl(currentUrl);
     const isClient = kind === "client";
     const meeting = el("details");
     meeting.dataset.url = url;
@@ -3230,13 +3817,15 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     summary.appendChild(mono(isCurrent ? (isClient ? "  · current" : "  · (COMPUTER)") : "  · (AVAILABLE)"));
     summary.appendChild(badge(isClient ? "CLIENT" : "DRIVER", isClient ? "warn" : ""));
     summary.appendChild(badge(probeLocation(isCurrent, bridgeOnline), isCurrent && bridgeOnline ? "ok" : ""));
-    summary.appendChild(document.createTextNode(" "));
+    const actions = el("span", "meet-card-actions");
+    actions.setAttribute("aria-label", "Meeting actions");
+    actions.appendChild(el("span", "meet-actions-label", "Actions"));
     const connectBtn = actionButton(isCurrent && bridgeOnline ? "Rejoin" : "Connect", "primary", (e) => {
       e.stopPropagation();
       postMeetCommand(`/join ${url}`);
     });
     connectBtn.title = "Connect the live driver to this meeting (same action as the Connector agents row buttons).";
-    summary.appendChild(connectBtn);
+    actions.appendChild(connectBtn);
     const accountsBtn = actionButton("Accounts", "mini", (e) => {
       e.stopPropagation();
       state.meetAssignmentScope = url;
@@ -3244,7 +3833,28 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
       $("meet-role-settings").scrollIntoView({ behavior: "smooth", block: "start" });
     });
     accountsBtn.title = "Set HOST and COMPANION account overrides for this meeting.";
-    summary.appendChild(accountsBtn);
+    actions.appendChild(accountsBtn);
+    if (stableChannelUrl) {
+      const deleteBtn = actionButton("Delete", "mini danger", (e) => {
+        e.stopPropagation();
+        forgetMeetChannel(stableChannelUrl);
+      });
+      deleteBtn.disabled = isCurrent;
+      deleteBtn.title = isCurrent
+        ? "Leave or switch meetings before deleting"
+        : "Delete this meeting and its scoped settings while preserving transcript, caption, and event history.";
+      deleteBtn.setAttribute(
+        "aria-label",
+        isCurrent
+          ? `Delete ${meetRoomId(stableChannelUrl)} (Leave or switch meetings before deleting)`
+          : `Delete meeting ${meetRoomId(stableChannelUrl)}`,
+      );
+      const deleteWrap = el("span", "meet-delete-action");
+      deleteWrap.title = deleteBtn.title;
+      deleteWrap.appendChild(deleteBtn);
+      actions.appendChild(deleteWrap);
+    }
+    summary.appendChild(actions);
     meeting.appendChild(summary);
 
     const us = meetUsRows(isCurrent, clients, url, hostProfile, (meetingState || {})[meetRoomId(url)], kind);
@@ -3402,12 +4012,22 @@ async function loadMeet() {
     el("span", "mini-label", "Show:"),
     meetKindToggle("driver", "Driver"),
     meetKindToggle("client", "Client"),
-    actionButton("Clear all", "mini", clearAllMeetSections),
+    actionButton("Clear displayed data", "mini", clearAllMeetSections),
     autoBtn,
     el("span", "mini-label", "Exact"),
     exactAll,
   );
   let health;
+  try {
+    const channels = await api(`${V1}/meet/channels`);
+    state.meetForgottenUrls = (channels.forgotten || []).map(meetAssignmentKey);
+    const forgotten = new Set(state.meetForgottenUrls);
+    state.meetKnownUrls = (channels.known || [])
+      .map(meetAssignmentKey)
+      .filter((url) => url && !forgotten.has(url));
+  } catch (_error) {
+    // The bridge/status view remains useful if this auxiliary discovery call fails.
+  }
   try {
     const capture = await api(`${V1}/audio/capture`);
     state.meetCaptureListening = !!capture.listening;
@@ -3421,22 +4041,26 @@ async function loadMeet() {
       `run "ws-collab-meet-bridge" (or "python -m ws_collab.meet_bridge")`;
     if (dot) { dot.classList.remove("ok"); dot.classList.add("danger"); }
     $("meet-bridge-card").textContent = "Bridge unreachable.";
-    syncCompanionMeetingOptions("");
+    syncCompanionTargetOptions("");
     renderCompanionMetrics(null);
-    // Still show the known default driver meetings as placeholders (all
-    // correctly "not current" while the bridge itself is down) so the
-    // intended meetings stay visible instead of the section going blank.
-    renderMeetTree($("meet-driver-tree"), [
-      ...state.meetKnownUrls
-        .filter((url) => !DEFAULT_CLIENT_MEETING_URLS.map(meetAssignmentKey).includes(meetAssignmentKey(url)))
-        .map((url) => ({ url, captions: [], kind: "driver" })),
-      ...DEFAULT_CLIENT_MEETING_URLS.map((url) => ({ url, captions: [], kind: "client" })),
-    ], null, [], [], [], false, 0, null, {}, []);
+    // Before discovery completes, the in-memory defaults are placeholders.
+    // Once /meet/channels has answered, state.meetKnownUrls is authoritative;
+    // never append hardcoded defaults here or tombstoned rows would reappear.
+    const clientUrls = new Set(DEFAULT_CLIENT_MEETING_URLS.map(meetAssignmentKey));
+    renderMeetTree(
+      $("meet-driver-tree"),
+      state.meetKnownUrls.map((url) => ({
+        url,
+        captions: [],
+        kind: clientUrls.has(meetAssignmentKey(url)) ? "client" : "driver",
+      })),
+      null, [], [], [], false, 0, null, {}, [],
+    );
     return;
   }
   if (dot) { dot.classList.toggle("ok", !!health.ok); dot.classList.toggle("danger", !health.ok); }
   statusLine.textContent = health.meetingUrl ? `bridge online — ${health.meetingUrl}` : "bridge online — no meeting";
-  syncCompanionMeetingOptions(health.meetingUrl);
+  syncCompanionTargetOptions(health.meetingUrl);
   renderCompanionMetrics(health);
   const hostProfileLabel = ssoLabel(health.hostProfile);
   const paintBridgeCard = (captionData) => {
@@ -3471,8 +4095,10 @@ async function loadMeet() {
     // Non-fatal — the meeting tree still renders without the Virtual agents list.
   }
   const byMeeting = new Map();
+  const forgottenMeetings = new Set(state.meetForgottenUrls.map(meetAssignmentKey));
   (capData.captions || []).forEach((c) => {
     const key = c.meetingUrl ? meetAssignmentKey(c.meetingUrl) : "(unknown meeting)";
+    if (forgottenMeetings.has(key)) return;
     if (!byMeeting.has(key)) byMeeting.set(key, []);
     byMeeting.get(key).push(c);
   });
@@ -3696,6 +4322,8 @@ function renderSilencesPage(options = {}) {
   $("sil-stop").disabled = !state.silences.running;
   $("sil-test").disabled = state.silences.running;
   $("sil-first-role").disabled = state.silences.running;
+  const continueSelected = $("meet-companion-action").value === "continue";
+  $("sil-drive-next").disabled = !state.silences.running || !continueSelected;
   setSilencesAutoscroll(silencesAutoscrollOn());
   const captionData = state.silences.lastCaptionData;
   $("sil-transport-line").textContent = captionData
@@ -3721,8 +4349,12 @@ async function silencesPollCaptions() {
   captions.forEach((caption) => {
     if (logic.scoreCaption(run, caption)) scored += 1;
   });
+  await driveNextSilenceAgentTurn();
   const stats = logic.summarizeRun(run);
-  if (stats.completed >= stats.total) state.silences.running = false;
+  if (stats.completed >= stats.total) {
+    state.silences.running = false;
+    await endSilencesTestSession();
+  }
   $("sil-status").textContent = state.silences.running
     ? `running · ${scored} new scored turn${scored === 1 ? "" : "s"}`
     : (stats.completed >= stats.total ? "complete" : "stopped");
@@ -3736,11 +4368,45 @@ async function loadSilencesCompanionStatus() {
   } catch (_error) {
     // Older/offline workers are represented by the absence-safe metrics below.
   }
-  syncCompanionMeetingOptions(health && health.meetingUrl);
+  syncCompanionTargetOptions(health && health.meetingUrl);
   renderCompanionMetrics(health);
-  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
-  if (meetingUrl && state.meetCompanion.configMeetingUrl !== meetingUrl && !state.meetCompanion.loading) {
+  if (!state.companionCableWiring.payload && !state.companionCableWiring.loading) {
+    await loadCompanionCableWiring();
+  }
+  const configKey = companionConfigKey();
+  if (
+    (companionScope() !== "channel" || companionTargetChannelKey())
+    && state.meetCompanion.configKey !== configKey
+    && !state.meetCompanion.loading
+  ) {
     await loadCompanionInterjectorConfig();
+  }
+}
+
+async function renewSilencesTestSession() {
+  const run = state.silences.run;
+  const meetingUrl = companionMeetingKey(
+    (run && run.meetingUrl) || state.meetCompanion.meetingUrl,
+  );
+  if (!run || !meetingUrl) return;
+  run.meetingUrl = meetingUrl;
+  await api(`${V1}/meet/companion-click/test-session`, {
+    method: "POST",
+    body: { test_profile: run.testId, channel_key: meetingUrl },
+  });
+}
+
+async function endSilencesTestSession(run = state.silences.run) {
+  try {
+    const params = new URLSearchParams({
+      test_profile: (run && run.testId) || state.meetCompanion.testProfile,
+      channel_key: companionMeetingKey(
+        (run && run.meetingUrl) || state.meetCompanion.meetingUrl,
+      ),
+    });
+    await api(`${V1}/meet/companion-click/test-session?${params}`, { method: "DELETE" });
+  } catch (_error) {
+    // The five-second lease also prevents a disconnected test UI leaking into production.
   }
 }
 
@@ -3748,6 +4414,8 @@ function resetSilencesRun() {
   const logic = silencesLogic();
   if (!logic) return;
   state.silences.running = false;
+  const previousRun = state.silences.run;
+  endSilencesTestSession(previousRun);
   state.silences.lastCaptionData = null;
   state.silences.pendingRender = false;
   state.silences.run = logic.createRun({
@@ -3755,36 +4423,78 @@ function resetSilencesRun() {
     firstRole: $("sil-first-role").value,
     startedAtSec: Date.now() / 1000,
   });
+  state.silences.run.meetingUrl = companionTestChannelKey();
   $("sil-status").textContent = "ready";
   renderSilencesPage({ force: true });
 }
 
-function startSilencesRun() {
+async function startSilencesRun() {
   const logic = silencesLogic();
   if (!logic) return;
-  state.silences.running = true;
   state.silences.lastCaptionData = null;
   state.silences.run = logic.createRun({
     testId: $("sil-test").value,
     firstRole: $("sil-first-role").value,
     startedAtSec: Date.now() / 1000,
   });
+  state.silences.run.meetingUrl = companionTestChannelKey();
+  if (companionMeetingKey(state.meetCompanion.meetingUrl)) {
+    try {
+      await renewSilencesTestSession();
+    } catch (error) {
+      $("sil-status").textContent = `test configuration error: ${error.message}`;
+      return;
+    }
+  }
+  state.silences.running = true;
   $("sil-status").textContent = "running";
   renderSilencesPage({ force: true });
+  try {
+    await driveNextSilenceAgentTurn();
+  } catch (error) {
+    $("sil-status").textContent = `agent queue error: ${error.message}`;
+  }
   if (!state.silences.polling) {
     state.silences.polling = true;
     silencesPollOnce();
   }
 }
 
-function stopSilencesRun() {
+async function stopSilencesRun() {
   state.silences.running = false;
+  await endSilencesTestSession();
   $("sil-status").textContent = "stopped";
   renderSilencesPage();
 }
 
-function driveNextSilenceAgentTurn() {
-  // SEAM for queued task agent-voices-via-companion: speak the current expected token here.
+async function driveNextSilenceAgentTurn() {
+  const logic = silencesLogic();
+  const run = state.silences.run;
+  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
+  if (
+    !logic || !run || !state.silences.running || !meetingUrl
+    || $("meet-companion-action").value !== "continue"
+  ) return;
+  const test = logic.TESTS[run.testId] || logic.TESTS.count20;
+  if (run.nextIndex >= test.tokens.length) return;
+  const role = logic.expectedRoleFor(run.nextIndex, run.firstRole);
+  if (role !== "companion" || run.floorQueuedIndex === run.nextIndex) return;
+  const queuedIndex = run.nextIndex;
+  const result = await api(`${V1}/meet/floor/queue`, {
+    method: "POST",
+    body: {
+      meeting_url: meetingUrl,
+      test_profile: run.testId,
+      agent_id: "companion",
+      role,
+      text: test.tokens[queuedIndex],
+      correlation_id: `silence-test:${run.testId}:${queuedIndex}`,
+    },
+  });
+  run.floorQueuedIndex = queuedIndex;
+  $("sil-status").textContent = result.waiting_for_floor
+    ? `running · agent turn ${queuedIndex + 1} queued for silence`
+    : `running · floor already open; agent turn ${queuedIndex + 1} released`;
 }
 
 function silencesPollOnce() {
@@ -3794,7 +4504,10 @@ function silencesPollOnce() {
     return;
   }
   const refresh = state.silences.running
-    ? Promise.all([silencesPollCaptions(), loadSilencesCompanionStatus()])
+    ? renewSilencesTestSession().then(() => Promise.all([
+      silencesPollCaptions(),
+      loadSilencesCompanionStatus(),
+    ]))
     : loadSilencesCompanionStatus();
   refresh.catch((error) => {
     $("sil-status").textContent = `caption feed error: ${error.message}`;
@@ -4789,20 +5502,71 @@ function wireEvents() {
     if (!text) { pushError("Enter text to speak into the meeting."); return; }
     postMeetCommand(`/say ${text}`);
   };
-  $("meet-companion-meeting").onchange = () => {
-    state.meetCompanion.meetingUrl = companionMeetingKey($("meet-companion-meeting").value);
-    $("meet-companion-meeting").dataset.signature = "";
-    syncCompanionMeetingOptions(state.meetCompanion.health && state.meetCompanion.health.meetingUrl);
+  $("meet-companion-target").onchange = () => {
+    const select = $("meet-companion-target");
+    const nextTarget = select.value;
+    if (
+      nextTarget !== state.meetCompanion.target
+      && companionFormIsDirty()
+      && !confirm("Discard unsaved Silence configuration changes and switch targets?")
+    ) {
+      select.value = state.meetCompanion.target;
+      return;
+    }
+    state.meetCompanion.target = nextTarget;
+    if (companionScope() === "channel") {
+      const option = select.selectedOptions[0];
+      const channelUrl = companionMeetingKey(option && option.dataset.channelUrl);
+      if (channelUrl) state.meetCompanion.meetingUrl = channelUrl;
+    }
+    updateCompanionTargetControls();
+    state.meetCompanion.configKey = "";
     loadCompanionInterjectorConfig();
     renderCompanionMetrics(state.meetCompanion.health);
   };
+  syncCompanionTargetOptions();
+  updateCompanionTargetControls();
   $("meet-companion-form").onsubmit = saveCompanionInterjector;
+  $("companion-cable-save").onclick = saveCompanionCableWiring;
+  $("companion-cable-wire").onclick = applyCompanionCableWiring;
+  $("companion-cable-disconnect").onclick = disconnectCompanionCableWiring;
+  Object.values(COMPANION_CABLE_SELECTS).forEach((id) => {
+    $(id).onchange = () => {
+      state.companionCableWiring.dirty = true;
+      $("companion-cable-eligibility").textContent = "Unsaved endpoint changes. Save validates that RECEIVE and TRANSMIT are different virtual cables.";
+      $("companion-cable-wire").disabled = true;
+    };
+  });
   $("meet-companion-reset").onclick = resetCompanionInterjector;
+  $("meet-companion-save-defaults").onclick = saveCompanionToDefaults;
+  $("meet-companion-restore-builtins").onclick = restoreCompanionBuiltInDefaults;
   $("meet-companion-mode").onchange = updateCompanionConditionalFields;
+  $("meet-companion-action").onchange = updateCompanionConditionalFields;
+  $("meet-companion-form").addEventListener("input", refreshCompanionDraftState);
+  $("meet-companion-form").addEventListener("change", refreshCompanionDraftState);
   $("sil-start").onclick = startSilencesRun;
   $("sil-stop").onclick = stopSilencesRun;
   $("sil-reset").onclick = resetSilencesRun;
-  $("sil-test").onchange = resetSilencesRun;
+  $("sil-test").onchange = () => {
+    const scenario = $("sil-test");
+    const nextProfile = scenario.value;
+    if (
+      companionScope() === "test"
+      && nextProfile !== state.meetCompanion.testProfile
+      && companionFormIsDirty()
+      && !confirm("Discard unsaved Tests here changes and switch test scenarios?")
+    ) {
+      scenario.value = state.meetCompanion.testProfile;
+      return;
+    }
+    state.meetCompanion.testProfile = nextProfile;
+    syncCompanionTargetOptions(state.meetCompanion.health && state.meetCompanion.health.meetingUrl);
+    if (companionScope() === "test") {
+      state.meetCompanion.configKey = "";
+      loadCompanionInterjectorConfig();
+    }
+    resetSilencesRun();
+  };
   $("sil-first-role").onchange = resetSilencesRun;
   $("sil-autoscroll").onclick = () => {
     const next = !silencesAutoscrollOn();
@@ -4814,7 +5578,9 @@ function wireEvents() {
     if (sel) sel.removeAllRanges();
     renderSilencesTurns(silencesRun(), { force: true });
   };
-  $("sil-drive-next").onclick = driveNextSilenceAgentTurn;
+  $("sil-drive-next").onclick = () => driveNextSilenceAgentTurn().catch((error) => {
+    $("sil-status").textContent = `agent queue error: ${error.message}`;
+  });
   $("sil-turns").addEventListener("mouseleave", () => {
     if (state.silences.pendingRender && !silencesScrolledUp() && !hasSelectionIn("sil-turns")) {
       renderSilencesTurns(silencesRun(), { force: true });

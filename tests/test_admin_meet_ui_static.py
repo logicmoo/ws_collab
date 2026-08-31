@@ -48,9 +48,9 @@ def test_meet_page_links_to_silences_as_the_only_backchannel_editor() -> None:
     assert "Automatic companion backchannels are configured and monitored on" in meet_page
     assert '<a href="#silences">Silences</a>' in meet_page
     assert 'id="meet-companion-form"' not in meet_page
-    assert '<label for="meet-companion-meeting">Exact meeting</label>' in index
+    assert '<label for="meet-companion-target">Configuration target</label>' in index
     assert "companionMeetingKey(state.meetCompanion.meetingUrl)" in source
-    assert "Select a specific meeting before saving." in source
+    assert "companionTargetChannelKey()" in source
 
 
 def test_sso_browser_page_loads_and_saves_accessible_consent_toggle() -> None:
@@ -66,40 +66,83 @@ def test_sso_browser_page_loads_and_saves_accessible_consent_toggle() -> None:
     assert "every navigation is still logged" in source
 
 
-def test_companion_interjector_uses_existing_routes_and_exact_payload_keys() -> None:
+def test_companion_interjector_uses_existing_scoped_routes_and_payload() -> None:
     source = _source()
 
     assert 'api(`${V1}/meet/companion-click?meeting_url=${encodeURIComponent(meetingUrl)}`)' in source
-    assert 'api(`${V1}/meet/companion-click`, { method: "POST", body })' in source
+    assert "await api(`${V1}/meet/companion-click`, { method: \"POST\", body })" in source
     assert 'method: "DELETE"' in source
-    assert "Remove the companion interjector override for ${room}" in source
     for key in (
-        "meeting_url",
         "enabled",
-        "interval_seconds",
+        "action",
+        "intervalSeconds",
         "mode",
         "trigger",
-        "after_seconds",
-        "silence_ms",
-        "min_gap_seconds",
-        "max_wait_seconds",
-        "audio_rms_threshold",
-        "click_ms",
+        "afterSeconds",
+        "silenceMs",
+        "minGapSeconds",
+        "maxWaitSeconds",
+        "audioRmsThreshold",
+        "clickMs",
         "gain",
-        "sound",
-        "phrase",
-        "f0_hz",
-        "f1_hz",
-        "f2_hz",
+        "f0Hz",
+        "f1Hz",
+        "f2Hz",
     ):
         assert f"{key}:" in source
+
+
+def test_meet_admin_has_delete_action_for_driver_and_client_cards() -> None:
+    source = _source()
+
+    assert 'actions.setAttribute("aria-label", "Meeting actions")' in source
+    assert 'actionButton("Delete", "mini danger"' in source
+    assert "if (stableChannelUrl)" in source
+    assert 'kind: clientUrls.has(meetAssignmentKey(url)) ? "client" : "driver"' in source
+    assert "Leave or switch meetings before deleting" in source
+    assert "deleteBtn.disabled = isCurrent" in source
+
+
+def test_meet_admin_confirms_and_calls_durable_channel_delete() -> None:
+    source = _source()
+
+    assert "Delete meeting ${code} (${key})?" in source
+    assert "removes it from the Driver/Client lists and deletes its per-channel role and Silence overrides" in source
+    assert "Transcript, caption, and event history is preserved." in source
+    assert "/meet/channels/forget" in source
+    assert "body: { meeting_url: key }" in source
+    assert "error.status === 405" in source
+    assert "Restart/update the server" in source
+    assert "MEET_BRIDGE_BASE}/command" not in source.split("async function forgetMeetChannel", 1)[1].split(
+        "function meetRoleOverride", 1
+    )[0]
+    assert 'actionButton("Clear displayed data", "mini", clearAllMeetSections)' in source
+
+
+def test_meet_admin_reconciles_delete_without_resurrecting_defaults() -> None:
+    source = _source()
+    delete_source = source.split("async function forgetMeetChannel", 1)[1].split(
+        "function meetRoleOverride", 1
+    )[0]
+    offline_source = source.split(
+        "// Before discovery completes, the in-memory defaults are placeholders.", 1
+    )[1].split("return;", 1)[0]
+
+    assert "removeMeetChannelFromRenderedList(key)" in delete_source
+    assert "state.meetKnownUrls = kept" in delete_source
+    assert "syncCompanionTargetOptions(" in delete_source
+    assert "Discard unsaved Silence configuration changes and switch targets?" in delete_source
+    assert "Could not delete ${code}" in delete_source
+    assert 'resultEl.className = "mono hint error"' in delete_source
+    assert "never append hardcoded defaults here" in offline_source
+    assert "state.meetKnownUrls.map" in offline_source
 
 
 def test_companion_interjector_renders_source_and_absence_safe_metrics() -> None:
     source = _source()
 
-    assert '"Inherited global defaults"' in source
-    assert '"Persisted meeting override"' in source
+    assert '"Default config"' in source
+    assert '"override active"' in source
     assert 'health.companionClick && typeof health.companionClick === "object"' in source
     assert '"Runtime metrics unavailable (older worker)"' in source
     assert 'silencesMetric("Backchannels sent"' in source

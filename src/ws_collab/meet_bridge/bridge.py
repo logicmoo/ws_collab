@@ -70,6 +70,8 @@ Usage (installed as a console script, or `python -m ws_collab.meet_bridge`):
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -90,6 +92,7 @@ from .audio_out import (
     resolve_audio_device,
     sapi_wav_base64,
     speak_windows,
+    verify_audio_device_identity,
 )
 from .cdp import (
     DEFAULT_CDP,
@@ -120,6 +123,10 @@ from .scripts_js import (
     COMPANION_AUDIO_RMS_JS,
     COMPANION_CLICK_JS,
     COMPANION_CLICK_ONCE_JS,
+    COMPANION_CABLE_FAIL_CLOSED_JS,
+    COMPANION_CABLE_FINALIZE_JS,
+    COMPANION_CABLE_PREPARE_JS,
+    COMPANION_CABLE_VERIFY_JS,
     CANCEL_COMPANION_AUDIO_JS,
     GUM_PATCH_JS,
     SELECT_MIC_DEVICE_JS,
@@ -128,7 +135,7 @@ from .scripts_js import (
     autojoin_js,
 )
 from .tracker import CaptionTracker
-from ..meet_browser_settings import MeetBrowserSettings
+from ..meet_browser_settings import MeetBrowserSettings, companion_click_runtime_layers
 
 DEFAULT_RECIPIENTS = ["conversation"]
 DEFAULT_SENDER_PREFIX = "meet-"
@@ -138,6 +145,72 @@ CAPTION_DUPLICATE_WINDOW_SECONDS = 15.0
 CAPTION_DUPLICATE_RECENT_LIMIT = 400
 CAPTION_PUSH_BINDING = "__wsCollabCaptionPush"
 CAPTION_PUSH_HEALTH_SECONDS = 5.0
+_BRIDGE_WIRING_ROUTES = {
+    "/wire-companion-audio",
+    "/disconnect-companion-audio",
+}
+
+
+def _header_value(headers: Any, name: str) -> str:
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        return str(getter(name) or getter(name.lower()) or "")
+    return ""
+
+
+def bridge_worker_request_error(
+    headers: Any, worker_secret: str
+) -> tuple[int, str] | None:
+    """Authorize a server-to-worker mutation without enabling browser CORS."""
+
+    if _header_value(headers, "origin"):
+        return 403, "cross-origin bridge mutations are forbidden; use the main server API"
+    if not worker_secret:
+        return 503, "bridge worker credential is not configured"
+    authorization = _header_value(headers, "authorization")
+    scheme, _, supplied = authorization.partition(" ")
+    if scheme.casefold() != "bearer" or not supplied or not hmac.compare_digest(
+        supplied, worker_secret
+    ):
+        return 401, "missing or invalid bridge worker credential"
+    return None
+
+
+def companion_wiring_revision(config: dict[str, Any]) -> str:
+    serialized = json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def companion_wiring_operation_key(
+    tab_id: str, meeting_url: str, config: dict[str, Any]
+) -> str:
+    return f"{tab_id}:{meeting_url}:{companion_wiring_revision(config)}"
+
+
+def companion_wiring_is_suppressed(
+    holder: dict[str, Any], tab_id: str, meeting_url: str, config: dict[str, Any]
+) -> bool:
+    return holder.get(
+        "companion_wiring_manual_suppression"
+    ) == companion_wiring_operation_key(tab_id, meeting_url, config)
+
+
+def saved_companion_wiring_config(
+    mailbox: Any, payload: dict[str, Any]
+) -> dict[str, Any]:
+    unknown = set(payload) - {"meeting_url", "reason"}
+    if unknown:
+        raise ValueError(
+            "bridge wiring accepts only a meeting reference; save device selections "
+            "through the main server first"
+        )
+    saved = mailbox.companion_cable_wiring()
+    if not (saved.get("validation") or {}).get("valid") or not isinstance(
+        saved.get("config"), dict
+    ):
+        errors = (saved.get("validation") or {}).get("errors") or []
+        raise ValueError("; ".join(errors) or "saved companion cable wiring is invalid")
+    return saved["config"]
 CAPTION_PUSH_POLL_INTERVAL = 2.0
 CAPTION_PUSH_MAX_PAYLOAD_BYTES = 256 * 1024
 CAPTION_PUSH_REINSTALL_SECONDS = 10.0
@@ -365,6 +438,11 @@ def companion_click_gain(value: Any) -> float:
     return gain
 
 
+def companion_action_phrase(action: Any) -> str:
+    value = str(action or "say:uh").strip().lower()
+    return value.split(":", 1)[1] if value.startswith("say:") else "uh"
+
+
 def parse_companion_click_command(command: str) -> dict[str, Any] | None:
     parts = str(command or "").strip().split()
     if not parts or parts[0].lower() != "/click":
@@ -410,6 +488,7 @@ def update_companion_click_status(status: dict[str, Any], holder: dict[str, Any]
         last_click_iso = None
     payload = {
         "enabled": bool(holder.get("companion_click_enabled")),
+        "action": str(holder.get("companion_click_action") or "say:uh"),
         "intervalSeconds": float(holder.get("companion_click_interval_seconds") or 2.0),
         "lastClickAt": last_click_at,
         "lastClickIso": last_click_iso,
@@ -424,12 +503,12 @@ def update_companion_click_status(status: dict[str, Any], holder: dict[str, Any]
         "maxWaitSeconds": float(holder.get("companion_click_max_wait_seconds") or 0.0),
         "clickMs": float(holder.get("companion_click_ms") or 100.0),
         "gain": float(holder.get("companion_click_gain") or 0.12),
-        "sound": str(holder.get("companion_click_sound") or "uh"),
-        "phrase": str(holder.get("companion_click_phrase") or holder.get("companion_click_sound") or "uh"),
         "f0Hz": float(holder.get("companion_click_f0_hz") or 125.0),
         "f1Hz": float(holder.get("companion_click_f1_hz") or 600.0),
         "f2Hz": float(holder.get("companion_click_f2_hz") or 1300.0),
         "clicksSent": int(holder.get("companion_clicks_sent") or 0),
+        "actionEvaluated": int(holder.get("companion_click_actions_evaluated") or 0),
+        "noOpSelections": int(holder.get("companion_click_no_op_selections") or 0),
         "suppressed": int(holder.get("companion_click_suppressed") or 0),
         "rowBreaksObserved": int(holder.get("companion_click_row_breaks_observed") or 0),
         "lastTrigger": holder.get("companion_click_last_trigger"),
@@ -438,6 +517,13 @@ def update_companion_click_status(status: dict[str, Any], holder: dict[str, Any]
         "lastTriggerAt": holder.get("companion_click_last_trigger_at"),
         "lastTriggerIso": holder.get("companion_click_last_trigger_iso"),
         "lastPhrase": holder.get("companion_click_last_phrase"),
+        "lastAction": holder.get("companion_click_last_action"),
+        "floorOpen": bool(holder.get("companion_click_floor_open")),
+        "floorGrantedAt": holder.get("companion_click_floor_granted_at"),
+        "floorGrantedTo": holder.get("companion_click_floor_granted_to"),
+        "floorGrantCount": int(holder.get("companion_click_floor_grant_count") or 0),
+        "floorDeferredCount": int(holder.get("companion_click_floor_deferred_count") or 0),
+        "lastDeferredReason": holder.get("companion_click_last_deferred_reason"),
         "currentSilenceMs": holder.get("companion_click_current_silence_ms"),
         "eligibility": holder.get("companion_click_eligibility"),
         "companionReady": bool(holder.get("companion_click_companion_ready")),
@@ -501,6 +587,187 @@ def update_companion_heard_stt_status(status: dict[str, Any], holder: dict[str, 
     }
     status["companionHeardStt"] = payload
     return payload
+
+
+def update_companion_cable_wiring_status(
+    status: dict[str, Any], holder: dict[str, Any]
+) -> dict[str, Any]:
+    payload = {
+        "mode": "two-cable",
+        "phase": holder.get("companion_wiring_phase") or "unwired",
+        "wired": holder.get("companion_wiring_phase") == "wired",
+        "desired": holder.get("companion_wiring_desired"),
+        "actual": holder.get("companion_wiring_actual"),
+        "meetingUrl": holder.get("companion_wiring_meeting_url"),
+        "tabId": holder.get("companion_wiring_tab_id"),
+        "reason": holder.get("companion_wiring_reason"),
+        "wiredAt": holder.get("companion_wiring_wired_at"),
+        "retryCount": int(holder.get("companion_wiring_retry_count") or 0),
+        "captureHealth": holder.get("companion_wiring_capture_health"),
+        "sinkVerified": bool(holder.get("companion_wiring_sink_verified")),
+        "micVerified": bool(holder.get("companion_wiring_mic_verified")),
+        "ttsOutputVerified": bool(holder.get("companion_wiring_tts_verified")),
+        "feedbackSafeMuted": bool(holder.get("companion_wiring_feedback_safe_muted", True)),
+        "feedbackSafe": bool(holder.get("companion_wiring_feedback_safe")),
+        "browserDevices": holder.get("companion_wiring_browser_devices") or [],
+        "lastVerifiedAt": holder.get("companion_wiring_last_verified_at"),
+        "lastError": holder.get("companion_wiring_last_error"),
+        "detectorSource": holder.get("companion_wiring_detector_source") or "unknown",
+    }
+    status["companionCableWiring"] = payload
+    return payload
+
+
+def _cable_eval(tab: Any, script: str, *, timeout: int = 12) -> dict[str, Any]:
+    raw = tab.evaluate(script, await_promise=True, timeout=timeout)
+    payload = json.loads(raw) if isinstance(raw, str) and raw.strip() else raw
+    if not isinstance(payload, dict):
+        raise RuntimeError("companion cable operation returned a non-object")
+    return payload
+
+
+def disconnect_companion_audio_wiring(
+    tab: Any,
+    mailbox: Any,
+    holder: dict[str, Any],
+    status: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    if reason == "manual-disconnect":
+        desired = holder.get("companion_wiring_desired")
+        tab_id = str(holder.get("companion_wiring_tab_id") or "")
+        meeting_url = str(holder.get("companion_wiring_meeting_url") or "")
+        if isinstance(desired, dict) and tab_id and meeting_url:
+            holder["companion_wiring_manual_suppression"] = companion_wiring_operation_key(
+                tab_id, meeting_url, desired
+            )
+    try:
+        _cable_eval(tab, COMPANION_CABLE_FAIL_CLOSED_JS, timeout=3)
+    except Exception:
+        try:
+            tab.evaluate(
+                'window.__wsCollabCableGeneration = Number(window.__wsCollabCableGeneration || 0) + 1; '
+                'document.querySelectorAll("audio,video").forEach((m) => { m.muted = true; m.volume = 0; })'
+            )
+        except Exception:
+            pass
+    try:
+        mailbox.stop_companion_wiring_capture()
+    except Exception:
+        pass
+    holder["companion_wiring_phase"] = "disconnected"
+    holder["companion_wiring_feedback_safe_muted"] = True
+    holder["companion_wiring_feedback_safe"] = True
+    holder["companion_wiring_sink_verified"] = False
+    holder["companion_wiring_mic_verified"] = False
+    holder["companion_wiring_tts_verified"] = False
+    holder["companion_wiring_detector_source"] = "unknown"
+    holder["companion_wiring_reason"] = reason
+    holder["companion_tts_output_device_index"] = None
+    return {"ok": True, **update_companion_cable_wiring_status(status, holder)}
+
+
+def wire_companion_audio(
+    tab: Any,
+    mailbox: Any,
+    holder: dict[str, Any],
+    status: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    meeting_url: str,
+    tab_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Atomically wire RECEIVE then TRANSMIT, failing closed at every boundary."""
+
+    fingerprint = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    if reason == "manual":
+        holder.pop("companion_wiring_manual_suppression", None)
+    if (
+        holder.get("companion_wiring_phase") == "wired"
+        and holder.get("companion_wiring_fingerprint") == fingerprint
+        and holder.get("companion_wiring_meeting_url") == meeting_url
+        and holder.get("companion_wiring_tab_id") == tab_id
+    ):
+        return {"ok": True, "idempotent": True, **update_companion_cable_wiring_status(status, holder)}
+    holder.update({
+        "companion_wiring_phase": "preparing",
+        "companion_wiring_desired": config,
+        "companion_wiring_actual": None,
+        "companion_wiring_meeting_url": meeting_url,
+        "companion_wiring_tab_id": tab_id,
+        "companion_wiring_reason": reason,
+        "companion_wiring_config_revision": companion_wiring_revision(config),
+        "companion_wiring_feedback_safe_muted": True,
+        "companion_wiring_feedback_safe": True,
+        "companion_wiring_sink_verified": False,
+        "companion_wiring_mic_verified": False,
+        "companion_wiring_tts_verified": False,
+        "companion_wiring_last_error": None,
+        "companion_wiring_detector_source": "unknown",
+    })
+    prepare_script = COMPANION_CABLE_PREPARE_JS.replace(
+        "__WS_CONFIG__", json.dumps(config, separators=(",", ":"))
+    )
+    try:
+        prepared = _cable_eval(tab, prepare_script)
+        if not prepared.get("ok"):
+            raise RuntimeError(str(prepared.get("error") or "browser cable preparation failed"))
+        holder["companion_wiring_phase"] = "capture-pending"
+        holder["companion_wiring_sink_verified"] = bool((prepared.get("sink") or {}).get("verified"))
+        holder["companion_wiring_mic_verified"] = bool((prepared.get("mic") or {}).get("verified"))
+        holder["companion_wiring_browser_devices"] = prepared.get("browserDevices") or []
+        capture_id = str((config.get("receive_capture_input") or {}).get("serverDeviceId") or "")
+        capture = mailbox.start_companion_wiring_capture(capture_id)
+        holder["companion_wiring_capture_health"] = capture
+        if (
+            not capture.get("listening")
+            or not capture.get("live_capture")
+            or capture.get("device_id") != capture_id
+            or capture.get("input_mode") != "device"
+        ):
+            raise RuntimeError(str(capture.get("error") or "RECEIVE server capture is not healthy"))
+        holder["companion_wiring_phase"] = "capture-healthy"
+        finalized = _cable_eval(tab, COMPANION_CABLE_FINALIZE_JS)
+        if not finalized.get("ok"):
+            raise RuntimeError(str(finalized.get("error") or "browser cable finalization failed"))
+        output_index = (config.get("transmit_tts_output") or {}).get("serverIndex")
+        if not isinstance(output_index, int) or output_index < 0:
+            raise RuntimeError("TRANSMIT TTS output has no live exact server index")
+        output_endpoint = config.get("transmit_tts_output") or {}
+        verified_output = verify_audio_device_identity(
+            output_index,
+            expected_name=str(output_endpoint.get("label") or ""),
+            expected_host_api=str(output_endpoint.get("hostApi") or ""),
+            want="output",
+        )
+        holder["companion_tts_output_device_index"] = output_index
+        holder["companion_wiring_phase"] = "wired"
+        holder["companion_wiring_fingerprint"] = fingerprint
+        holder["companion_wiring_actual"] = {
+            "receivePlaybackSink": finalized.get("sink"),
+            "receiveCaptureInput": {
+                "deviceId": capture.get("device_id"),
+                "deviceName": capture.get("device_name"),
+            },
+            "transmitTtsOutput": {**output_endpoint, "actual": verified_output},
+            "transmitCompanionMic": finalized.get("mic"),
+        }
+        holder["companion_wiring_wired_at"] = time.time()
+        holder["companion_wiring_last_verified_at"] = time.time()
+        holder["companion_wiring_feedback_safe_muted"] = False
+        holder["companion_wiring_feedback_safe"] = True
+        holder["companion_wiring_sink_verified"] = True
+        holder["companion_wiring_mic_verified"] = True
+        holder["companion_wiring_tts_verified"] = True
+        holder["companion_wiring_detector_source"] = "receive-cable"
+        return {"ok": True, "idempotent": False, **update_companion_cable_wiring_status(status, holder)}
+    except Exception as error:
+        disconnect_companion_audio_wiring(tab, mailbox, holder, status, reason="wire-failed")
+        holder["companion_wiring_phase"] = "failed"
+        holder["companion_wiring_last_error"] = str(error)
+        return {"ok": False, "error": str(error), **update_companion_cable_wiring_status(status, holder)}
 
 
 def forward_companion_heard_audio(
@@ -640,6 +907,7 @@ def apply_companion_click_state(
     log: Callable[..., None] | None = None,
 ) -> bool:
     enabled = bool(holder.get("companion_click_enabled"))
+    audible = enabled and str(holder.get("companion_click_action") or "say:uh").startswith("say:")
     interval_seconds = float(holder.get("companion_click_interval_seconds") or 2.0)
     interval_ms = max(1, int(round(interval_seconds * 1000)))
     duration_seconds = max(0.001, float(holder.get("companion_click_ms") or 100.0) / 1000.0)
@@ -647,7 +915,7 @@ def apply_companion_click_state(
     # Fixed and reactive interjects are both scheduled by the Python arbiter so
     # they share one serialized outbound track with virtual-agent speech.
     fixed_interval = False
-    sound = str(holder.get("companion_click_phrase") or holder.get("companion_click_sound") or "uh").lower()
+    sound = companion_action_phrase(holder.get("companion_click_action"))
     if sound not in {"uh", "uhuh", "hmm", "click"}:
         sound = "uh"
     f0 = max(1.0, float(holder.get("companion_click_f0_hz") or 125.0))
@@ -656,7 +924,7 @@ def apply_companion_click_state(
     try:
         raw = tab.evaluate(
             COMPANION_CLICK_JS % (
-                "true" if enabled else "false",
+                "true" if audible else "false",
                 interval_ms,
                 json.dumps(duration_seconds),
                 json.dumps(gain),
@@ -695,9 +963,9 @@ def apply_companion_click_state(
         update_companion_click_status(status, holder)
         update_companion_heard_stt_status(status, holder)
         js_status = str(payload.get("status") or "")
-        if enabled and js_status in {"installed", "reinstalled"}:
+        if audible and js_status in {"installed", "reinstalled"}:
             _log_companion_click(log, "install", f"[click] companion ticker {js_status} ({interval_seconds:g}s)", interval=0.0)
-        if enabled and payload.get("lastError"):
+        if audible and payload.get("lastError"):
             _log_companion_click(log, "js-error", f"[click] companion ticker waiting: {payload.get('lastError')}", err=True, interval=10.0)
         return True
     except Exception as error:  # noqa: BLE001
@@ -747,7 +1015,7 @@ def trigger_companion_click(
             "%Y-%m-%dT%H:%M:%S", time.localtime(now)
         )
         holder["companion_click_last_phrase"] = str(
-            phrase or holder.get("companion_click_phrase") or holder.get("companion_click_sound") or "uh"
+            phrase or companion_action_phrase(holder.get("companion_click_action"))
         )
         holder["companion_click_last_silence_ms"] = silence_ms
         holder["companion_click_last_monologue_seconds"] = monologue_seconds
@@ -772,12 +1040,63 @@ def measure_companion_audio_silence(
     log: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     threshold = max(0.0, float(holder.get("companion_click_audio_rms_threshold") or 0.015))
+    if holder.get("companion_wiring_desired"):
+        capture = holder.get("companion_wiring_capture_health") or {}
+        now = time.time()
+        if (
+            holder.get("companion_wiring_phase") != "wired"
+            or not capture.get("silence_ready", capture.get("live_capture"))
+            or capture.get("input_mode") != "device"
+        ):
+            payload = {
+                "ok": False,
+                "status": "not-ready",
+                "source": "receive-cable",
+                "rms": capture.get("meter_level"),
+                "quietMs": 0,
+                "lastError": holder.get("companion_wiring_last_error")
+                or "receive cable is not atomically wired and capture-healthy",
+            }
+        else:
+            rms = float(capture.get("meter_level") or 0.0)
+            if rms > threshold:
+                holder["companion_wiring_audio_quiet_since"] = None
+            elif not isinstance(holder.get("companion_wiring_audio_quiet_since"), (int, float)):
+                holder["companion_wiring_audio_quiet_since"] = now
+            quiet_since = holder.get("companion_wiring_audio_quiet_since")
+            payload = {
+                "ok": True,
+                "status": "receive-cable-vad",
+                "source": "receive-cable",
+                "rms": rms,
+                "threshold": threshold,
+                "quietMs": max(0.0, (now - float(quiet_since)) * 1000.0)
+                if isinstance(quiet_since, (int, float))
+                else 0.0,
+                "lastAudioAt": capture.get("last_audio_at"),
+                "lastChunkAt": capture.get("last_chunk_at"),
+                "chunks": capture.get("chunks_forwarded"),
+                "vadInSpeech": capture.get("vad_in_speech"),
+            }
+        holder["companion_click_audio_status"] = payload["status"]
+        holder["companion_click_audio_rms"] = payload.get("rms")
+        holder["companion_click_audio_quiet_ms"] = payload.get("quietMs")
+        holder["companion_wiring_detector_source"] = (
+            "receive-cable" if payload.get("ok") else "unknown"
+        )
+        update_companion_click_status(status, holder)
+        update_companion_cable_wiring_status(status, holder)
+        return payload
     try:
         raw = tab.evaluate(COMPANION_AUDIO_RMS_JS % json.dumps(threshold), await_promise=True, timeout=2)
         payload = json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
     except Exception as error:  # noqa: BLE001
         payload = {"ok": False, "status": "audio-unavailable", "lastError": str(error)}
     holder["companion_click_audio_status"] = payload.get("status")
+    payload["source"] = "browser-media-stream"
+    holder["companion_wiring_detector_source"] = (
+        "browser-media-stream" if payload.get("ok") else "unknown"
+    )
     if isinstance(payload.get("rms"), (int, float)):
         holder["companion_click_audio_rms"] = float(payload["rms"])
     if isinstance(payload.get("quietMs"), (int, float)):
@@ -840,6 +1159,19 @@ def companion_click_trigger_decision(
     if audio_probe and audio_probe.get("ok") and isinstance(audio_probe.get("quietMs"), (int, float)):
         audio_quiet_ms = max(0.0, float(audio_probe["quietMs"]))
         audio_quiet = audio_quiet_ms >= silence_ms
+    if trigger_source in {"audio", "both"} and not (audio_probe and audio_probe.get("ok")):
+        return {
+            "due": False,
+            "trigger": "audio-not-ready",
+            "reason": "audio-not-ready",
+            "eventKey": f"{row_key}:{float(last_growth_at):.6f}",
+            "rowKey": row_key,
+            "silenceMs": 0.0,
+            "captionSilenceMs": caption_silence_ms,
+            "audioSilenceMs": 0.0,
+            "monologueSeconds": monologue_seconds,
+            "detectorSource": (audio_probe or {}).get("source", "unknown"),
+        }
     if trigger_source == "caption":
         due = caption_quiet
         trigger = "caption-stasis"
@@ -871,6 +1203,11 @@ def companion_click_trigger_decision(
         "captionSilenceMs": caption_silence_ms,
         "audioSilenceMs": audio_quiet_ms,
         "monologueSeconds": monologue_seconds,
+        "detectorSource": (
+            "combined"
+            if trigger_source == "both"
+            else (audio_probe or {}).get("source", "captions")
+        ),
     }
 
 
@@ -929,8 +1266,10 @@ def queue_companion_interjection(
     *,
     meeting_url: str | None,
     now: float | None = None,
+    floor_continue: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    action_evaluate: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Apply readiness/serialization gates and enqueue at most one backchannel."""
+    """Dispatch one silence action without conflating floor control and audio."""
 
     at = time.monotonic() if now is None else now
     outbound = companion_audio.status()
@@ -945,6 +1284,116 @@ def queue_companion_interjection(
         reason = str(decision.get("reason") or decision.get("trigger") or "waiting")
         holder["companion_click_eligibility"] = reason
         return {"accepted": False, "reason": reason}
+    action = str(
+        holder.get("companion_click_action")
+        or "say:uh"
+    ).strip().lower()
+    event_key = str(
+        decision.get("eventKey")
+        or f"interval:{meeting_url or 'unknown'}:{at:.6f}"
+    )
+    if action == "nothing":
+        source = str(holder.get("companion_click_source") or "")
+        test_profile = source.split(":", 1)[1] if source.startswith("test:") else ""
+        recorder = action_evaluate
+        try:
+            recorded = recorder({
+                "meeting_url": meeting_url,
+                "event_key": event_key,
+                "action": "nothing",
+                "test_profile": test_profile,
+                "role": "companion",
+                "trigger": decision.get("trigger") or "silence",
+            }) if recorder else {"accepted": True}
+        except Exception as error:  # noqa: BLE001
+            recorded = {"accepted": False, "reason": f"action-record-failed: {error}"}
+        if not recorded.get("accepted") and not recorded.get("duplicate"):
+            reason = str(recorded.get("reason") or "action-record-rejected")
+            holder["companion_click_eligibility"] = reason
+            return {"accepted": False, "reason": reason, "action": "nothing"}
+        mark_companion_interjection_queued(holder, decision, now=at)
+        holder["companion_click_actions_evaluated"] = int(
+            holder.get("companion_click_actions_evaluated") or 0
+        ) + 1
+        holder["companion_click_no_op_selections"] = int(
+            holder.get("companion_click_no_op_selections") or 0
+        ) + 1
+        holder["companion_click_suppressed"] = int(
+            holder.get("companion_click_suppressed") or 0
+        ) + 1
+        holder["companion_click_last_action"] = "nothing"
+        holder["companion_click_last_trigger"] = decision.get("trigger")
+        holder["companion_click_last_trigger_reason"] = "configured-say-nothing"
+        holder["companion_click_last_trigger_mode"] = decision.get("mode")
+        holder["companion_click_last_trigger_at"] = time.time()
+        holder["companion_click_last_trigger_iso"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%S", time.localtime(holder["companion_click_last_trigger_at"])
+        )
+        holder["companion_click_floor_open"] = False
+        holder["companion_click_eligibility"] = "configured-say-nothing"
+        return {
+            **recorded,
+            "accepted": True,
+            "action": "nothing",
+            "reason": "configured-say-nothing",
+            "granted": False,
+        }
+    if action == "continue":
+        if decision.get("mode") != "on_silence":
+            reason = "continue-requires-on-silence"
+        elif not outbound.get("companionReady"):
+            reason = "companion-not-ready"
+        elif outbound.get("speaking") or outbound.get("queued"):
+            reason = (
+                "agent-speech-active"
+                if (outbound.get("current") or {}).get("kind") == "speech"
+                else "output-queue-busy"
+            )
+        elif action_evaluate is None and floor_continue is None:
+            reason = "floor-coordinator-unavailable"
+        else:
+            source = str(holder.get("companion_click_source") or "")
+            test_profile = source.split(":", 1)[1] if source.startswith("test:") else ""
+            try:
+                evaluator = action_evaluate or floor_continue
+                floor = evaluator({
+                    "meeting_url": meeting_url,
+                    "event_key": event_key,
+                    **({"action": "continue"} if action_evaluate else {}),
+                    "test_profile": test_profile,
+                    "role": "companion",
+                    "trigger": decision.get("trigger") or "silence",
+                })
+            except Exception as error:  # noqa: BLE001
+                floor = {"accepted": False, "reason": f"floor-signal-failed: {error}"}
+            if floor.get("accepted"):
+                mark_companion_interjection_queued(holder, decision, now=at)
+                holder["companion_click_actions_evaluated"] = int(
+                    holder.get("companion_click_actions_evaluated") or 0
+                ) + 1
+                holder["companion_click_last_action"] = "continue"
+                holder["companion_click_floor_open"] = bool(floor.get("floorOpen", floor.get("floor_open")))
+                holder["companion_click_floor_granted_at"] = floor.get("floorGrantedAt")
+                holder["companion_click_floor_granted_to"] = floor.get("floorGrantedTo")
+                holder["companion_click_floor_grant_count"] = int(floor.get("floorGrantCount") or 0)
+                holder["companion_click_floor_deferred_count"] = int(floor.get("floorDeferredCount") or 0)
+                holder["companion_click_last_deferred_reason"] = floor.get("lastDeferredReason")
+                holder["companion_click_eligibility"] = (
+                    "floor-granted" if floor.get("granted") else "floor-open"
+                )
+                return {**floor, "accepted": True, "action": "continue"}
+            reason = str(floor.get("reason") or "floor-signal-rejected")
+        mark_companion_interjection_queued(holder, decision, now=at)
+        holder["companion_click_actions_evaluated"] = int(
+            holder.get("companion_click_actions_evaluated") or 0
+        ) + 1
+        holder["companion_click_last_action"] = "continue"
+        holder["companion_click_floor_deferred_count"] = int(
+            holder.get("companion_click_floor_deferred_count") or 0
+        ) + 1
+        holder["companion_click_last_deferred_reason"] = reason
+        holder["companion_click_eligibility"] = reason
+        return {"accepted": False, "reason": reason, "action": "continue"}
     if not outbound.get("companionReady"):
         reason = "companion-not-ready"
     elif outbound.get("speaking") or outbound.get("queued"):
@@ -954,7 +1403,7 @@ def queue_companion_interjection(
             else "output-queue-busy"
         )
     else:
-        phrase = str(holder.get("companion_click_phrase") or "uh")
+        phrase = companion_action_phrase(action)
         result = companion_audio.submit(
             kind="interject",
             meeting_url=meeting_url,
@@ -963,7 +1412,12 @@ def queue_companion_interjection(
         )
         if result.get("accepted"):
             mark_companion_interjection_queued(holder, decision, now=at)
+            holder["companion_click_actions_evaluated"] = int(
+                holder.get("companion_click_actions_evaluated") or 0
+            ) + 1
             holder["companion_click_last_suppression_key"] = None
+            holder["companion_click_last_action"] = f"say:{phrase}"
+            holder["companion_click_floor_open"] = False
             holder["companion_click_eligibility"] = "queued"
             return result
         reason = str(result.get("reason") or "queue-rejected")
@@ -1892,7 +2346,8 @@ def main() -> None:
     parser.add_argument("--companion-click-ms", type=companion_click_ms, default=100.0, help="Companion click burst duration in milliseconds (default %(default)s)")
     parser.add_argument("--companion-click-gain", type=companion_click_gain, default=0.12, help="Companion click WebAudio gain in (0,1]; tune empirically for Meet VAD (default %(default)s)")
     parser.add_argument("--companion-click-sound", choices=["uh", "click"], default="uh", help="Legacy companion boundary sound compatibility option (default %(default)s)")
-    parser.add_argument("--companion-click-phrase", choices=["uh", "uhuh", "hmm"], default=None, help="Companion backchannel phrase; defaults to the legacy --companion-click-sound value")
+    parser.add_argument("--companion-click-phrase", choices=["uh", "uhuh", "hmm", "click"], default=None, help="Companion backchannel phrase; legacy 'click' is accepted for persisted-config compatibility")
+    parser.add_argument("--companion-click-action", choices=["continue", "nothing", "say:uh", "say:uhuh", "say:hmm", "say:click"], default="say:uh", help="Silence action: open the agent floor, do nothing, or queue a companion phrase")
     parser.add_argument("--companion-click-f0", type=companion_click_positive_float, default=125.0, help="'uh' fundamental frequency in Hz (default %(default)s)")
     parser.add_argument("--companion-click-f1", type=companion_click_positive_float, default=600.0, help="'uh' first formant bandpass center in Hz (default %(default)s)")
     parser.add_argument("--companion-click-f2", type=companion_click_positive_float, default=1300.0, help="'uh' second formant bandpass center in Hz (default %(default)s)")
@@ -2195,6 +2650,11 @@ def main() -> None:
         "sso_rescan_permitted": False,
         "sso_consent_operation_id": f"bridge-account-scan:{uuid.uuid4().hex}",
         "companion_click_enabled": bool(args.companion_click),
+        "companion_click_action": (
+            f"say:{args.companion_click_phrase}"
+            if args.companion_click_phrase
+            else str(args.companion_click_action)
+        ),
         "companion_click_interval_seconds": float(args.companion_click_interval),
         "companion_click_mode": str(args.companion_click_mode),
         "companion_click_trigger": str(args.companion_click_trigger),
@@ -2205,8 +2665,6 @@ def main() -> None:
         "companion_click_audio_rms_threshold": float(args.companion_click_audio_rms_threshold),
         "companion_click_ms": float(args.companion_click_ms),
         "companion_click_gain": float(args.companion_click_gain),
-        "companion_click_sound": str(args.companion_click_sound),
-        "companion_click_phrase": str(args.companion_click_phrase or args.companion_click_sound),
         "companion_click_f0_hz": float(args.companion_click_f0),
         "companion_click_f1_hz": float(args.companion_click_f1),
         "companion_click_f2_hz": float(args.companion_click_f2),
@@ -2217,6 +2675,8 @@ def main() -> None:
         "companion_click_last_install_at": None,
         "companion_click_last_error": None,
         "companion_clicks_sent": 0,
+        "companion_click_actions_evaluated": 0,
+        "companion_click_no_op_selections": 0,
         "companion_click_suppressed": 0,
         "companion_click_row_breaks_observed": 0,
         "companion_click_pending_breaks": [],
@@ -2227,6 +2687,13 @@ def main() -> None:
         "companion_click_last_trigger_at": None,
         "companion_click_last_trigger_iso": None,
         "companion_click_last_phrase": None,
+        "companion_click_last_action": None,
+        "companion_click_floor_open": False,
+        "companion_click_floor_granted_at": None,
+        "companion_click_floor_granted_to": None,
+        "companion_click_floor_grant_count": 0,
+        "companion_click_floor_deferred_count": 0,
+        "companion_click_last_deferred_reason": None,
         "companion_click_current_silence_ms": None,
         "companion_click_eligibility": "disabled" if not args.companion_click else "waiting-for-companion",
         "companion_click_companion_ready": False,
@@ -2269,9 +2736,16 @@ def main() -> None:
         "companion_heard_stt_disconnects": 0,
         "companion_heard_stt_reconnects": 0,
         "companion_heard_stt_server_capture": None,
+        "companion_wiring_phase": "unwired",
+        "companion_wiring_feedback_safe_muted": True,
+        "companion_wiring_feedback_safe": True,
+        "companion_wiring_retry_count": 0,
+        "companion_wiring_detector_source": "unknown",
+        "companion_tts_output_device_index": None,
         "companion_say_artifact_started_at": 0.0,
         "companion_say_artifact_until": 0.0,
     }
+    companion_wiring_lock = threading.RLock()
     update_sso_satisfaction(
         holder,
         role_authusers=args.role_authusers,
@@ -2479,6 +2953,14 @@ def main() -> None:
 
     click_settings_dir = settings_dir
     click_profile = Path(args.profile).expanduser()
+    click_persisted_settings_seen = False
+    if args.meet:
+        try:
+            MeetBrowserSettings(click_settings_dir).unforget_meeting_url(
+                click_profile, args.meet
+            )
+        except ValueError:
+            pass
 
     def _normalize_click_setting(raw: Any, default: dict[str, Any]) -> dict[str, Any]:
         row = raw if isinstance(raw, dict) else {}
@@ -2523,14 +3005,23 @@ def main() -> None:
         trigger = str(row.get("trigger") or default.get("trigger") or "caption").lower()
         if trigger not in {"caption", "audio", "both"}:
             trigger = "caption"
-        sound = str(row.get("sound") or default.get("sound") or "uh").lower()
-        if sound not in {"uh", "click"}:
-            sound = "uh"
-        phrase = str(row.get("phrase") or row.get("sound") or default.get("phrase") or sound).lower()
+        phrase = str(
+            row.get("phrase") or row.get("sound")
+            or default.get("phrase") or default.get("sound") or "uh"
+        ).lower()
         if phrase not in {"uh", "uhuh", "hmm", "click"}:
             phrase = "uh"
+        raw_action = row.get("action")
+        if raw_action is None and ("phrase" in row or "sound" in row):
+            raw_action = f"say:{phrase}"
+        action = str(raw_action or default.get("action") or f"say:{phrase}").strip().lower()
+        if action not in {"continue", "nothing", "say:uh", "say:uhuh", "say:hmm", "say:click"}:
+            action = f"say:{phrase}" if phrase in {"uh", "uhuh", "hmm", "click"} else "say:uh"
+        if action == "continue" and mode == "fixed":
+            mode = "reactive"
         return {
             "enabled": enabled,
+            "action": action,
             "intervalSeconds": positive("intervalSeconds", 2.0),
             "mode": mode,
             "trigger": trigger,
@@ -2541,17 +3032,21 @@ def main() -> None:
             "audioRmsThreshold": nonnegative("audioRmsThreshold", 0.015),
             "clickMs": positive("clickMs", 100.0),
             "gain": min(1.0, positive("gain", 0.12)),
-            "sound": sound,
-            "phrase": phrase,
             "f0Hz": positive("f0Hz", 125.0),
             "f1Hz": positive("f1Hz", 600.0),
             "f2Hz": positive("f2Hz", 1300.0),
         }
 
     def _read_companion_click_setting(target_url: str | None) -> dict[str, Any]:
+        nonlocal click_persisted_settings_seen
         key = meeting_key(target_url)
-        default = {
+        cli_seed = {
             "enabled": bool(args.companion_click),
+            "action": (
+                f"say:{args.companion_click_phrase}"
+                if args.companion_click_phrase
+                else str(args.companion_click_action)
+            ),
             "intervalSeconds": float(args.companion_click_interval),
             "mode": str(args.companion_click_mode),
             "trigger": str(args.companion_click_trigger),
@@ -2562,8 +3057,6 @@ def main() -> None:
             "audioRmsThreshold": float(args.companion_click_audio_rms_threshold),
             "clickMs": float(args.companion_click_ms),
             "gain": float(args.companion_click_gain),
-            "sound": str(args.companion_click_sound),
-            "phrase": str(args.companion_click_phrase or args.companion_click_sound),
             "f0Hz": float(args.companion_click_f0),
             "f1Hz": float(args.companion_click_f1),
             "f2Hz": float(args.companion_click_f2),
@@ -2573,14 +3066,17 @@ def main() -> None:
         except Exception as error:  # noqa: BLE001
             _log_companion_click(log, "settings-read", f"[click] settings read failed: {error}", err=True, interval=10.0)
             state = {}
-        default_setting = _normalize_click_setting(state.get("companion_click"), default)
-        overrides = state.get("meeting_companion_click", {})
-        if key and isinstance(overrides, dict) and isinstance(overrides.get(key), dict):
-            setting = _normalize_click_setting(overrides.get(key), default_setting)
-            source = "override"
-        else:
-            setting = default_setting
-            source = "default"
+        layers, click_persisted_settings_seen = companion_click_runtime_layers(
+            state,
+            key or "",
+            cli_seed,
+            persisted_source_seen=click_persisted_settings_seen,
+        )
+        setting: dict[str, Any] = {}
+        source = "cli"
+        for layer_source, patch in layers:
+            setting = _normalize_click_setting(patch, setting)
+            source = layer_source
         return {**setting, "meetingUrl": key, "source": source}
 
     def _persist_companion_click_override(target_url: str, enabled: bool, interval_seconds: float | None = None) -> dict[str, Any]:
@@ -2592,6 +3088,30 @@ def main() -> None:
         overrides = state.get("meeting_companion_click", {})
         overrides = dict(overrides) if isinstance(overrides, dict) else {}
         current = _read_companion_click_setting(key)
+        if str(current.get("source") or "").startswith("test:"):
+            built_in = {
+                "enabled": bool(args.companion_click),
+                "action": (
+                    f"say:{args.companion_click_phrase}"
+                    if args.companion_click_phrase
+                    else str(args.companion_click_action)
+                ),
+                "intervalSeconds": float(args.companion_click_interval),
+                "mode": str(args.companion_click_mode),
+                "trigger": str(args.companion_click_trigger),
+                "afterSeconds": float(args.companion_click_after),
+                "silenceMs": float(args.companion_click_silence_ms),
+                "minGapSeconds": float(args.companion_click_min_gap),
+                "maxWaitSeconds": float(args.companion_click_max_wait),
+                "audioRmsThreshold": float(args.companion_click_audio_rms_threshold),
+                "clickMs": float(args.companion_click_ms),
+                "gain": float(args.companion_click_gain),
+                "f0Hz": float(args.companion_click_f0),
+                "f1Hz": float(args.companion_click_f1),
+                "f2Hz": float(args.companion_click_f2),
+            }
+            global_setting = _normalize_click_setting(state.get("companion_click"), built_in)
+            current = _normalize_click_setting(overrides.get(key), global_setting)
         interval = float(interval_seconds if interval_seconds is not None else current.get("intervalSeconds", 2.0))
         overrides[key] = {**current, "enabled": bool(enabled), "intervalSeconds": interval}
         overrides[key].pop("meetingUrl", None)
@@ -2609,6 +3129,7 @@ def main() -> None:
         setting = _read_companion_click_setting(holder.get("url"))
         signature = (
             bool(setting["enabled"]),
+            str(setting.get("action") or "say:uh"),
             float(setting["intervalSeconds"]),
             str(setting.get("mode") or "reactive"),
             str(setting.get("trigger") or "caption"),
@@ -2619,8 +3140,6 @@ def main() -> None:
             float(setting.get("audioRmsThreshold") or 0.015),
             float(setting.get("clickMs") or 100.0),
             float(setting.get("gain") or 0.12),
-            str(setting.get("sound") or "uh"),
-            str(setting.get("phrase") or setting.get("sound") or "uh"),
             float(setting.get("f0Hz") or 125.0),
             float(setting.get("f1Hz") or 600.0),
             float(setting.get("f2Hz") or 1300.0),
@@ -2629,6 +3148,7 @@ def main() -> None:
         )
         changed = force or holder.get("companion_click_signature") != signature
         holder["companion_click_enabled"] = bool(setting["enabled"])
+        holder["companion_click_action"] = str(setting.get("action") or "say:uh")
         holder["companion_click_interval_seconds"] = float(setting["intervalSeconds"])
         holder["companion_click_mode"] = str(setting.get("mode") or "reactive")
         holder["companion_click_trigger"] = str(setting.get("trigger") or "caption")
@@ -2639,8 +3159,6 @@ def main() -> None:
         holder["companion_click_audio_rms_threshold"] = float(setting.get("audioRmsThreshold") or 0.015)
         holder["companion_click_ms"] = float(setting.get("clickMs") or 100.0)
         holder["companion_click_gain"] = float(setting.get("gain") or 0.12)
-        holder["companion_click_sound"] = str(setting.get("sound") or "uh")
-        holder["companion_click_phrase"] = str(setting.get("phrase") or setting.get("sound") or "uh")
         holder["companion_click_f0_hz"] = float(setting.get("f0Hz") or 125.0)
         holder["companion_click_f1_hz"] = float(setting.get("f1Hz") or 600.0)
         holder["companion_click_f2_hz"] = float(setting.get("f2Hz") or 1300.0)
@@ -2664,7 +3182,8 @@ def main() -> None:
                 apply_companion_click_state(tab, holder, status, log=log)
                 if time.time() >= float(holder.get("speaking_until") or 0):
                     try:
-                        tab.evaluate(autojoin_js("speaking" if setting["enabled"] else "muted"))
+                        audible = bool(setting["enabled"]) and str(setting.get("action") or "").startswith("say:")
+                        tab.evaluate(autojoin_js("speaking" if audible else "muted"))
                     except Exception as error:  # noqa: BLE001
                         _log_companion_click(log, "sync-mic", f"[click] companion mic-policy failed: {error}", err=True, interval=10.0)
         return setting
@@ -2716,7 +3235,10 @@ def main() -> None:
             mic = args.mic_select_device or "(WebAudio synthetic mic patch)"
             if args.mic_select_device and not holder.get("companion_mic_confirmed"):
                 mic += " -- attempting, not yet confirmed by Meet"
-            speak = (f"device #{tts_output_device_index} (virtual cable)" if tts_output_device_index is not None
+            active_tts_output_index = holder.get("companion_tts_output_device_index")
+            if active_tts_output_index is None:
+                active_tts_output_index = tts_output_device_index
+            speak = (f"device #{active_tts_output_index} (virtual cable)" if active_tts_output_index is not None
                      else "(WebAudio synthetic speaker patch)")
             clients.append({
                 "role": "companion",
@@ -2725,6 +3247,7 @@ def main() -> None:
                 "speak": speak,
                 "companionClick": update_companion_click_status(status, holder),
                 "companionHeardStt": update_companion_heard_stt_status(status, holder),
+                "companionCableWiring": update_companion_cable_wiring_status(status, holder),
                 "companionAudio": companion_audio.status(),
                 # Set by companion_loop() when it attaches the companion tab.
                 "profile": holder.get("companion_profile"),
@@ -2781,6 +3304,10 @@ def main() -> None:
             and holder.get("companion_mic_ready")
             and active
             and requested == active
+            and (
+                not holder.get("companion_wiring_desired")
+                or holder.get("companion_wiring_phase") == "wired"
+            )
         )
         error = None
         if not args.companion:
@@ -2793,6 +3320,8 @@ def main() -> None:
             error = f"companion is not in-call ({holder.get('companion_state') or 'unknown'})"
         elif not holder.get("companion_mic_ready"):
             error = "companion synthetic microphone is not ready"
+        elif holder.get("companion_wiring_desired") and holder.get("companion_wiring_phase") != "wired":
+            error = "companion two-cable wiring is not feedback-safe and ready"
         return {
             "ready": ready,
             "meetingUrl": active,
@@ -2814,9 +3343,88 @@ def main() -> None:
         max_pending=args.companion_audio_queue_max,
     )
 
+    def _run_companion_wiring(
+        payload: dict[str, Any], *, trusted_config: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        config = trusted_config or saved_companion_wiring_config(mailbox, payload)
+        requested = meeting_key(payload.get("meeting_url")) if payload.get("meeting_url") else meeting_key(holder.get("url"))
+        active = meeting_key(holder.get("url"))
+        tab = holder.get("companion_tab")
+        tab_id = str(holder.get("companion_tab_id") or "")
+        if not active or requested != active:
+            return {"ok": False, "error": f"selected meeting is not active ({active or 'none'})"}
+        if tab is None or not tab_id or holder.get("companion_state") != "in-call":
+            return {"ok": False, "error": "companion must be attached and in-call before wiring"}
+        with companion_wiring_lock:
+            return wire_companion_audio(
+                tab,
+                mailbox,
+                holder,
+                status,
+                config,
+                meeting_url=active,
+                tab_id=tab_id,
+                reason=str(payload.get("reason") or "manual"),
+            )
+
+    def _disconnect_companion_wiring(reason: str) -> dict[str, Any]:
+        tab = holder.get("companion_tab")
+        if tab is None:
+            try:
+                mailbox.stop_companion_wiring_capture()
+            except Exception:
+                pass
+            holder["companion_wiring_phase"] = "disconnected"
+            holder["companion_wiring_feedback_safe_muted"] = True
+            holder["companion_wiring_feedback_safe"] = True
+            holder["companion_tts_output_device_index"] = None
+            return {"ok": True, **update_companion_cable_wiring_status(status, holder)}
+        with companion_wiring_lock:
+            return disconnect_companion_audio_wiring(
+                tab, mailbox, holder, status, reason=reason
+            )
+
+    def invalidate_floor(reason: str, target_url: str | None = None) -> None:
+        target = meeting_key(target_url or holder.get("url"))
+        holder["companion_click_floor_open"] = False
+        holder["companion_click_last_deferred_reason"] = reason
+        if not target:
+            return
+        try:
+            mailbox.invalidate_meeting_floor({"meeting_url": target, "reason": reason})
+        except Exception as error:  # noqa: BLE001
+            _log_companion_click(
+                log,
+                f"floor-invalidate-{reason}",
+                f"[floor] could not invalidate {target}: {error}",
+                err=True,
+                interval=10.0,
+            )
+
+    def sync_floor_status() -> None:
+        target = meeting_key(holder.get("url"))
+        if not target or str(holder.get("companion_click_action") or "") != "continue":
+            return
+        try:
+            floor = mailbox.meeting_floor_status(target)
+        except Exception:
+            return
+        holder["companion_click_floor_open"] = bool(floor.get("floorOpen"))
+        holder["companion_click_floor_granted_at"] = floor.get("floorGrantedAt")
+        holder["companion_click_floor_granted_to"] = floor.get("floorGrantedTo")
+        holder["companion_click_floor_grant_count"] = int(floor.get("floorGrantCount") or 0)
+        holder["companion_click_floor_deferred_count"] = int(floor.get("floorDeferredCount") or 0)
+        holder["companion_click_last_deferred_reason"] = floor.get("lastDeferredReason")
+
     def _health_server() -> None:
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         from urllib.parse import parse_qs, urlparse
+
+        worker_secret = (
+            os.environ.get("WS_COLLAB_BRIDGE_TOKEN")
+            or os.environ.get("WS_COLLAB_TOKEN")
+            or ""
+        )
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
@@ -2893,6 +3501,7 @@ def main() -> None:
                     status["hostProfile"] = host_profile
                     update_companion_click_status(status, holder)
                     update_companion_heard_stt_status(status, holder)
+                    update_companion_cable_wiring_status(status, holder)
                     status["companionAudio"] = companion_audio.status()
                     with captions_lock:
                         _refresh_caption_transport_state(
@@ -2921,6 +3530,20 @@ def main() -> None:
                 # ws_collab's own API), which turns even a plain GET
                 # /health or /captions into a "non-simple" request that the
                 # browser preflights first.
+                route = urlparse(self.path).path.rstrip("/")
+                if route in _BRIDGE_WIRING_ROUTES:
+                    body = json.dumps(
+                        {
+                            "ok": False,
+                            "error": "cross-origin bridge mutations are forbidden; use the main server API",
+                        }
+                    ).encode("utf-8")
+                    self.send_response(403)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 self.send_response(204)
                 self.send_header("access-control-allow-origin", "*")
                 self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
@@ -2934,17 +3557,53 @@ def main() -> None:
                 # the bridge directly over HTTP.
                 parsed = urlparse(self.path)
                 route = parsed.path.rstrip("/")
-                if route not in {"/command", "/speech", "/speech/cancel", "/speech/status"}:
+                if route not in {
+                    "/command",
+                    "/speech",
+                    "/speech/cancel",
+                    "/speech/status",
+                    "/wire-companion-audio",
+                    "/disconnect-companion-audio",
+                }:
                     self.send_response(404)
                     self.send_header("access-control-allow-origin", "*")
                     self.send_header("content-length", "0")
                     self.end_headers()
                     return
+                if route in _BRIDGE_WIRING_ROUTES:
+                    auth_error = bridge_worker_request_error(
+                        self.headers, worker_secret
+                    )
+                    if auth_error is not None:
+                        status_code, message = auth_error
+                        body = json.dumps({"ok": False, "error": message}).encode(
+                            "utf-8"
+                        )
+                        self.send_response(status_code)
+                        self.send_header("content-type", "application/json")
+                        self.send_header("content-length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
                 try:
                     length = int(self.headers.get("content-length") or 0)
                     raw = self.rfile.read(length) if length else b"{}"
                     payload = json.loads(raw or b"{}")
-                    if route == "/speech/status":
+                    if route == "/wire-companion-audio":
+                        body_obj = _run_companion_wiring(payload)
+                        status_code = 200 if body_obj.get("ok") else 409
+                    elif route == "/disconnect-companion-audio":
+                        requested = meeting_key(payload.get("meeting_url")) if payload.get("meeting_url") else meeting_key(holder.get("url"))
+                        active = meeting_key(holder.get("url"))
+                        if requested and requested != active:
+                            body_obj = {"ok": False, "error": "selected meeting is not active"}
+                            status_code = 409
+                        else:
+                            body_obj = _disconnect_companion_wiring(
+                                str(payload.get("reason") or "manual-disconnect")
+                            )
+                            status_code = 200
+                    elif route == "/speech/status":
                         utterance_id = str(payload.get("utterance_id") or "").strip()
                         wait_seconds = float(payload.get("wait_seconds") or 0.0)
                         body_obj = companion_audio.utterance_status(
@@ -2994,7 +3653,8 @@ def main() -> None:
                 body = json.dumps(body_obj).encode("utf-8")
                 self.send_response(status_code)
                 self.send_header("content-type", "application/json")
-                self.send_header("access-control-allow-origin", "*")
+                if route not in _BRIDGE_WIRING_ROUTES:
+                    self.send_header("access-control-allow-origin", "*")
                 self.send_header("content-length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -3018,6 +3678,97 @@ def main() -> None:
 
     # ---- presence companion: a second SSO keeps the meeting populated ------
     # It can also TALK: /say and /click route audio through its synthetic mic.
+    def _auto_wire_companion_if_ready(tab: Any) -> None:
+        if holder.get("companion_state") != "in-call":
+            return
+        key = f"{holder.get('companion_tab_id')}:{meeting_key(holder.get('url'))}"
+        if holder.get("companion_wiring_auto_key") != key:
+            holder["companion_wiring_auto_key"] = key
+            holder.pop("companion_wiring_manual_suppression", None)
+            holder["companion_wiring_retry_count"] = 0
+            holder["companion_wiring_next_retry_at"] = 0.0
+        if (
+            holder.get("companion_wiring_phase") == "wired"
+            and holder.get("companion_wiring_tab_id") == holder.get("companion_tab_id")
+            and holder.get("companion_wiring_meeting_url") == meeting_key(holder.get("url"))
+        ):
+            return
+        attempts = int(holder.get("companion_wiring_retry_count") or 0)
+        try:
+            saved = mailbox.companion_cable_wiring()
+            if not (saved.get("validation") or {}).get("valid"):
+                if isinstance(saved.get("config"), dict):
+                    holder["companion_wiring_desired"] = saved.get("config")
+                holder["companion_wiring_retry_count"] = 3
+                holder["companion_wiring_phase"] = "unwired"
+                holder["companion_wiring_last_error"] = "; ".join(
+                    (saved.get("validation") or {}).get("errors") or []
+                ) or "four endpoints are not configured"
+                update_companion_cable_wiring_status(status, holder)
+                return
+            revision = companion_wiring_revision(saved["config"])
+            if holder.get("companion_wiring_config_revision") != revision:
+                holder["companion_wiring_config_revision"] = revision
+                holder.pop("companion_wiring_manual_suppression", None)
+                holder["companion_wiring_retry_count"] = 0
+                holder["companion_wiring_next_retry_at"] = 0.0
+                attempts = 0
+            if attempts >= 3 or time.monotonic() < float(
+                holder.get("companion_wiring_next_retry_at") or 0.0
+            ):
+                return
+            if companion_wiring_is_suppressed(
+                holder,
+                str(holder.get("companion_tab_id") or ""),
+                meeting_key(holder.get("url")),
+                saved["config"],
+            ):
+                return
+            holder["companion_wiring_retry_count"] = attempts + 1
+            result = _run_companion_wiring({
+                "meeting_url": holder.get("url"),
+                "reason": "auto-after-in-call" if attempts == 0 else "auto-retry",
+            }, trusted_config=saved["config"])
+            if not result.get("ok"):
+                holder["companion_wiring_next_retry_at"] = time.monotonic() + (2 ** attempts) * 3.0
+        except Exception as error:  # noqa: BLE001
+            holder["companion_wiring_retry_count"] = attempts + 1
+            holder["companion_wiring_next_retry_at"] = time.monotonic() + (2 ** attempts) * 3.0
+            holder["companion_wiring_last_error"] = str(error)
+            update_companion_cable_wiring_status(status, holder)
+
+    def _verify_live_companion_wiring(tab: Any) -> dict[str, Any] | None:
+        if holder.get("companion_wiring_phase") != "wired":
+            return None
+        try:
+            browser = _cable_eval(tab, COMPANION_CABLE_VERIFY_JS, timeout=3)
+            capture = mailbox.secondary_capture_state()
+            capture_id = str(
+                ((holder.get("companion_wiring_desired") or {}).get("receive_capture_input") or {}).get(
+                    "serverDeviceId"
+                )
+                or ""
+            )
+            healthy = (
+                capture.get("listening")
+                and capture.get("live_capture")
+                and capture.get("input_mode") == "device"
+                and capture.get("device_id") == capture_id
+            )
+            if not browser.get("ok") or not healthy:
+                raise RuntimeError(
+                    str(browser.get("error") or capture.get("error") or "RECEIVE capture/device changed")
+                )
+            holder["companion_wiring_capture_health"] = capture
+            holder["companion_wiring_last_verified_at"] = time.time()
+            return capture
+        except Exception as error:  # noqa: BLE001
+            _disconnect_companion_wiring("verification-failed")
+            holder["companion_wiring_phase"] = "failed"
+            holder["companion_wiring_last_error"] = str(error)
+            update_companion_cable_wiring_status(status, holder)
+            return None
+
     def companion_loop() -> None:
         companion_cdp = cdp_endpoint
         companion_profile = Path(args.profile).expanduser()
@@ -3066,6 +3817,7 @@ def main() -> None:
                     told_sso = True
                     print("[companion] using its assigned authuser tab in the browser profile", flush=True)
                 if companion_tab is not None and holder.get("companion_tab_id") is None:
+                    _disconnect_companion_wiring("companion-tab-closed")
                     companion_audio.invalidate("companion tab closed")
                     invalidate_sso_satisfaction(holder, "companion-tab-closed", clear_roles=("companion",))
                     companion_tab = None
@@ -3168,7 +3920,11 @@ def main() -> None:
                 # getUserMedia calls (prejoin preview, mic toggles) resolve
                 # to our WebAudio destination instead of the real hardware.
                 # Idempotent in JS (window.__sapiPatched guard).
-                if not mic_ready or holder.get("companion_click_enabled") or holder.get("companion_click_installed"):
+                audible_silence_action = (
+                    holder.get("companion_click_enabled")
+                    and str(holder.get("companion_click_action") or "").startswith("say:")
+                )
+                if not mic_ready or audible_silence_action or holder.get("companion_click_installed"):
                     try:
                         companion_tab.evaluate(GUM_PATCH_JS)
                         mic_ready = True
@@ -3177,7 +3933,7 @@ def main() -> None:
                         mic_ready = False
                         holder["companion_mic_ready"] = False
                         print(f"[companion] mic patch failed: {error}", file=sys.stderr, flush=True)
-                if mic_ready and (holder.get("companion_click_enabled") or holder.get("companion_click_installed")):
+                if mic_ready and (audible_silence_action or holder.get("companion_click_installed")):
                     apply_companion_click_state(companion_tab, holder, status, log=log)
                 # Hands-off applies to SIGN-IN, not to joining: if the tab
                 # shows a meet page with a Join/Rejoin button the SSO is
@@ -3269,18 +4025,31 @@ def main() -> None:
                             holder["companion_mic_confirmed"] = True
                     except Exception as error:  # noqa: BLE001
                         log(f"[companion] mic-select failed: {error}", err=True, role="companion")
+                if (
+                    holder.get("companion_wiring_phase") == "wired"
+                    and holder.get("companion_wiring_meeting_url") != meeting_key(target)
+                ):
+                    _disconnect_companion_wiring("meeting-switched")
+                if state == "in-call":
+                    _auto_wire_companion_if_ready(companion_tab)
+                    _verify_live_companion_wiring(companion_tab)
                 # While say_into_meeting() owns the mic, don't fight it with
                 # a mute click. If the companion clicker is enabled, keep the
                 # same fake-mic-only "speaking" policy active so Meet transmits
                 # the synthetic ticks.
                 if time.time() >= float(holder.get("speaking_until") or 0):
-                    mic_policy = "speaking" if holder.get("companion_click_enabled") else "muted"
+                    audible_backchannel = (
+                        holder.get("companion_click_enabled")
+                        and str(holder.get("companion_click_action") or "").startswith("say:")
+                    )
+                    mic_policy = "speaking" if audible_backchannel else "muted"
                     verdict = companion_tab.evaluate(autojoin_js(mic_policy))
-                    if verdict == "unmuted-for-speech" and holder.get("companion_click_enabled"):
+                    if verdict == "unmuted-for-speech" and audible_backchannel:
                         _log_companion_click(log, "unmuted", "[click] companion unmuted for synthetic ticker", interval=60.0)
                     if verdict in ("join-clicked", "stayed-in-call", "muted", "admitted"):
                         log(f"[companion] {verdict}", role="companion")
                 if state == "in-call" and holder.get("companion_click_enabled"):
+                    sync_floor_status()
                     audio_probe = None
                     now_mono = time.monotonic()
                     mode = str(holder.get("companion_click_mode") or "reactive")
@@ -3294,24 +4063,49 @@ def main() -> None:
                         decision,
                         meeting_url=holder.get("url"),
                         now=now_mono,
+                        action_evaluate=mailbox.evaluate_meeting_silence_action,
                     )
-                    if queued.get("accepted"):
+                    if queued.get("accepted") and queued.get("action") == "continue":
+                        _log_companion_click(
+                            log,
+                            "floor-continue",
+                            (
+                                f"[floor] Continue "
+                                f"{'granted to ' + str(queued.get('floorGrantedTo')) if queued.get('granted') else 'opened'} "
+                                f"via {decision.get('trigger')}"
+                            ),
+                            interval=0.0,
+                        )
+                    elif queued.get("accepted") and queued.get("action") == "nothing":
+                        _log_companion_click(
+                            log,
+                            "say-nothing",
+                            f"[silence-action] Say nothing via {decision.get('trigger')}",
+                            interval=0.0,
+                        )
+                    elif queued.get("accepted"):
                         _log_companion_click(
                             log,
                             "reactive-click",
                             (
                                 f"[backchannel] queued companion "
-                                f"{holder.get('companion_click_phrase') or 'uh'!r} "
+                                f"{companion_action_phrase(holder.get('companion_click_action'))!r} "
                                 f"via {decision.get('trigger')}"
                             ),
                             interval=10.0,
                         )
                     update_companion_click_status(status, holder)
-                if state == "in-call" and args.companion_heard_stt:
+                if (
+                    state == "in-call"
+                    and args.companion_heard_stt
+                    and holder.get("companion_wiring_phase") != "wired"
+                    and not holder.get("companion_wiring_desired")
+                ):
                     forward_companion_heard_audio(companion_tab, mailbox, holder, status, log=log)
-                else:
+                elif holder.get("companion_wiring_phase") != "wired":
                     companion_tab.evaluate('document.querySelectorAll("audio,video").forEach((m) => { m.muted = true; m.volume = 0; })')
             except Exception as error:  # noqa: BLE001
+                _disconnect_companion_wiring("companion-cdp-error")
                 invalidate_sso_satisfaction(holder, "companion-cdp-error", clear_roles=("companion",))
                 companion_tab = None
                 holder["companion_tab"] = None
@@ -3319,6 +4113,7 @@ def main() -> None:
                 holder["companion_state"] = "not-attached"
                 holder["companion_mic_ready"] = False
                 companion_audio.invalidate("companion CDP attachment lost")
+                invalidate_floor("channel-disconnected")
                 holder["companion_click_installed"] = False
                 update_companion_click_status(status, holder)
                 log(f"[companion] {error}", err=True, role="companion")
@@ -3346,6 +4141,17 @@ def main() -> None:
                 log=log,
             ):
                 raise RuntimeError(str(holder.get("companion_click_last_error") or "interject failed"))
+            cable_output_index = holder.get("companion_tts_output_device_index")
+            if isinstance(cable_output_index, int):
+                phrase_b64, phrase_duration = sapi_wav_base64(phrase)
+                import base64 as _base64
+
+                play_wav_bytes_to_device(
+                    _base64.b64decode(phrase_b64),
+                    cable_output_index,
+                    cancellation=cancel_event,
+                )
+                holder["companion_click_artifact_until"] = time.time() + phrase_duration + 2.0
             duration_ms = float(holder.get("companion_click_ms") or 100.0)
             if phrase == "uhuh":
                 duration_ms = max(duration_ms, 280.0)
@@ -3381,15 +4187,18 @@ def main() -> None:
             unmute_verdict = tab.evaluate(autojoin_js("speaking"))
             if cancel_event.wait(0.3):
                 raise RuntimeError("companion speech cancelled before playback")
-            if tts_output_device_index is not None:
+            physical_output_index = holder.get("companion_tts_output_device_index")
+            if physical_output_index is None:
+                physical_output_index = tts_output_device_index
+            if physical_output_index is not None:
                 import base64 as _base64
 
                 play_wav_bytes_to_device(
                     _base64.b64decode(b64),
-                    tts_output_device_index,
+                    physical_output_index,
                     cancellation=cancel_event,
                 )
-                verdict = f"completed-via-device-{tts_output_device_index}"
+                verdict = f"completed-via-device-{physical_output_index}"
             else:
                 verdict = tab.evaluate(
                     SPEAK_INTO_MEETING_JS % json.dumps(b64),
@@ -3403,7 +4212,11 @@ def main() -> None:
             holder["speaking_until"] = 0.0
             if holder.get("companion_tab_id") == item.get("tabId"):
                 try:
-                    tab.evaluate(autojoin_js("speaking" if holder.get("companion_click_enabled") else "muted"))
+                    audible = (
+                        holder.get("companion_click_enabled")
+                        and str(holder.get("companion_click_action") or "").startswith("say:")
+                    )
+                    tab.evaluate(autojoin_js("speaking" if audible else "muted"))
                 except Exception as error:  # noqa: BLE001
                     log(f"[say] re-mute failed: {error}", err=True, role="companion")
 
@@ -3436,6 +4249,15 @@ def main() -> None:
 
     def switch_to(target_url: str | None) -> None:
         """Leave for another meeting: /join <url> or /new (fresh servant room)."""
+        if target_url:
+            try:
+                MeetBrowserSettings(click_settings_dir).unforget_meeting_url(
+                    click_profile, target_url
+                )
+            except ValueError as error:
+                print(f"[bridge] switch failed: {error}", file=sys.stderr, flush=True)
+                return
+        invalidate_floor("meeting-switch", holder.get("url"))
         companion_audio.invalidate("meeting switch")
         old_id = holder.get("tab_id")
         old_url = str(holder.get("url") or "")
@@ -3661,6 +4483,7 @@ def main() -> None:
             return f"kill failed: no process tracked for {wanted} (attach-only mode, or never launched)"
         ok = _terminate_process(process)
         if ok:
+            invalidate_floor(f"{wanted}-process-killed")
             invalidate_sso_satisfaction(holder, f"{wanted}-process-killed")
             holder[key] = process
             if wanted == "host":
@@ -3700,6 +4523,8 @@ def main() -> None:
             return f"disconnect failed: unknown role {wanted!r}"
         closed: list[str] = []
         failed: list[str] = []
+        if wanted in (None, "host", "companion"):
+            invalidate_floor(f"{wanted or 'channel'}-disconnected")
         if wanted in (None, "host"):
             tab = holder.get("tab")
             tab_id = holder.get("tab_id")

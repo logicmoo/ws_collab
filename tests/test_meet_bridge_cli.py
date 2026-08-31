@@ -391,7 +391,7 @@ def test_backchannel_dispatch_queues_phrase_through_shared_audio_arbiter() -> No
             self.submission = kwargs
             return {"accepted": True, "id": "backchannel-1"}
 
-    holder = {"companion_click_phrase": "uhuh", "companion_click_mode": "reactive"}
+    holder = {"companion_click_action": "say:uhuh", "companion_click_mode": "reactive"}
     audio = Audio()
     decision = {
         "due": True,
@@ -411,10 +411,200 @@ def test_backchannel_dispatch_queues_phrase_through_shared_audio_arbiter() -> No
     assert holder["companion_click_eligibility"] == "queued"
 
 
-def test_backchannel_status_exposes_phrase_trigger_queue_and_suppression_metrics() -> None:
+@pytest.mark.parametrize(
+    ("action", "phrase"),
+    [("say:uh", "uh"), ("say:uhuh", "uhuh"), ("say:hmm", "hmm")],
+)
+def test_all_say_actions_queue_only_the_selected_phrase(action, phrase) -> None:
+    class Audio:
+        submission = None
+
+        def status(self):
+            return {"companionReady": True, "queued": 0, "speaking": False}
+
+        def submit(self, **kwargs):
+            self.submission = kwargs
+            return {"accepted": True, "id": "phrase"}
+
+    audio = Audio()
+    holder = {"companion_click_action": action}
+    result = bridge.queue_companion_interjection(
+        holder,
+        audio,
+        {"due": True, "mode": "on_silence", "eventKey": "row:1", "trigger": "caption-stasis"},
+        meeting_url="https://meet.google.com/abc-defg-hij",
+    )
+
+    assert result["accepted"] is True
+    assert audio.submission["kind"] == "interject"
+    assert audio.submission["metadata"]["phrase"] == phrase
+    assert holder["companion_click_last_action"] == action
+    assert holder.get("companion_click_floor_grant_count", 0) == 0
+
+
+def test_continue_emits_floor_signal_without_audio_or_backchannel_metrics() -> None:
+    class Audio:
+        submissions = []
+
+        def status(self):
+            return {"companionReady": True, "queued": 0, "speaking": False}
+
+        def submit(self, **kwargs):
+            self.submissions.append(kwargs)
+            return {"accepted": True}
+
+    signals = []
+    holder = {
+        "companion_click_action": "continue",
+        "companion_click_source": "test:count20",
+        "companion_clicks_sent": 4,
+        "companion_click_row_breaks_observed": 2,
+    }
+    audio = Audio()
+
+    result = bridge.queue_companion_interjection(
+        holder,
+        audio,
+        {"due": True, "mode": "on_silence", "eventKey": "row:1", "trigger": "caption-stasis"},
+        meeting_url="https://meet.google.com/abc-defg-hij",
+        floor_continue=lambda payload: (
+            signals.append(payload)
+            or {
+                "accepted": True,
+                "floorOpen": True,
+                "floorGrantCount": 0,
+                "floorDeferredCount": 0,
+            }
+        ),
+    )
+
+    assert result["accepted"] is True
+    assert result["action"] == "continue"
+    assert audio.submissions == []
+    assert signals[0]["test_profile"] == "count20"
+    assert holder["companion_clicks_sent"] == 4
+    assert holder["companion_click_row_breaks_observed"] == 2
+    assert holder["companion_click_floor_open"] is True
+    assert holder["companion_click_fired_silence_event"] == "row:1"
+
+
+def test_say_nothing_records_once_per_silence_edge_without_output_or_floor() -> None:
+    class Audio:
+        submissions = []
+
+        def status(self):
+            return {"companionReady": False, "queued": 0, "speaking": False}
+
+        def submit(self, **kwargs):
+            self.submissions.append(kwargs)
+            return {"accepted": True}
+
+    audio = Audio()
+    records = []
+    holder = {
+        "companion_click_action": "nothing",
+        "companion_clicks_sent": 4,
+        "companion_click_floor_grant_count": 2,
+        "companion_click_row_breaks_observed": 3,
+        "host_active_caption_key": "row",
+        "host_active_caption_started_at": 0.0,
+        "host_active_caption_last_growth_at": 9.0,
+        "companion_click_after_seconds": 1.0,
+        "companion_click_silence_ms": 500.0,
+        "companion_click_min_gap_seconds": 1.0,
+    }
+    decision = bridge.companion_interjection_decision(holder, now=10.0)
+
+    first = bridge.queue_companion_interjection(
+        holder,
+        audio,
+        decision,
+        meeting_url="https://meet.google.com/abc-defg-hij",
+        now=10.0,
+        action_evaluate=lambda payload: records.append(payload) or {"accepted": True},
+    )
+    duplicate = bridge.companion_interjection_decision(holder, now=11.1)
+
+    assert first["action"] == "nothing"
+    assert first["reason"] == "configured-say-nothing"
+    assert audio.submissions == []
+    assert records[0]["action"] == "nothing"
+    assert holder["companion_clicks_sent"] == 4
+    assert holder["companion_click_floor_grant_count"] == 2
+    assert holder["companion_click_row_breaks_observed"] == 3
+    assert holder["companion_click_no_op_selections"] == 1
+    assert holder["companion_click_suppressed"] == 1
+    assert duplicate["due"] is False
+    assert duplicate["trigger"] == "continuous-silence-debounced"
+
+
+def test_say_nothing_interval_records_at_configured_cadence() -> None:
+    class Audio:
+        def status(self):
+            return {"companionReady": False, "queued": 0, "speaking": False}
+
+    holder = {
+        "companion_click_action": "nothing",
+        "companion_click_mode": "fixed",
+        "companion_click_interval_seconds": 2.0,
+        "companion_click_min_gap_seconds": 0.1,
+    }
+    records = []
+    assert bridge.companion_interjection_decision(holder, now=0.0)["due"] is False
+    for at in (2.0, 4.0):
+        decision = bridge.companion_interjection_decision(holder, now=at)
+        assert decision["due"] is True
+        bridge.queue_companion_interjection(
+            holder,
+            Audio(),
+            decision,
+            meeting_url="https://meet.google.com/abc-defg-hij",
+            now=at,
+            action_evaluate=lambda payload: records.append(payload) or {"accepted": True},
+        )
+        assert bridge.companion_interjection_decision(holder, now=at + 0.1)["due"] is False
+
+    assert len(records) == 2
+    assert records[0]["event_key"] != records[1]["event_key"]
+    assert holder["companion_click_no_op_selections"] == 2
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [
+        (
+            {"companionReady": True, "queued": 0, "speaking": True, "current": {"kind": "speech"}},
+            "agent-speech-active",
+        ),
+        ({"companionReady": True, "queued": 1, "speaking": False}, "output-queue-busy"),
+    ],
+)
+def test_continue_defers_when_agent_or_output_queue_is_busy(status, reason) -> None:
+    class Audio:
+        def status(self):
+            return status
+
+    signals = []
+    holder = {"companion_click_action": "continue"}
+    decision = {"due": True, "mode": "on_silence", "eventKey": "row:1", "trigger": "caption-stasis"}
+    result = bridge.queue_companion_interjection(
+        holder,
+        Audio(),
+        decision,
+        meeting_url="https://meet.google.com/abc-defg-hij",
+        floor_continue=lambda payload: signals.append(payload) or {"accepted": True},
+    )
+
+    assert result == {"accepted": False, "reason": reason, "action": "continue"}
+    assert signals == []
+    assert holder["companion_click_floor_deferred_count"] == 1
+    assert holder["companion_click_fired_silence_event"] == "row:1"
+
+
+def test_backchannel_status_exposes_action_trigger_queue_and_suppression_metrics() -> None:
     holder = {
         "companion_click_enabled": True,
-        "companion_click_phrase": "hmm",
+        "companion_click_action": "say:hmm",
         "companion_click_mode": "fixed",
         "companion_click_suppressed": 3,
         "companion_click_last_phrase": "uhuh",
@@ -429,7 +619,8 @@ def test_backchannel_status_exposes_phrase_trigger_queue_and_suppression_metrics
 
     payload = bridge.update_companion_click_status({}, holder)
 
-    assert payload["phrase"] == "hmm"
+    assert payload["action"] == "say:hmm"
+    assert "phrase" not in payload and "sound" not in payload
     assert payload["triggerMode"] == "interval"
     assert payload["suppressed"] == 3
     assert payload["lastPhrase"] == "uhuh"
@@ -453,7 +644,7 @@ def test_backchannel_phrase_is_forwarded_to_distinct_audio_generator(phrase) -> 
         "companion_click_interval_seconds": 5.0,
         "companion_click_ms": 100.0,
         "companion_click_gain": 0.12,
-        "companion_click_phrase": phrase,
+        "companion_click_action": f"say:{phrase}",
         "companion_click_f0_hz": 125.0,
         "companion_click_f1_hz": 600.0,
         "companion_click_f2_hz": 1300.0,

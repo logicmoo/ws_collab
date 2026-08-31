@@ -260,3 +260,165 @@ def test_service_enforces_max_utterance_length(service) -> None:
     service.set_voice_profile("agent-1", {"max_utterance_chars": 5})
     with pytest.raises(ValidationError):
         service.speak("agent-1", "far too long for this agent")
+
+
+def test_floor_gate_releases_at_most_one_matching_agent_turn(engine) -> None:
+    first = engine.speak(
+        "agent-a", "one", voice_id="fake:aria", destination="companion",
+        meeting_url="https://meet.google.com/abc-defg-hij", wait_for_floor=True,
+        floor_test_profile="count20", floor_role="companion",
+    )
+    second = engine.speak(
+        "agent-b", "two", voice_id="fake:aria", destination="companion",
+        meeting_url="https://meet.google.com/abc-defg-hij", wait_for_floor=True,
+        floor_test_profile="count20", floor_role="companion",
+    )
+
+    released = engine.open_floor(
+        "https://meet.google.com/abc-defg-hij", event_key="silence-1",
+        test_profile="count20", role="companion",
+    )
+    state = engine.state()
+
+    assert first["waiting_for_floor"] is True
+    assert second["waiting_for_floor"] is True
+    assert released["granted"] is True
+    assert released["utterance_id"] == first["id"]
+    assert state["queue"][0]["requires_floor"] is False
+    assert state["queue"][1]["requires_floor"] is True
+
+
+def test_floor_stays_open_safely_until_matching_agent_is_queued(engine) -> None:
+    opened = engine.open_floor(
+        "https://meet.google.com/abc-defg-hij", event_key="silence-1",
+        test_profile="abcs", role="companion",
+    )
+    queued = engine.speak(
+        "agent-a", "A", voice_id="fake:aria", destination="companion",
+        meeting_url="https://meet.google.com/abc-defg-hij", wait_for_floor=True,
+        floor_test_profile="abcs", floor_role="companion",
+    )
+
+    assert opened == {"floor_open": True, "granted": False, "reason": "no-queued-agent"}
+    assert queued["floor_consumed"] is True
+    assert queued["waiting_for_floor"] is False
+    assert engine.state()["floor_open"] == []
+
+
+def test_floor_grants_are_channel_and_test_scoped_and_invalidatable(engine) -> None:
+    queued = engine.speak(
+        "agent-a", "A", voice_id="fake:aria", destination="companion",
+        meeting_url="https://meet.google.com/abc-defg-hij", wait_for_floor=True,
+        floor_test_profile="abcs",
+    )
+
+    wrong_channel = engine.open_floor(
+        "https://meet.google.com/xyz-abcd-efg", event_key="silence-other",
+        test_profile="abcs",
+    )
+    wrong_test = engine.open_floor(
+        "https://meet.google.com/abc-defg-hij", event_key="silence-wrong-test",
+        test_profile="count20",
+    )
+    invalidated = engine.invalidate_floor(
+        "https://meet.google.com/abc-defg-hij",
+        cancel_waiters=True,
+        test_profile="abcs",
+    )
+
+    assert wrong_channel["granted"] is False
+    assert wrong_test["granted"] is False
+    assert all(item["id"] != queued["id"] for item in engine.state()["queue"])
+    assert invalidated >= 1
+
+
+@pytest.mark.parametrize("meeting_index", [0, 1])
+@pytest.mark.parametrize("test_profile", ["", "count20", "abcs"])
+def test_floor_release_matches_exact_meeting_and_test_profile(
+    engine, meeting_index, test_profile
+) -> None:
+    meetings = [
+        "https://meet.google.com/abc-defg-hij",
+        "https://meet.google.com/xyz-abcd-efg",
+    ]
+    queued = {}
+    for candidate_meeting in meetings:
+        for candidate_profile in ("", "count20", "abcs"):
+            result = engine.speak(
+                f"agent-{len(queued)}",
+                f"turn-{len(queued)}",
+                voice_id="fake:aria",
+                destination="companion",
+                meeting_url=candidate_meeting,
+                wait_for_floor=True,
+                floor_test_profile=candidate_profile,
+            )
+            queued[(candidate_meeting, candidate_profile)] = result["id"]
+
+    target = (meetings[meeting_index], test_profile)
+    released = engine.open_floor(
+        target[0], event_key=f"silence-{meeting_index}-{test_profile}", test_profile=target[1]
+    )
+    waiting = {
+        item["id"]: item["requires_floor"]
+        for item in engine.state()["queue"]
+    }
+
+    assert released["utterance_id"] == queued[target]
+    assert waiting[queued[target]] is False
+    assert all(
+        waiting[item_id] is True
+        for scope, item_id in queued.items()
+        if scope != target
+    )
+
+
+@pytest.mark.parametrize("meeting_index", [0, 1])
+@pytest.mark.parametrize("test_profile", ["", "count20", "abcs"])
+def test_floor_invalidation_matches_exact_meeting_and_test_profile(
+    engine, meeting_index, test_profile
+) -> None:
+    meetings = [
+        "https://meet.google.com/abc-defg-hij",
+        "https://meet.google.com/xyz-abcd-efg",
+    ]
+    queued = {}
+    for candidate_meeting in meetings:
+        for candidate_profile in ("", "count20", "abcs"):
+            scope = (candidate_meeting, candidate_profile)
+            queued[scope] = engine.speak(
+                f"agent-{len(queued)}",
+                f"turn-{len(queued)}",
+                voice_id="fake:aria",
+                destination="companion",
+                meeting_url=candidate_meeting,
+                wait_for_floor=True,
+                floor_test_profile=candidate_profile,
+                floor_role="companion",
+            )["id"]
+            engine.open_floor(
+                candidate_meeting,
+                event_key=f"open-{len(queued)}",
+                test_profile=candidate_profile,
+                role="host",
+            )
+
+    target = (meetings[meeting_index], test_profile)
+    invalidated = engine.invalidate_floor(
+        target[0], cancel_waiters=True, test_profile=target[1]
+    )
+    state = engine.state()
+    remaining_ids = {item["id"] for item in state["queue"]}
+    remaining_grants = {
+        (grant["meeting_url"], grant["test_profile"])
+        for grant in state["floor_open"]
+    }
+
+    assert invalidated == 2
+    assert queued[target] not in remaining_ids
+    assert target not in remaining_grants
+    assert all(
+        item_id in remaining_ids and scope in remaining_grants
+        for scope, item_id in queued.items()
+        if scope != target
+    )

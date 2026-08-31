@@ -850,6 +850,59 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             require_sso_consent,
         )
 
+    @router.get(f"{mount}/meet/companion-cable-wiring")
+    async def companion_cable_wiring(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.get_companion_cable_wiring)
+
+    @router.get(f"{mount}/meet/companion-cable-wiring/runtime")
+    async def companion_cable_wiring_runtime(request: Request) -> dict[str, Any]:
+        await _require(request, "worker")
+        return guarded(service.get_companion_cable_wiring, runtime_only=True)
+
+    @router.post(f"{mount}/meet/companion-cable-wiring/capture/start")
+    async def companion_cable_wiring_capture_start(
+        request: Request, body: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        await _require(request, "worker", mutating=True)
+        return guarded(
+            service.start_companion_wiring_capture,
+            body.get("device_id", body.get("deviceId", "")),
+        )
+
+    @router.post(f"{mount}/meet/companion-cable-wiring/capture/stop")
+    async def companion_cable_wiring_capture_stop(request: Request) -> dict[str, Any]:
+        await _require(request, "worker", mutating=True)
+        return guarded(service.stop_companion_wiring_capture)
+
+    @router.post(f"{mount}/meet/companion-cable-wiring")
+    async def save_companion_cable_wiring(
+        request: Request, body: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.save_companion_cable_wiring, body)
+
+    @router.post(f"{mount}/meet/companion-cable-wiring/wire")
+    async def wire_companion_audio(
+        request: Request, body: dict[str, Any] = Body(default_factory=dict)
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return await guarded_thread(
+            service.wire_companion_audio,
+            body.get("meeting_url", body.get("meetingUrl", "")),
+            reason="manual",
+        )
+
+    @router.post(f"{mount}/meet/companion-cable-wiring/disconnect")
+    async def disconnect_companion_audio_wiring(
+        request: Request, body: dict[str, Any] = Body(default_factory=dict)
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return await guarded_thread(
+            service.disconnect_companion_audio_wiring,
+            body.get("meeting_url", body.get("meetingUrl", "")),
+        )
+
     @router.get(f"{mount}/meet/role-assignments")
     async def meet_role_assignments(request: Request) -> dict[str, Any]:
         await _require(request, "viewer")
@@ -875,9 +928,48 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             request.query_params.get("meeting_url", ""),
         )
 
+    @router.post(f"{mount}/meet/channels/forget")
+    async def forget_meet_channel(
+        request: Request, body: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.forget_meeting_channel,
+            body.get("meeting_url", body.get("channel", "")),
+        )
+
+    @router.get(f"{mount}/meet/channels")
+    async def meet_channels(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.get_meeting_channels)
+
+    @router.post(f"{mount}/meet/channels/prune")
+    async def prune_meet_channels(
+        request: Request, body: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.prune_meeting_channels, body.get("keep"))
+
     @router.get(f"{mount}/meet/companion-click")
     async def meet_companion_click(request: Request) -> dict[str, Any]:
         await _require(request, "viewer")
+        scope = request.query_params.get("scope")
+        if scope:
+            scope_key = request.query_params.get("scope_key", "")
+            test_profile = request.query_params.get("test_profile", "")
+            if str(scope).lower() == "test" and not test_profile and scope_key.startswith("test:"):
+                test_profile = scope_key.split(":", 1)[1]
+            channel_key = request.query_params.get(
+                "channel_key", request.query_params.get("meeting_url", "")
+            )
+            if str(scope).lower() in {"channel", "meeting"} and not channel_key:
+                channel_key = scope_key
+            return guarded(
+                service.get_companion_click_config,
+                scope,
+                channel_key=channel_key,
+                test_profile=test_profile,
+            )
         return guarded(
             service.get_meet_companion_click,
             request.query_params.get("meeting_url", ""),
@@ -886,6 +978,38 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     @router.post(f"{mount}/meet/companion-click")
     async def set_meet_companion_click(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
+        if body.get("scope"):
+            metadata = {
+                "scope", "scope_key", "channel_key", "meeting_url", "test_profile",
+                "replace_override", "override",
+            }
+            if "override" in body:
+                if not isinstance(body["override"], dict):
+                    raise HTTPException(status_code=422, detail="override must be an object")
+                unknown_metadata = sorted(set(body) - metadata)
+                if unknown_metadata:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"unknown scoped companion-click field: {unknown_metadata[0]}",
+                    )
+                values = body["override"]
+            else:
+                values = {key: value for key, value in body.items() if key not in metadata}
+            scope_key = str(body.get("scope_key") or "")
+            test_profile = body.get("test_profile", "")
+            if str(body["scope"]).lower() == "test" and not test_profile and scope_key.startswith("test:"):
+                test_profile = scope_key.split(":", 1)[1]
+            channel_key = body.get("channel_key", body.get("meeting_url", ""))
+            if str(body["scope"]).lower() in {"channel", "meeting"} and not channel_key:
+                channel_key = scope_key
+            return guarded(
+                service.set_companion_click_config,
+                body["scope"],
+                values,
+                channel_key=channel_key,
+                test_profile=test_profile,
+                replace=body.get("replace_override", False) is True,
+            )
         return guarded(
             service.set_meet_companion_click,
             body.get("enabled", False),
@@ -902,6 +1026,7 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
             gain=body.get("gain"),
             sound=body.get("sound"),
             phrase=body.get("phrase"),
+            action=body.get("action"),
             f0_hz=body.get("f0_hz", body.get("f0Hz")),
             f1_hz=body.get("f1_hz", body.get("f1Hz")),
             f2_hz=body.get("f2_hz", body.get("f2Hz")),
@@ -910,9 +1035,123 @@ def create_rest_router(ctx: AppContext, mount: str = "/ws_collab", *, in_schema:
     @router.delete(f"{mount}/meet/companion-click")
     async def clear_meet_companion_click(request: Request) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
+        scope = request.query_params.get("scope")
+        if scope:
+            scope_key = request.query_params.get("scope_key", "")
+            test_profile = request.query_params.get("test_profile", "")
+            if str(scope).lower() == "test" and not test_profile and scope_key.startswith("test:"):
+                test_profile = scope_key.split(":", 1)[1]
+            channel_key = request.query_params.get(
+                "channel_key", request.query_params.get("meeting_url", "")
+            )
+            if str(scope).lower() in {"channel", "meeting"} and not channel_key:
+                channel_key = scope_key
+            return guarded(
+                service.clear_companion_click_config,
+                scope,
+                channel_key=channel_key,
+                test_profile=test_profile,
+            )
         return guarded(
             service.clear_meet_companion_click,
             request.query_params.get("meeting_url", ""),
+        )
+
+    @router.post(f"{mount}/meet/companion-click/test-session")
+    async def activate_meet_companion_click_test(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.activate_companion_click_test,
+            body.get("test_profile", ""),
+            body.get("channel_key", body.get("meeting_url", "")),
+        )
+
+    @router.delete(f"{mount}/meet/companion-click/test-session")
+    async def deactivate_meet_companion_click_test(request: Request) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.deactivate_companion_click_test,
+            request.query_params.get("test_profile", ""),
+            request.query_params.get(
+                "channel_key", request.query_params.get("meeting_url", "")
+            ),
+        )
+
+    @router.post(f"{mount}/meet/floor/continue")
+    async def continue_meet_floor(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "worker", mutating=True)
+        return guarded(
+            service.continue_meeting_floor,
+            body.get("meeting_url", body.get("meetingUrl", "")),
+            body.get("event_key", body.get("eventKey", "")),
+            test_profile=body.get("test_profile", body.get("testProfile", "")),
+            role=body.get("role", ""),
+            trigger=body.get("trigger", "silence"),
+        )
+
+    @router.post(f"{mount}/meet/silence-action/evaluate")
+    async def evaluate_meet_silence_action(
+        request: Request, body: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        await _require(request, "worker", mutating=True)
+        return guarded(
+            service.evaluate_meeting_silence_action,
+            body.get("meeting_url", body.get("meetingUrl", "")),
+            body.get("event_key", body.get("eventKey", "")),
+            body.get("action", ""),
+            test_profile=body.get("test_profile", body.get("testProfile", "")),
+            role=body.get("role", ""),
+            trigger=body.get("trigger", "silence"),
+        )
+
+    @router.get(f"{mount}/meet/floor/status")
+    async def meet_floor_status(request: Request) -> dict[str, Any]:
+        await _require(request, "worker")
+        return guarded(
+            service.meeting_floor_status,
+            request.query_params.get("meeting_url", ""),
+        )
+
+    @router.post(f"{mount}/meet/floor/queue")
+    async def queue_meet_floor_utterance(
+        request: Request, body: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.queue_meeting_floor_utterance,
+            body.get("meeting_url", body.get("meetingUrl", "")),
+            body.get("agent_id", ""),
+            body.get("text", ""),
+            test_profile=body.get("test_profile", body.get("testProfile", "")),
+            role=body.get("role", "companion"),
+            correlation_id=body.get("correlation_id"),
+        )
+
+    @router.delete(f"{mount}/meet/floor")
+    async def invalidate_meet_floor(request: Request) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.invalidate_meeting_floor,
+            request.query_params.get("meeting_url", ""),
+            reason=request.query_params.get("reason", "operator-reset"),
+            test_profile=request.query_params.get("test_profile", ""),
+            cancel_waiters=True,
+        )
+
+    @router.post(f"{mount}/meet/floor/invalidate")
+    async def invalidate_meet_floor_worker(
+        request: Request, body: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        await _require(request, "worker", mutating=True)
+        return guarded(
+            service.invalidate_meeting_floor,
+            body.get("meeting_url", body.get("meetingUrl", "")),
+            reason=body.get("reason", "bridge-invalidated"),
+            test_profile=body.get("test_profile", body.get("testProfile", "")),
+            cancel_waiters=True,
         )
 
     @router.post(f"{mount}/meet/bridge/start")

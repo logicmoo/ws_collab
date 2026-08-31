@@ -33,6 +33,7 @@ import os
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from typing import Any
@@ -149,6 +150,26 @@ class MailboxClient:
             body={"device_id": device_id},
         )
 
+    def stop_secondary_capture(self) -> dict[str, Any]:
+        return self._call("/v1/audio/secondary-capture/stop", method="POST")
+
+    def start_companion_wiring_capture(self, device_id: str) -> dict[str, Any]:
+        return self._call(
+            "/v1/meet/companion-cable-wiring/capture/start",
+            method="POST",
+            body={"device_id": device_id},
+        )
+
+    def stop_companion_wiring_capture(self) -> dict[str, Any]:
+        return self._call(
+            "/v1/meet/companion-cable-wiring/capture/stop", method="POST"
+        )
+
+    def companion_cable_wiring(self) -> dict[str, Any]:
+        """Fetch the machine wiring config for bounded post-join auto-wire."""
+
+        return self._call("/v1/meet/companion-cable-wiring/runtime")
+
     def ingest_companion_browser_audio(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Push muted companion remote-media PCM into shared secondary capture."""
         return self._call(
@@ -159,6 +180,24 @@ class MailboxClient:
 
     def post_browser_nav_intent(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._call("/v1/browser/nav-intents", method="POST", body=payload)
+
+    def continue_meeting_floor(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Publish a durable floor-open edge to the shared agent/TTS coordinator."""
+
+        return self._call("/v1/meet/floor/continue", method="POST", body=payload)
+
+    def evaluate_meeting_silence_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate one canonical configured silence action."""
+
+        return self._call("/v1/meet/silence-action/evaluate", method="POST", body=payload)
+
+    def invalidate_meeting_floor(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._call("/v1/meet/floor/invalidate", method="POST", body=payload)
+
+    def meeting_floor_status(self, meeting_url: str) -> dict[str, Any]:
+        return self._call(
+            f"/v1/meet/floor/status?meeting_url={urllib.parse.quote(meeting_url, safe='')}"
+        )
 
 
 class BrowserNavIntentPoster:

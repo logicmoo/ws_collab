@@ -54,6 +54,9 @@ class TtsItem:
     correlation_id: str | None = field(default=None, compare=False)
     interrupt: bool = field(default=False, compare=False)
     cancelled: bool = field(default=False, compare=False)
+    requires_floor: bool = field(default=False, compare=False)
+    floor_test_profile: str = field(default="", compare=False)
+    floor_role: str = field(default="", compare=False)
 
     def __post_init__(self) -> None:
         # Lower priority number = spoken sooner; ties broken by FIFO.
@@ -75,6 +78,9 @@ class TtsItem:
             "artifact_source": self.artifact_source,
             "correlation_id": self.correlation_id,
             "cancelled": self.cancelled,
+            "requires_floor": self.requires_floor,
+            "floor_test_profile": self.floor_test_profile or None,
+            "floor_role": self.floor_role or None,
         }
 
 
@@ -142,6 +148,7 @@ class TtsEngine:
         self._muted_agents: set[str] = set()
         self._paused_agents: set[str] = set()
         self._recent: dict[str, float] = {}
+        self._floor_open: dict[tuple[str, str], dict[str, Any]] = {}
         self._dedupe_window_s = dedupe_window_s
         self._route_play = route_play
         self._route_status = route_status
@@ -190,6 +197,9 @@ class TtsEngine:
         correlation_id: str | None = None,
         interrupt: bool = False,
         dedupe: bool = True,
+        wait_for_floor: bool = False,
+        floor_test_profile: str = "",
+        floor_role: str = "",
     ) -> dict[str, Any]:
         text = (text or "").strip()
         if not text:
@@ -219,7 +229,18 @@ class TtsEngine:
                 artifact_source=artifact_source,
                 correlation_id=correlation_id,
                 interrupt=interrupt,
+                requires_floor=bool(wait_for_floor),
+                floor_test_profile=str(floor_test_profile or ""),
+                floor_role=str(floor_role or ""),
             )
+            floor_consumed = False
+            if item.requires_floor and item.meeting_url:
+                floor_key = (item.meeting_url, item.floor_test_profile)
+                grant = self._floor_open.get(floor_key)
+                if grant and self._floor_matches(item, grant):
+                    item.requires_floor = False
+                    self._floor_open.pop(floor_key, None)
+                    floor_consumed = True
             self._pending.append(item)
             self._pending.sort()
             self._recent[self._dedupe_key(agent_id, text)] = time.time()
@@ -227,7 +248,13 @@ class TtsEngine:
         if interrupt and self._current is not None:
             self.cancel(self._current.id)
         self._signal()
-        return {"duplicate": False, "id": item.id, "queue_position": queue_position}
+        return {
+            "duplicate": False,
+            "id": item.id,
+            "queue_position": queue_position,
+            "waiting_for_floor": item.requires_floor,
+            "floor_consumed": floor_consumed,
+        }
 
     def _dedupe_key(self, agent_id: str, text: str) -> str:
         return f"{agent_id}\x1f{normalize_text(text)}"
@@ -301,6 +328,112 @@ class TtsEngine:
             self._muted_agents.discard(agent_id)
         self._signal()
 
+    @staticmethod
+    def _floor_matches(item: TtsItem, grant: dict[str, Any]) -> bool:
+        test_profile = str(grant.get("test_profile") or "")
+        role = str(grant.get("role") or "")
+        return (
+            item.floor_test_profile == test_profile
+            and (not role or not item.floor_role or item.floor_role == role)
+        )
+
+    def open_floor(
+        self,
+        meeting_url: str,
+        *,
+        event_key: str,
+        test_profile: str = "",
+        role: str = "",
+    ) -> dict[str, Any]:
+        """Open one meeting-scoped floor grant and release at most one held item."""
+
+        grant = {
+            "meeting_url": meeting_url,
+            "event_key": str(event_key),
+            "test_profile": str(test_profile or ""),
+            "role": str(role or ""),
+            "opened_at": time.time(),
+        }
+        floor_key = (meeting_url, grant["test_profile"])
+        with self._lock:
+            existing = self._floor_open.get(floor_key)
+            if existing and existing.get("event_key") == grant["event_key"]:
+                return {"floor_open": True, "granted": False, "duplicate": True}
+            if self._current is not None:
+                return {
+                    "floor_open": False,
+                    "granted": False,
+                    "deferred": True,
+                    "reason": "agent-already-speaking",
+                }
+            item = next(
+                (
+                    candidate
+                    for candidate in self._pending
+                    if not candidate.cancelled
+                    and candidate.requires_floor
+                    and candidate.destination == "companion"
+                    and candidate.meeting_url == meeting_url
+                    and self._floor_matches(candidate, grant)
+                ),
+                None,
+            )
+            if item is None:
+                self._floor_open[floor_key] = grant
+                return {"floor_open": True, "granted": False, "reason": "no-queued-agent"}
+            item.requires_floor = False
+            self._floor_open.pop(floor_key, None)
+            result = {
+                "floor_open": False,
+                "granted": True,
+                "utterance_id": item.id,
+                "agent_id": item.agent_id,
+                "role": item.floor_role or None,
+            }
+        self._signal()
+        return result
+
+    def invalidate_floor(
+        self,
+        meeting_url: str,
+        *,
+        cancel_waiters: bool = False,
+        test_profile: str = "",
+    ) -> int:
+        """Invalidate one exact meeting and test-profile floor scope."""
+
+        with self._lock:
+            count = 0
+            if cancel_waiters:
+                for item in self._pending:
+                    if (
+                        item.requires_floor
+                        and item.meeting_url == meeting_url
+                        and item.floor_test_profile == test_profile
+                        and not item.cancelled
+                    ):
+                        item.cancelled = True
+                        count += 1
+            count += int(
+                self._floor_open.pop((meeting_url, str(test_profile or "")), None)
+                is not None
+            )
+            return count
+
+    def invalidate_all_floors(self, *, cancel_waiters: bool = False) -> int:
+        """Intentionally invalidate every floor scope."""
+
+        with self._lock:
+            count = 0
+            if cancel_waiters:
+                for item in self._pending:
+                    if item.requires_floor and not item.cancelled:
+                        item.cancelled = True
+                        count += 1
+            count += len(self._floor_open)
+            self._floor_open.clear()
+            return count
+
     # -------------------------------------------------------------------- state
     def state(self) -> dict[str, Any]:
         with self._lock:
@@ -311,6 +444,7 @@ class TtsEngine:
                 "paused_global": self._paused_global,
                 "paused_agents": sorted(self._paused_agents),
                 "muted_agents": sorted(self._muted_agents),
+                "floor_open": [dict(grant) for grant in self._floor_open.values()],
                 "backend": self._backend.name,
             }
         if self._route_status is not None:
@@ -366,6 +500,12 @@ class TtsEngine:
                     continue
                 if item.agent_id in self._paused_agents:
                     continue
+                if item.requires_floor:
+                    grant = self._floor_open.get(str(item.meeting_url or ""))
+                    if not grant or not self._floor_matches(item, grant):
+                        continue
+                    item.requires_floor = False
+                    self._floor_open.pop(str(item.meeting_url or ""), None)
                 self._pending.remove(item)
                 return item
             return None

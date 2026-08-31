@@ -56,6 +56,8 @@ class SecondaryCaptureService:
         self._chunks_forwarded = 0
         self._frames_forwarded = 0
         self._bytes_forwarded = 0
+        self._last_chunk_at: float | None = None
+        self._last_audio_at: float | None = None
         self._segments_forwarded = 0
         self._dispatch_errors = 0
         self._stream_error: str | None = None
@@ -148,6 +150,22 @@ class SecondaryCaptureService:
                 "chunks_forwarded": self._chunks_forwarded,
                 "frames_forwarded": self._frames_forwarded,
                 "bytes_forwarded": self._bytes_forwarded,
+                "last_chunk_at": self._last_chunk_at,
+                "last_audio_at": self._last_audio_at,
+                "vad_in_speech": bool(vad and vad.state.in_speech),
+                "silence_ready": bool(
+                    self._listening
+                    and (
+                        self._browser_connected
+                        if self._input_mode == "browser"
+                        else self._stream is not None
+                    )
+                ),
+                "decision_source": (
+                    "browser-media-stream"
+                    if self._input_mode == "browser"
+                    else "receive-cable"
+                ),
                 "segments_forwarded": self._segments_forwarded,
                 "dispatch_errors": self._dispatch_errors,
                 "browser_connected": self._browser_connected,
@@ -330,6 +348,8 @@ class SecondaryCaptureService:
             self._chunks_forwarded += chunks
             self._frames_forwarded += frames
             self._bytes_forwarded += byte_count
+            if frame is not None:
+                self._last_chunk_at = time.time()
 
     def _start_stream(self, device) -> bool:
         try:
@@ -348,7 +368,7 @@ class SecondaryCaptureService:
             copied = indata.copy()
             self._enqueue_frame(
                 copied,
-                chunks=0,
+                chunks=1,
                 frames=int(getattr(copied, "shape", [len(copied)])[0]),
                 byte_count=int(getattr(copied, "nbytes", 0)),
             )
@@ -426,6 +446,8 @@ class SecondaryCaptureService:
                 self._meter_level = level
                 self._peak_level = max(self._peak_level * 0.96, level)
                 self._clipping = bool(getattr(mono, "size", 0)) and bool((np.abs(mono) >= 0.999).any())
+                if level > vad.threshold:
+                    self._last_audio_at = time.time()
             event = vad.process(mono)
             if event == "speech_start":
                 in_speech = True
@@ -471,8 +493,16 @@ class SecondaryCaptureService:
                 "audio_source": "companion_heard_meeting_audio",
                 "capture": "secondary",
                 "exclude_engines": ["google_meet"],
-                "self_audio_exclusion": "remote-media-stream-only",
-                "artifact_suppression": "bridge-capture-time-filter",
+                "self_audio_exclusion": (
+                    "remote-media-stream-only"
+                    if self._input_mode == "browser"
+                    else "distinct-transmit-cable"
+                ),
+                "artifact_suppression": (
+                    "bridge-capture-time-filter"
+                    if self._input_mode == "browser"
+                    else "two-cable-physical-isolation"
+                ),
             },
         )
         with self._lock:

@@ -145,6 +145,44 @@ def resolve_audio_device(name_substring: str, *, want: str) -> int:
     return matches[0][0]
 
 
+def verify_audio_device_identity(
+    device_index: int,
+    *,
+    expected_name: str,
+    expected_host_api: str,
+    want: str,
+) -> dict[str, object]:
+    """Verify a volatile index still names the exact persisted endpoint."""
+
+    import sounddevice as sd
+
+    devices = sd.query_devices()
+    if not (0 <= int(device_index) < len(devices)):
+        raise ValueError(f"device index {device_index} is no longer available")
+    entry = devices[int(device_index)]
+    host_apis = sd.query_hostapis()
+    host_index = int(entry.get("hostapi", -1))
+    actual_host = (
+        str(host_apis[host_index].get("name") or "")
+        if 0 <= host_index < len(host_apis)
+        else str(host_index)
+    )
+    actual_name = str(entry.get("name") or "").strip()
+    channel_key = "max_output_channels" if want == "output" else "max_input_channels"
+    if actual_name != str(expected_name or "").strip() or actual_host != str(expected_host_api or ""):
+        raise ValueError(
+            f"device index {device_index} changed: expected {expected_name!r} on "
+            f"{expected_host_api!r}, found {actual_name!r} on {actual_host!r}"
+        )
+    if int(entry.get(channel_key, 0)) <= 0:
+        raise ValueError(f"device index {device_index} no longer supports {want}")
+    if want == "output":
+        sd.check_output_settings(device=int(device_index))
+    else:
+        sd.check_input_settings(device=int(device_index))
+    return {"index": int(device_index), "name": actual_name, "hostApi": actual_host}
+
+
 def play_wav_bytes_to_device(
     wav_bytes: bytes,
     device_index: int,

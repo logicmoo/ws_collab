@@ -106,3 +106,12 @@ class AdminUIState:
             }
             self._save()
         return self.get_page(key)
+
+    def clear_page(self, page: str) -> dict[str, Any]:
+        """Remove one auxiliary UI snapshot without touching durable events."""
+        key = self._page_key(page)
+        with self._lock:
+            self._load()
+            self._pages.pop(key, None)
+            self._save()
+        return self.get_page(key)

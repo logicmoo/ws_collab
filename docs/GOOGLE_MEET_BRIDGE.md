@@ -158,10 +158,29 @@ readiness, queued/speaking state, capacity, counters, and last output/error.
 Speech artifact IDs, agent/source markers, expected text, and the playback
 window are also carried into companion-heard STT suppression.
 
-The Silences admin page owns per-meeting backchannel configuration. **On
-silence** uses caption stasis and/or incoming-audio quiet detection, emits once
-on the quiet edge, and rearms after caption growth or speech resumes. **Every N
-seconds** runs only while the assigned companion is active and ready; both
+The Silences admin page owns global, per-channel, and named test silence-action
+configuration. Channel and test records are partial patches; deleting one
+immediately reveals the current global values. Live meetings resolve channel
+over global over built-in values. A Count-to-20 or ABC harness run temporarily
+leases its named test patch above that live channel; stop/completion removes the
+lease and an abandoned lease expires after five seconds. Test configuration
+never launches or joins a meeting and never rewrites production settings.
+One **Configuration target** selector lists **Default Config**, the currently
+selected **Tests here** harness profile, then known channels. **Save override**
+stores only differences from the current global default, **Reset from defaults**
+deletes a test/channel patch (or reloads the saved global form), and **Save to
+defaults** promotes the displayed effective form to global while preserving all
+partial override patches. Restoring built-ins is a separate advanced action. **On
+silence** uses caption stasis and/or incoming-audio quiet detection, acts once
+on the quiet edge, and rearms after caption growth or speech resumes. `Continue`
+opens a meeting-scoped floor gate in the shared agent TTS queue and never
+synthesizes filler audio; if no utterance is held, the gate remains available
+until one eligible agent queues. `Say "uh"`, `Say "uhuh"`, and `Say "hmm"` use
+the companion audio arbiter and do not open the floor. `Say nothing` explicitly
+records a suppressed no-op without floor, audio, backchannel, or caption-row
+effects. All five choices use one `action` field and the same inherited trigger
+and detector settings; audio shaping remains saved but applies only to `say:*`.
+**Every N seconds** is valid for `nothing` and `say:*`, but not `continue`; both
 modes honor the minimum safety gap and queue state. Switching meetings or
 reattaching a tab invalidates queued output and resets scheduling state.
 
@@ -226,6 +245,35 @@ prints exactly which named person should say which token and waits for operator
 input before checking the live caption.
 
 ### Companion-heard audio into Whisper and other STT drivers
+
+#### Feedback-safe two-cable wiring
+
+The Silences page can persist and apply four exact machine endpoints. RECEIVE
+uses a virtual cable's browser playback side (often product-labeled “Input”)
+and its paired server recording side (often product-labeled “Output”).
+TRANSMIT must be a different virtual cable: its server playback endpoint
+receives serialized agent TTS/backchannels and its browser recording endpoint
+replaces the companion's outbound audio sender.
+
+Wiring begins only after the companion is `in-call`. Remote media is first
+muted, every live media element is assigned and verified against the exact
+normalized RECEIVE browser label, server capture is started and verified, and
+only then are those elements unmuted into that virtual sink. The mic is acquired
+with an exact browser device constraint and replaces the existing sender; TTS
+output is re-verified by host API, label, direction, and live index. Any zero or
+ambiguous browser-label match, capture failure, changed media element, sink, or
+track immediately restores mute and stops the receive capture. No default
+speaker or host-mic fallback is used.
+
+Receive-cable PCM drives both the secondary non-Meet STT fanout and the actual
+Silence RMS/VAD decision. While cable mode is selected the legacy muted
+MediaStream tap is disabled, preventing double feed. An unwired/failed cable
+reports audio `not-ready` and cannot produce an audio-silence edge. Automatic
+wiring is bounded to three post-join attempts per tab/meeting; **Wire now** can
+apply or re-apply safely afterward. A manual disconnect suppresses automatic
+rewiring only for that exact tab, meeting, and saved configuration revision;
+an explicit wire, changed configuration, replacement tab, or new meeting clears
+the suppression.
 
 This route is experimental and remains **off by default**. Enable it for a
 manual bridge with `--companion-heard-stt`, or for server-managed bridge

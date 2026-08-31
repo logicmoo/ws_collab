@@ -141,16 +141,41 @@ Generic form: `POST /ws_collab/v1/events` with `{"stream", "type", "data",
 | POST | `/ws_collab/v1/browser/nav-intents` | worker |
 | GET | `/ws_collab/v1/meet/browser-settings` | viewer |
 | POST | `/ws_collab/v1/meet/browser-settings` | operator |
+| GET | `/ws_collab/v1/meet/companion-cable-wiring` | viewer |
+| POST | `/ws_collab/v1/meet/companion-cable-wiring` | operator |
+| POST | `/ws_collab/v1/meet/companion-cable-wiring/wire` | operator |
+| POST | `/ws_collab/v1/meet/companion-cable-wiring/disconnect` | operator |
+| GET | `/ws_collab/v1/meet/channels` | viewer |
+| POST | `/ws_collab/v1/meet/channels/forget` | operator |
+| POST | `/ws_collab/v1/meet/channels/prune` | operator |
 
 The POST route ingests redacted intent/outcome records from browser worker
 processes. Both phases share a `nav_id`; GET returns the durable `events` page
 and a newest-first `records` view merged by that identifier.
+
+Companion cable wiring persists four exact machine endpoints in
+`sound_settings.json`: RECEIVE browser playback/server capture and a different
+TRANSMIT TTS playback/companion mic pair. Saving never applies or unmutes it.
+`/wire` is the narrow authenticated proxy to the bridge's idempotent atomic
+operation; `/disconnect` immediately mutes remote media and stops its capture.
+The bridge accepts these operations only from the main server with its worker
+credential, rejects browser origins and arbitrary endpoint overrides, and
+re-fetches the validated saved configuration through the worker API.
+The worker-only runtime/capture subroutes accept only the saved RECEIVE device
+and are not general bridge-command or audio-device controls.
 
 Meet browser settings include the global boolean `require_sso_consent` (default
 `false`). The settings POST validates it as a JSON boolean. When enabled,
 explicitly typed SSO navigation requires native operator confirmation; when
 disabled, typed SSO navigation proceeds with a `consent-disabled` log record.
 The typed-intent classifier remains mandatory in both modes.
+
+Meeting forgetting stores normalized `forgotten_meeting_urls` tombstones in the
+active Meet profile. Passive event, admin-state, browser-history, tab, and live
+status discovery cannot restore a tombstoned channel. An explicit `/join`
+clears its tombstone. `channels/prune` requires a non-empty `keep` URL array and
+refuses to exclude the active meeting. Both operations remove channel-scoped
+role/Silence settings and test leases, but preserve transcript/event history.
 
 ### Workers
 | Method | Path | Role |
@@ -221,13 +246,44 @@ historical route name. The Silences admin page is the sole editor. Pass
 `meeting_url` to select an exact room; GET reports `source: "override"` or
 `"default"` plus `globalDefault`.
 
-POST accepts `enabled`, `phrase` (`uh`, `uhuh`, or `hmm`), legacy
+Scoped clients pass `scope=global|channel|test`, a normalized Google Meet
+`channel_key` for channel/test context, and `test_profile` for test scope.
+Channel identities are returned as `google-meet:<room-code>` rather than a
+display label. GET returns canonical values plus `scope`, `scopeKey`,
+`effective`, `hasOverride`, the stored `override` patch, and per-field
+`sources`. Resolution is test patch > channel patch > saved global > built-in.
+Test profiles may be resolved without a channel; in that case their base is
+global. A scoped POST accepts settings in `override` and can use
+`replace_override: true`. Scoped DELETE removes the channel/test patch; global
+DELETE resets only the saved global default to built-ins.
+
+POST accepts `enabled`, `action` (`continue`, `nothing`, `say:uh`, `say:uhuh`,
+or `say:hmm`), and
 `mode` (`reactive` for **on silence**, `fixed` for **every N seconds**),
 `interval_seconds`, `trigger` (`caption`, `audio`, or `both`),
 `after_seconds`, `silence_ms`, `min_gap_seconds`, `max_wait_seconds`,
 `audio_rms_threshold`, `click_ms`, `gain`, and formants `f0_hz`, `f1_hz`,
-`f2_hz`. Legacy `sound` remains accepted. DELETE with `meeting_url` removes
+`f2_hz`. Legacy `phrase`/`sound` inputs remain accepted and normalize to
+`action`; responses and new storage contain only `action`. DELETE with `meeting_url` removes
 that room's override and restores inherited defaults.
+
+`continue` is valid only with on-silence/reactive mode. It sends no companion
+filler audio: the bridge posts one meeting/test-scoped edge to
+`POST /meet/floor/continue`, which records `CONVERSATION_FLOOR_CONTINUE` and
+opens/releases one held utterance in the normal agent TTS queue.
+`POST /meet/floor/queue` holds an eligible companion utterance for that signal;
+`GET /meet/floor/status` reports open/granted/deferred state, and DELETE
+`/meet/floor` invalidates stale grants. `nothing` grants no floor and queues no
+audio; it records one suppressed no-op evaluation per silence edge or configured
+interval cadence. Interval mode accepts `nothing` and `say:*`, but rejects
+`continue`. Phrase-only saved records resolve as `say:<phrase>` without rewriting
+storage.
+
+The observation harness leases a selected test profile onto its live channel
+through `POST /meet/companion-click/test-session`. The UI renews the five-second
+lease while running and DELETEs it on stop/completion, so a disconnected test
+cannot remain active. This endpoint only selects configuration; it never
+launches or joins a meeting.
 
 ### Cursors
 | Method | Path | Role |

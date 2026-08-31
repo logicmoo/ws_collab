@@ -577,10 +577,29 @@ button.row-enabled-toggle[data-enabled="false"] { border-color: var(--status-dan
 }
 .meet-tree-meeting > summary a { color: var(--accent-teal); }
 .meet-tree-meeting > summary button {
-  margin-left: 8px;
   font-size: 10px;
   padding: 2px 8px;
   vertical-align: middle;
+}
+.meet-card-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-left: 10px;
+}
+.meet-actions-label {
+  color: var(--text-muted);
+  font: 600 9px ui-monospace, monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.meet-delete-action { display: inline-flex; }
+@media (max-width: 700px) {
+  .meet-card-actions {
+    display: flex;
+    margin: 7px 0 0 16px;
+  }
 }
 /* A single compact row of checkboxes replaces 5 separate section headings
  * — unchecking one hides its whole content block (see `hidden` in JS), so
@@ -705,6 +724,16 @@ button.mini.danger:hover { color: var(--status-danger); border-color: var(--stat
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 9px 12px;
 }
+
+#companion-cable-wiring-panel select {
+  min-width: min(100%, 34rem);
+}
+
+#companion-cable-wiring-panel label > .hint {
+  display: block;
+  max-width: 44rem;
+  margin-top: 0.25rem;
+}
 .companion-settings-grid > label {
   display: flex;
   flex-direction: column;
@@ -712,6 +741,12 @@ button.mini.danger:hover { color: var(--status-danger); border-color: var(--stat
   color: var(--text-secondary);
   font-size: 11px;
 }
+.companion-field-source {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 400;
+}
+.companion-field-source.overridden { color: var(--status-success); }
 .companion-settings-grid > label.companion-check {
   flex-direction: row;
   align-items: center;
@@ -726,8 +761,17 @@ button.mini.danger:hover { color: var(--status-danger); border-color: var(--stat
   border: 0;
 }
 .companion-actions { margin-top: 10px; }
+.companion-advanced-actions {
+  margin-top: 8px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.companion-advanced-actions summary { cursor: pointer; }
+.companion-advanced-actions button { margin: 8px 6px 0 0; }
 #meet-companion-result.error { color: var(--status-danger); }
 #meet-companion-result.ok { color: var(--status-success); }
+#meet-command-result.error { color: var(--status-danger); }
+#meet-command-result.ok { color: var(--status-success); }
 @media (max-width: 700px) {
   .companion-scope-row { align-items: stretch; }
   .companion-scope-row > label,

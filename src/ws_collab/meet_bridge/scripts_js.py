@@ -367,6 +367,24 @@ GUM_PATCH_JS = r"""
   if (window.__sapiPatched) return;
   window.__sapiPatched = true;
   const real = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  window.__wsCollabRealGetUserMedia = real;
+  window.__wsCollabOutboundSenders = window.__wsCollabOutboundSenders || new Set();
+  const pc = window.RTCPeerConnection && window.RTCPeerConnection.prototype;
+  if (pc && !pc.__wsCollabSenderTracking) {
+    pc.__wsCollabSenderTracking = true;
+    const addTrack = pc.addTrack;
+    pc.addTrack = function(...args) {
+      const sender = addTrack.apply(this, args);
+      if (sender) window.__wsCollabOutboundSenders.add(sender);
+      return sender;
+    };
+    const addTransceiver = pc.addTransceiver;
+    pc.addTransceiver = function(...args) {
+      const transceiver = addTransceiver.apply(this, args);
+      if (transceiver && transceiver.sender) window.__wsCollabOutboundSenders.add(transceiver.sender);
+      return transceiver;
+    };
+  }
   navigator.mediaDevices.getUserMedia = async (constraints) => {
     if (constraints && constraints.audio) {
       if (!window.__sapiCtx) {
@@ -391,6 +409,255 @@ GUM_PATCH_JS = r"""
     return real(constraints);
   };
 })();
+"""
+
+
+COMPANION_CABLE_PREPARE_JS = r"""
+(async () => {
+  const CONFIG = __WS_CONFIG__;
+  const operation = (window.__wsCollabCableGeneration =
+    Number(window.__wsCollabCableGeneration || 0) + 1);
+  const normalize = (value) => String(value || "").normalize("NFKC").toLocaleLowerCase().trim().replace(/\s+/g, " ");
+  const media = Array.from(document.querySelectorAll("audio,video")).filter((element) => {
+    const stream = element.srcObject;
+    return stream && typeof stream.getAudioTracks === "function"
+      && stream.getAudioTracks().some((track) => track.readyState === "live");
+  });
+  const muteAll = () => media.forEach((element) => {
+    try { element.muted = true; element.volume = 0; } catch (_error) {}
+  });
+  const ownedStreams = [];
+  const stopOwned = () => ownedStreams.forEach((stream) => {
+    try { stream.getTracks().forEach((track) => track.stop()); } catch (_error) {}
+  });
+  const requireCurrent = () => {
+    if (window.__wsCollabCableGeneration !== operation) {
+      stopOwned();
+      const error = new Error("stale companion cable wiring operation");
+      error.wsCollabStale = true;
+      throw error;
+    }
+  };
+  muteAll();
+  const state = window.__wsCollabCableWiring || {};
+  window.__wsCollabCableWiring = state;
+  state.phase = "preparing";
+  state.media = media;
+  state.feedbackSafeMuted = true;
+  state.error = null;
+  state.operationGeneration = operation;
+  try {
+    if (!media.length) throw new Error("no live companion remote media elements exist yet");
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+      throw new Error("browser media device enumeration is unavailable");
+    }
+    const realGum = window.__wsCollabRealGetUserMedia;
+    if (typeof realGum !== "function") throw new Error("unpatched exact-device getUserMedia is unavailable");
+    let devices = await navigator.mediaDevices.enumerateDevices();
+    requireCurrent();
+    if (devices.some((device) => (device.kind === "audioinput" || device.kind === "audiooutput") && !device.label)) {
+      const permissionOnly = await realGum({ audio: true, video: false });
+      ownedStreams.push(permissionOnly);
+      requireCurrent();
+      permissionOnly.getTracks().forEach((track) => track.stop());
+      devices = await navigator.mediaDevices.enumerateDevices();
+      requireCurrent();
+    }
+    const exact = (kind, endpoint) => {
+      const wanted = normalize(endpoint.normalizedLabel || endpoint.label);
+      const matches = devices.filter((device) => device.kind === kind && normalize(device.label) === wanted);
+      if (!wanted) throw new Error(`${kind} normalized label selector is empty`);
+      if (matches.length !== 1) {
+        throw new Error(`${matches.length} ${kind} devices exactly match normalized label "${wanted}"`);
+      }
+      return matches[0];
+    };
+    const sink = exact("audiooutput", CONFIG.receive_playback_sink);
+    const mic = exact("audioinput", CONFIG.transmit_companion_mic);
+    if (!sink.deviceId || sink.deviceId === "default") throw new Error("RECEIVE sink resolved to default/empty device");
+    if (!mic.deviceId || mic.deviceId === "default") throw new Error("TRANSMIT mic resolved to default/empty device");
+    for (const element of media) {
+      if (typeof element.setSinkId !== "function") throw new Error("setSinkId is unavailable");
+      requireCurrent();
+      await element.setSinkId(sink.deviceId);
+      requireCurrent();
+      if (element.sinkId !== sink.deviceId) throw new Error("RECEIVE sinkId did not settle on the exact selected device");
+    }
+    const micStream = await realGum({ audio: { deviceId: { exact: mic.deviceId } }, video: false });
+    ownedStreams.push(micStream);
+    requireCurrent();
+    const micTrack = micStream.getAudioTracks()[0];
+    const settings = micTrack && typeof micTrack.getSettings === "function" ? micTrack.getSettings() : {};
+    if (!micTrack || (settings.deviceId && settings.deviceId !== mic.deviceId)) {
+      micStream.getTracks().forEach((track) => track.stop());
+      throw new Error("TRANSMIT microphone track did not verify the exact selected device");
+    }
+    const senders = Array.from(window.__wsCollabOutboundSenders || []).filter((sender) => {
+      const track = sender && sender.track;
+      return track && track.kind === "audio";
+    });
+    if (!senders.length) {
+      micStream.getTracks().forEach((track) => track.stop());
+      throw new Error("no companion outbound audio RTCRtpSender is available");
+    }
+    const previousTracks = senders.map((sender) => sender.track).filter(Boolean);
+    micTrack.enabled = previousTracks[0] ? previousTracks[0].enabled : false;
+    requireCurrent();
+    await senders[0].replaceTrack(micTrack);
+    requireCurrent();
+    for (const sender of senders.slice(1)) {
+      requireCurrent();
+      await sender.replaceTrack(null);
+      requireCurrent();
+    }
+    const syntheticTracks = new Set(
+      window.__sapiSink && window.__sapiSink.stream
+        ? window.__sapiSink.stream.getAudioTracks()
+        : []
+    );
+    previousTracks.forEach((track) => {
+      if (!syntheticTracks.has(track)) {
+        try { track.stop(); } catch (_error) {}
+      }
+    });
+    requireCurrent();
+    state.micTrack = micTrack;
+    state.micSender = senders[0];
+    state.config = CONFIG;
+    state.sinkId = sink.deviceId;
+    state.sinkLabel = sink.label;
+    state.micDeviceId = mic.deviceId;
+    state.micLabel = mic.label;
+    state.phase = "capture-pending";
+    state.browserDevices = devices
+      .filter((device) => device.kind === "audioinput" || device.kind === "audiooutput")
+      .map((device) => ({ kind: device.kind, deviceId: device.deviceId, label: device.label, normalizedLabel: normalize(device.label) }));
+    requireCurrent();
+    return JSON.stringify({
+      ok: true,
+      phase: state.phase,
+      feedbackSafeMuted: true,
+      mediaElementCount: media.length,
+      sink: { desired: CONFIG.receive_playback_sink, actualDeviceId: sink.deviceId, actualLabel: sink.label, verified: true },
+      mic: { desired: CONFIG.transmit_companion_mic, actualDeviceId: mic.deviceId, actualLabel: mic.label, trackId: micTrack.id, verified: true },
+      browserDevices: state.browserDevices,
+    });
+  } catch (error) {
+    stopOwned();
+    if (error && error.wsCollabStale) {
+      muteAll();
+      return JSON.stringify({ ok: false, stale: true, feedbackSafeMuted: true, error: error.message });
+    }
+    muteAll();
+    state.phase = "failed";
+    state.feedbackSafeMuted = true;
+    state.error = error && error.message ? error.message : String(error);
+    if (state.micTrack) state.micTrack.enabled = false;
+    return JSON.stringify({ ok: false, phase: state.phase, feedbackSafeMuted: true, error: state.error });
+  }
+})()
+"""
+
+
+COMPANION_CABLE_FINALIZE_JS = r"""
+(async () => {
+  const state = window.__wsCollabCableWiring || {};
+  const operation = state.operationGeneration;
+  const current = () => operation && window.__wsCollabCableGeneration === operation;
+  const media = Array.from(state.media || []);
+  const currentMedia = Array.from(document.querySelectorAll("audio,video")).filter((element) => {
+    const stream = element.srcObject;
+    return stream && typeof stream.getAudioTracks === "function"
+      && stream.getAudioTracks().some((track) => track.readyState === "live");
+  });
+  const fail = (message) => {
+    media.forEach((element) => { try { element.muted = true; element.volume = 0; } catch (_error) {} });
+    if (state.micTrack) state.micTrack.enabled = false;
+    state.phase = "failed";
+    state.feedbackSafeMuted = true;
+    state.error = message;
+    return JSON.stringify({ ok: false, phase: state.phase, feedbackSafeMuted: true, error: message });
+  };
+  if (!current()) return JSON.stringify({ ok: false, stale: true, feedbackSafeMuted: true, error: "stale companion cable wiring operation" });
+  if (!state.sinkId || !media.length) return fail("prepared RECEIVE sink state is missing");
+  if (currentMedia.length !== media.length || currentMedia.some((element) => !media.includes(element))) {
+    currentMedia.forEach((element) => { try { element.muted = true; element.volume = 0; } catch (_error) {} });
+    return fail("RECEIVE media elements changed before unmute");
+  }
+  if (!state.micSender || state.micSender.track !== state.micTrack) return fail("TRANSMIT mic sender verification failed");
+  for (const element of media) {
+    if (!element.isConnected || element.sinkId !== state.sinkId) return fail("RECEIVE media element/device changed before unmute");
+  }
+  if (!current()) return JSON.stringify({ ok: false, stale: true, feedbackSafeMuted: true, error: "stale companion cable wiring operation" });
+  media.forEach((element) => { element.volume = 0.8; element.muted = false; });
+  if (media.some((element) => element.sinkId !== state.sinkId)) return fail("RECEIVE sink changed while unmuting");
+  if (!current()) {
+    media.forEach((element) => { element.muted = true; element.volume = 0; });
+    return JSON.stringify({ ok: false, stale: true, feedbackSafeMuted: true, error: "stale companion cable wiring operation" });
+  }
+  state.phase = "wired";
+  state.feedbackSafeMuted = false;
+  state.error = null;
+  state.wiredAt = Date.now();
+  return JSON.stringify({
+    ok: true,
+    phase: state.phase,
+    feedbackSafeMuted: false,
+    wiredAt: state.wiredAt,
+    mediaElementCount: media.length,
+    sink: { actualDeviceId: state.sinkId, actualLabel: state.sinkLabel, verified: true },
+    mic: { actualDeviceId: state.micDeviceId, actualLabel: state.micLabel, trackId: state.micTrack.id, verified: true },
+  });
+})()
+"""
+
+
+COMPANION_CABLE_FAIL_CLOSED_JS = r"""
+(() => {
+  window.__wsCollabCableGeneration =
+    Number(window.__wsCollabCableGeneration || 0) + 1;
+  const state = window.__wsCollabCableWiring || {};
+  const media = new Set([...(state.media || []), ...document.querySelectorAll("audio,video")]);
+  media.forEach((element) => { try { element.muted = true; element.volume = 0; } catch (_error) {} });
+  if (state.micTrack) state.micTrack.enabled = false;
+  state.phase = "disconnected";
+  state.feedbackSafeMuted = true;
+  return JSON.stringify({ ok: true, phase: state.phase, feedbackSafeMuted: true });
+})()
+"""
+
+
+COMPANION_CABLE_VERIFY_JS = r"""
+(() => {
+  const state = window.__wsCollabCableWiring || {};
+  const media = Array.from(state.media || []);
+  const currentMedia = Array.from(document.querySelectorAll("audio,video")).filter((element) => {
+    const stream = element.srcObject;
+    return stream && typeof stream.getAudioTracks === "function"
+      && stream.getAudioTracks().some((track) => track.readyState === "live");
+  });
+  const sameMedia = currentMedia.length === media.length
+    && currentMedia.every((element) => media.includes(element));
+  const sinkVerified = sameMedia && !!state.sinkId && media.length > 0
+    && media.every((element) => element.isConnected && element.sinkId === state.sinkId);
+  const micVerified = !!state.micTrack && !!state.micSender
+    && state.micTrack.readyState === "live" && state.micSender.track === state.micTrack;
+  if (!sinkVerified || !micVerified) {
+    new Set([...media, ...currentMedia]).forEach((element) => { try { element.muted = true; element.volume = 0; } catch (_error) {} });
+    if (state.micTrack) state.micTrack.enabled = false;
+    state.phase = "failed";
+    state.feedbackSafeMuted = true;
+    state.error = !sinkVerified ? "RECEIVE sink/media changed" : "TRANSMIT mic track changed";
+  }
+  return JSON.stringify({
+    ok: sinkVerified && micVerified,
+    phase: state.phase || "unwired",
+    feedbackSafeMuted: state.feedbackSafeMuted !== false,
+    sinkVerified,
+    micVerified,
+    error: state.error || null,
+  });
+})()
 """
 
 SPEAK_INTO_MEETING_JS = r"""

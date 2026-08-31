@@ -131,6 +131,8 @@ def _fake_catalog() -> list[Device]:
         # same "which side is this" ambiguity the UI needs to resolve.
         make("Virtual Cable (playback side)", DIRECTION_VIRTUAL, supports_input=False, supports_output=True, channels=2),
         make("Virtual Cable (recording side)", DIRECTION_VIRTUAL, supports_input=True, supports_output=False, channels=2),
+        make("Virtual Cable B (playback side)", DIRECTION_VIRTUAL, supports_input=False, supports_output=True, channels=2),
+        make("Virtual Cable B (recording side)", DIRECTION_VIRTUAL, supports_input=True, supports_output=False, channels=2),
     ]
 
 

@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import re
+import secrets
 import sys
 import threading
 import time
@@ -28,6 +29,12 @@ from .audio.secondary_capture import SecondaryCaptureService
 from .audio.devices import DeviceRegistry
 from .audio.routing import RoutingManager
 from .audio.segment import AudioSegment
+from .companion_wiring import (
+    ENDPOINTS as COMPANION_WIRING_ENDPOINTS,
+    WIRING_KEY as COMPANION_WIRING_KEY,
+    build_wiring_config,
+    validate_wiring_config,
+)
 from .admin_ui_state import AdminUIState
 from .classify import SourceClassifier
 from .config import Config, ECHO_POLICIES
@@ -37,6 +44,9 @@ from .errors import AuthorizationError, ConflictError, NotFoundError, Validation
 from .events import (
     AGENT_SPEECH_STARTED,
     BROWSER_NAV_INTENT,
+    CONVERSATION_SILENCE_ACTION_EVALUATED,
+    CONVERSATION_FLOOR_CONTINUE,
+    CONVERSATION_FLOOR_INVALIDATED,
     CONVERSATION_MESSAGE,
     DYNAMIC_STREAMS,
     HEARD_SPEECH,
@@ -88,7 +98,7 @@ from .meet_bridge.cdp import (
     set_browser_nav_profile,
 )
 from .meet_bridge import navigator
-from .meet_browser_settings import MeetBrowserSettings
+from .meet_browser_settings import MeetBrowserSettings, normalize_meeting_url
 
 
 # The canonical capture source that STT engine routes hang off.
@@ -108,6 +118,32 @@ _MEET_URL_RE = re.compile(
     re.IGNORECASE,
 )
 _IGNORED_MEET_ROOMS = {"xxx-yyyy-zzz"}
+_COMPANION_TEST_PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+_COMPANION_FIELDS = (
+    "enabled", "action", "intervalSeconds", "mode", "trigger", "afterSeconds", "silenceMs",
+    "minGapSeconds", "maxWaitSeconds", "audioRmsThreshold", "clickMs", "gain",
+    "f0Hz", "f1Hz", "f2Hz",
+)
+_COMPANION_ACTIONS = {"continue", "nothing", "say:uh", "say:uhuh", "say:hmm", "say:click"}
+_COMPANION_CLIENT_ACTIONS = _COMPANION_ACTIONS - {"say:click"}
+_COMPANION_BUILTINS: dict[str, Any] = {
+    "enabled": False,
+    "action": "say:uh",
+    "intervalSeconds": 2.0,
+    "mode": "reactive",
+    "triggerMode": "on_silence",
+    "trigger": "caption",
+    "afterSeconds": 10.0,
+    "silenceMs": 500.0,
+    "minGapSeconds": 6.0,
+    "maxWaitSeconds": 0.0,
+    "audioRmsThreshold": 0.015,
+    "clickMs": 100.0,
+    "gain": 0.12,
+    "f0Hz": 125.0,
+    "f1Hz": 600.0,
+    "f2Hz": 1300.0,
+}
 
 
 def _sso_sort_key(account_id: str) -> tuple[int, str]:
@@ -181,6 +217,7 @@ class WsCollabService:
         # reload themselves when it changes, so a restart swaps in freshly hosted
         # assets instead of leaving stale HTML/JS running against the new server.
         self.boot_id = uuid.uuid4().hex
+        self._meet_bridge_process_secret = secrets.token_urlsafe(32)
         self.broker = Broker()
 
         # Audit sink used by every subsystem so security-relevant changes are durable.
@@ -227,6 +264,8 @@ class WsCollabService:
             route_status=self._companion_tts_status,
             route_cancel=self._cancel_companion_tts,
         )
+        self._meeting_floor_lock = threading.RLock()
+        self._meeting_floor_status: dict[str, dict[str, Any]] = {}
         self.capture = CaptureService(
             config, self.devices, self.publish, self.process_segment, is_tts_speaking=lambda: self.tts.is_speaking
         )
@@ -304,6 +343,20 @@ class WsCollabService:
                 return json.loads(response.read().decode("utf-8"))
         except Exception:
             return None
+
+    def _meet_bridge_worker_credential(self) -> str:
+        for preferred_role in ("admin", "operator", "worker"):
+            token = next(
+                (
+                    value
+                    for value, descriptor in self.config.tokens.items()
+                    if descriptor.get("role") == preferred_role
+                ),
+                "",
+            )
+            if token:
+                return token
+        return self._meet_bridge_process_secret
 
     def _meet_bridge_port_open(self) -> bool:
         import socket
@@ -408,7 +461,10 @@ class WsCollabService:
         meeting_role_account_maps: dict[str, Any] | None = None,
         companion_click: dict[str, Any] | None = None,
         meeting_companion_click: dict[str, Any] | None = None,
+        test_companion_click: dict[str, Any] | None = None,
+        active_test_companion_click: dict[str, Any] | None = None,
         known_meeting_urls: list[str] | None = None,
+        forgotten_meeting_urls: list[str] | None = None,
     ) -> dict[str, Any]:
         return self.meet_browser_settings.set_profile_state(
             profile_path or self._meet_profile_path(),
@@ -417,7 +473,10 @@ class WsCollabService:
             meeting_role_account_maps=meeting_role_account_maps,
             companion_click=companion_click,
             meeting_companion_click=meeting_companion_click,
+            test_companion_click=test_companion_click,
+            active_test_companion_click=active_test_companion_click,
             known_meeting_urls=known_meeting_urls,
+            forgotten_meeting_urls=forgotten_meeting_urls,
         )
 
     def _normalize_sso_accounts(self, accounts: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
@@ -531,11 +590,18 @@ class WsCollabService:
     @staticmethod
     def _meet_assignment_key(meeting_url: str) -> str:
         value = str(meeting_url or "").strip()
+        stable_match = re.fullmatch(
+            r"google-meet:([a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4})",
+            value,
+            re.IGNORECASE,
+        )
+        if stable_match:
+            return f"https://meet.google.com/{stable_match.group(1).lower()}"
         room_match = re.fullmatch(r"[a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4}", value, re.IGNORECASE)
         if room_match:
             return f"https://meet.google.com/{room_match.group(0).lower()}"
         match = re.match(
-            r"^https?://meet\.google\.com/([a-z0-9-]+)(?:[/?#].*)?$",
+            r"^https?://meet\.google\.com/([a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4})(?:[/?#].*)?$",
             value,
             re.IGNORECASE,
         )
@@ -630,6 +696,11 @@ class WsCollabService:
         state = self._meet_profile_state(profile_path)
         known: list[str] = []
         seen: set[str] = set()
+        forgotten = {
+            url
+            for candidate in state.get("forgotten_meeting_urls", [])
+            if (url := self._normal_meet_url(candidate))
+        }
         raw_known = state.get("known_meeting_urls", [])
         raw_maps = state.get("meeting_role_account_maps", {})
         raw_click_maps = state.get("meeting_companion_click", {})
@@ -643,7 +714,7 @@ class WsCollabService:
         candidates.extend(urls)
         for candidate in candidates:
             url = self._normal_meet_url(candidate)
-            if url and url not in seen:
+            if url and url not in forgotten and url not in seen:
                 seen.add(url)
                 known.append(url)
         if known != raw_known:
@@ -651,7 +722,6 @@ class WsCollabService:
         return known
 
     def _known_meeting_urls(self, profile_path: Path, *, include_history: bool = True) -> list[str]:
-        state = self._meet_profile_state(profile_path)
         known = self._remember_known_meeting_urls(profile_path, set())
         if include_history:
             now = time.time()
@@ -664,6 +734,145 @@ class WsCollabService:
         if live_url:
             known = self._remember_known_meeting_urls(profile_path, {live_url})
         return known
+
+    def _unforget_and_remember_meeting(self, meeting_url: str) -> str:
+        """Clear a tombstone only for an explicit operator join/connect."""
+        key = self._meet_assignment_key(meeting_url)
+        self.meet_browser_settings.unforget_meeting_url(self._meet_profile_path(), key)
+        return key
+
+    def _discovered_meeting_urls(self, profile_path: Path) -> set[str]:
+        state = self._meet_profile_state(profile_path)
+        found: dict[str, str] = {}
+        for name in (
+            "known_meeting_urls",
+            "forgotten_meeting_urls",
+            "meeting_role_account_maps",
+            "meeting_companion_click",
+        ):
+            self._collect_meet_urls_from_value(state.get(name), found, f"profile {name}")
+        for url, source in self._historical_meet_urls(profile_path).items():
+            found.setdefault(url, source)
+        for url in self._known_meeting_scan_cache:
+            normalized = self._normal_meet_url(url)
+            if normalized:
+                found.setdefault(normalized, "meeting scan cache")
+        live = self._normal_meet_url(
+            (self._meet_bridge_health_for_settings() or {}).get("meetingUrl")
+        )
+        if live:
+            found.setdefault(live, "active meeting")
+        return set(found)
+
+    def _apply_meeting_prune(
+        self,
+        keep_urls: list[str],
+        *,
+        discovered: set[str],
+        active: str,
+    ) -> dict[str, Any]:
+        profile_path = self._meet_profile_path()
+        keep = list(dict.fromkeys(keep_urls))
+        before = self._meet_profile_state(profile_path)
+        prior_forgotten = {
+            url
+            for candidate in before.get("forgotten_meeting_urls", [])
+            if (url := self._normal_meet_url(candidate))
+        }
+        forget = discovered - set(keep)
+        newly_forgotten = sorted(forget - prior_forgotten)
+        already_forgotten = sorted(forget & prior_forgotten)
+
+        def update(state: dict[str, Any]) -> None:
+            state["known_meeting_urls"] = keep
+            state["forgotten_meeting_urls"] = sorted(
+                (prior_forgotten | forget) - set(keep)
+            )
+            for map_name in ("meeting_role_account_maps", "meeting_companion_click"):
+                mapping = state.get(map_name, {})
+                if isinstance(mapping, dict):
+                    state[map_name] = {
+                        key: value
+                        for key, value in mapping.items()
+                        if self._normal_meet_url(key) in keep
+                    }
+            lease = state.get("active_test_companion_click", {})
+            if (
+                isinstance(lease, dict)
+                and self._normal_meet_url(lease.get("channelKey")) in forget
+            ):
+                state["active_test_companion_click"] = {}
+
+        self.meet_browser_settings.update_profile_state(profile_path, update)
+        self.admin_ui_state.clear_page("meet")
+        with self._meeting_floor_lock:
+            for key in forget:
+                self._meeting_floor_status.pop(key, None)
+                self.tts.invalidate_floor(key, cancel_waiters=True)
+        self._known_meeting_scan_cache = sorted(set(keep))
+        self._known_meeting_scan_at = time.time()
+        return {
+            "kept": keep,
+            "forgotten": newly_forgotten,
+            "alreadyForgotten": already_forgotten,
+            "active": active or None,
+            "historyPreserved": True,
+        }
+
+    def forget_meeting_channel(self, meeting_url: str) -> dict[str, Any]:
+        key = self._meet_assignment_key(meeting_url)
+        profile_path = self._meet_profile_path()
+        active = self._normal_meet_url(
+            (self._meet_bridge_health_for_settings() or {}).get("meetingUrl")
+        ) or ""
+        if active == key:
+            raise ConflictError("cannot forget the currently active meeting")
+        discovered = self._discovered_meeting_urls(profile_path) | {key}
+        keep = sorted(discovered - {key} - {
+            url
+            for candidate in self._meet_profile_state(profile_path).get(
+                "forgotten_meeting_urls", []
+            )
+            if (url := self._normal_meet_url(candidate))
+        })
+        return self._apply_meeting_prune(keep, discovered=discovered, active=active)
+
+    def get_meeting_channels(self) -> dict[str, Any]:
+        profile_path = self._meet_profile_path()
+        state = self._meet_profile_state(profile_path)
+        forgotten = sorted({
+            url
+            for candidate in state.get("forgotten_meeting_urls", [])
+            if (url := self._normal_meet_url(candidate))
+        })
+        active = self._normal_meet_url(
+            (self._meet_bridge_health_for_settings() or {}).get("meetingUrl")
+        )
+        return {
+            "known": self._known_meeting_urls(profile_path),
+            "forgotten": forgotten,
+            "active": active,
+        }
+
+    def prune_meeting_channels(self, keep_urls: list[str]) -> dict[str, Any]:
+        if not isinstance(keep_urls, list) or not keep_urls:
+            raise ValidationError("keep must be a non-empty array of Google Meet channels")
+        try:
+            keep = list(dict.fromkeys(normalize_meeting_url(value) for value in keep_urls))
+        except ValueError as error:
+            raise ValidationError(str(error)) from error
+        profile_path = self._meet_profile_path()
+        active = self._normal_meet_url(
+            (self._meet_bridge_health_for_settings() or {}).get("meetingUrl")
+        ) or ""
+        if active and active not in keep:
+            raise ConflictError(
+                "cannot prune the currently active meeting unless it is in keep"
+            )
+        discovered = self._discovered_meeting_urls(profile_path) | set(keep)
+        return self._apply_meeting_prune(
+            keep, discovered=discovered, active=active
+        )
 
     def _meeting_role_overrides(
         self,
@@ -704,24 +913,7 @@ class WsCollabService:
 
     @staticmethod
     def _normalize_companion_click_setting(raw: Any, default: dict[str, Any] | None = None) -> dict[str, Any]:
-        baseline = default or {
-            "enabled": False,
-            "intervalSeconds": 2.0,
-            "mode": "reactive",
-            "trigger": "caption",
-            "afterSeconds": 10.0,
-            "silenceMs": 500.0,
-            "minGapSeconds": 6.0,
-            "maxWaitSeconds": 0.0,
-            "audioRmsThreshold": 0.015,
-            "clickMs": 100.0,
-            "gain": 0.12,
-            "sound": "uh",
-            "phrase": "uh",
-            "f0Hz": 125.0,
-            "f1Hz": 600.0,
-            "f2Hz": 1300.0,
-        }
+        baseline = default or _COMPANION_BUILTINS
         row = raw if isinstance(raw, dict) else {}
         enabled = bool(row.get("enabled", baseline.get("enabled", False)))
         aliases = {
@@ -764,14 +956,25 @@ class WsCollabService:
         trigger = str(row.get("trigger") or baseline.get("trigger") or "caption").lower()
         if trigger not in {"caption", "audio", "both"}:
             trigger = "caption"
-        sound = str(row.get("sound") or baseline.get("sound") or "uh").lower()
-        if sound not in {"uh", "click"}:
-            sound = "uh"
-        phrase = str(row.get("phrase") or row.get("sound") or baseline.get("phrase") or sound).lower()
+        phrase = str(
+            row.get("phrase") or row.get("sound")
+            or baseline.get("phrase") or baseline.get("sound") or "uh"
+        ).lower()
         if phrase not in {"uh", "uhuh", "hmm", "click"}:
             phrase = "uh"
+        raw_action = row.get("action")
+        if raw_action is None and ("phrase" in row or "sound" in row):
+            raw_action = f"say:{phrase}"
+        action = str(raw_action or baseline.get("action") or f"say:{phrase}").strip().lower()
+        if action not in _COMPANION_ACTIONS:
+            action = f"say:{phrase}" if phrase in {"uh", "uhuh", "hmm", "click"} else "say:uh"
+        if action == "continue" and mode == "fixed":
+            # Invalid persisted combinations are constrained safely without
+            # rewriting legacy settings. New writes are rejected below.
+            mode = "reactive"
         return {
             "enabled": enabled,
+            "action": action,
             "intervalSeconds": positive("intervalSeconds", 2.0),
             "mode": mode,
             "triggerMode": "interval" if mode == "fixed" else "on_silence",
@@ -783,11 +986,64 @@ class WsCollabService:
             "audioRmsThreshold": nonnegative("audioRmsThreshold", 0.015),
             "clickMs": positive("clickMs", 100.0),
             "gain": min(1.0, positive("gain", 0.12)),
-            "sound": sound,
-            "phrase": phrase,
             "f0Hz": positive("f0Hz", 125.0),
             "f1Hz": positive("f1Hz", 600.0),
             "f2Hz": positive("f2Hz", 1300.0),
+        }
+
+    @staticmethod
+    def _companion_test_profile(value: Any) -> str:
+        name = str(value or "").strip().lower()
+        if not _COMPANION_TEST_PROFILE_RE.fullmatch(name):
+            raise ValidationError(
+                "test_profile must be 1-64 lowercase letters, numbers, dots, underscores, or hyphens"
+            )
+        return name
+
+    @staticmethod
+    def _companion_channel_scope_key(meeting_url: str) -> str:
+        url = WsCollabService._meet_assignment_key(meeting_url)
+        return f"google-meet:{url.rsplit('/', 1)[-1]}"
+
+    @staticmethod
+    def _companion_patch_from_storage(raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        aliases = {
+            "intervalSeconds": ("intervalSeconds", "interval_seconds"),
+            "afterSeconds": ("afterSeconds", "after_seconds"),
+            "silenceMs": ("silenceMs", "silence_ms"),
+            "minGapSeconds": ("minGapSeconds", "min_gap_seconds"),
+            "maxWaitSeconds": ("maxWaitSeconds", "max_wait_seconds"),
+            "audioRmsThreshold": ("audioRmsThreshold", "audio_rms_threshold"),
+            "clickMs": ("clickMs", "click_ms"),
+            "f0Hz": ("f0Hz", "f0_hz", "f0"),
+            "f1Hz": ("f1Hz", "f1_hz", "f1"),
+            "f2Hz": ("f2Hz", "f2_hz", "f2"),
+        }
+        patch: dict[str, Any] = {}
+        for key in ("enabled", "action", "mode", "trigger", "gain", "sound", "phrase"):
+            if key in raw:
+                patch[key] = raw[key]
+        if "mode" not in patch:
+            for alias in ("triggerMode", "trigger_mode"):
+                if alias in raw:
+                    patch["mode"] = raw[alias]
+                    break
+        for canonical, names in aliases.items():
+            for name in names:
+                if name in raw:
+                    patch[canonical] = raw[name]
+                    break
+        if "action" not in patch and ("phrase" in patch or "sound" in patch):
+            legacy_phrase = str(patch.get("phrase") or patch.get("sound") or "uh").lower()
+            if legacy_phrase in {"uh", "uhuh", "hmm", "click"}:
+                patch["action"] = f"say:{legacy_phrase}"
+        normalized = WsCollabService._normalize_companion_click_setting(patch)
+        return {
+            key: normalized[key]
+            for key in _COMPANION_FIELDS
+            if key in patch or (key == "action" and ("phrase" in patch or "sound" in patch))
         }
 
     def _meet_companion_click_maps(
@@ -804,10 +1060,20 @@ class WsCollabService:
                     key = self._meet_assignment_key(str(raw_key))
                 except ValidationError:
                     continue
-                overrides[key] = self._normalize_companion_click_setting(raw_setting, default)
-        if overrides != raw_overrides:
-            self._set_meet_profile_state(profile_path, meeting_companion_click=overrides)
+                overrides[key] = self._companion_patch_from_storage(raw_setting)
         return default, overrides
+
+    def _test_companion_click_map(self, profile_path: Path) -> dict[str, dict[str, Any]]:
+        raw_profiles = self._meet_profile_state(profile_path).get("test_companion_click", {})
+        profiles: dict[str, dict[str, Any]] = {}
+        if isinstance(raw_profiles, dict):
+            for raw_name, raw_setting in raw_profiles.items():
+                try:
+                    name = self._companion_test_profile(raw_name)
+                except ValidationError:
+                    continue
+                profiles[name] = self._companion_patch_from_storage(raw_setting)
+        return profiles
 
     def _effective_meet_companion_click(
         self,
@@ -817,8 +1083,628 @@ class WsCollabService:
         default, overrides = self._meet_companion_click_maps(profile_path)
         key = self._meet_assignment_key(meeting_url) if meeting_url else ""
         if key and key in overrides:
-            return {**overrides[key], "meetingUrl": key, "source": "override"}
+            setting = self._normalize_companion_click_setting(overrides[key], default)
+            return {**setting, "meetingUrl": key, "source": "override"}
         return {**default, "meetingUrl": key, "source": "default"}
+
+    def _validate_companion_patch(
+        self,
+        raw: dict[str, Any],
+        base: dict[str, Any],
+    ) -> dict[str, Any]:
+        aliases = {
+            "interval_seconds": "intervalSeconds",
+            "after_seconds": "afterSeconds",
+            "silence_ms": "silenceMs",
+            "min_gap_seconds": "minGapSeconds",
+            "max_wait_seconds": "maxWaitSeconds",
+            "audio_rms_threshold": "audioRmsThreshold",
+            "click_ms": "clickMs",
+            "f0_hz": "f0Hz",
+            "f1_hz": "f1Hz",
+            "f2_hz": "f2Hz",
+            "trigger_mode": "mode",
+            "triggerMode": "mode",
+        }
+        allowed = set(_COMPANION_FIELDS) | set(aliases) | {"phrase", "sound"}
+        unknown = sorted(set(raw) - allowed)
+        if unknown:
+            raise ValidationError(f"unknown companion-click setting: {unknown[0]}")
+        values: dict[str, Any] = {}
+        for raw_key, value in raw.items():
+            key = aliases.get(raw_key, raw_key)
+            if key in values and values[key] != value:
+                raise ValidationError(f"conflicting values for {key}")
+            values[key] = value
+        if "enabled" in values and not isinstance(values["enabled"], bool):
+            raise ValidationError("enabled must be a boolean")
+        if "action" in values:
+            action = str(values["action"]).strip().lower()
+            if action not in _COMPANION_CLIENT_ACTIONS:
+                raise ValidationError(
+                    "action must be 'continue', 'nothing', 'say:uh', 'say:uhuh', or 'say:hmm'"
+                )
+            values["action"] = action
+        if "mode" in values:
+            mode = str(values["mode"]).strip().lower().replace("-", "_")
+            mode = {"on_silence": "reactive", "interval": "fixed"}.get(mode, mode)
+            if mode not in {"reactive", "fixed"}:
+                raise ValidationError("mode must be 'on_silence'/'reactive' or 'interval'/'fixed'")
+            values["mode"] = mode
+        if "trigger" in values:
+            trigger = str(values["trigger"]).strip().lower()
+            if trigger not in {"caption", "audio", "both"}:
+                raise ValidationError("trigger must be 'caption', 'audio', or 'both'")
+            values["trigger"] = trigger
+        if "sound" in values:
+            sound = str(values["sound"]).strip().lower()
+            if sound in {"uhuh", "hmm"}:
+                values.setdefault("phrase", sound)
+            if sound not in {"uh", "click"}:
+                if sound not in {"uhuh", "hmm"}:
+                    raise ValidationError("legacy sound must be 'uh', 'uhuh', 'hmm', or 'click'")
+            if "action" not in values:
+                values["action"] = f"say:{sound}"
+        if "phrase" in values:
+            phrase = str(values["phrase"]).strip().lower()
+            if phrase not in {"uh", "uhuh", "hmm", "click"}:
+                raise ValidationError("phrase must be 'uh', 'uhuh', or 'hmm'")
+            if "action" not in values:
+                values["action"] = f"say:{phrase}"
+        values.pop("sound", None)
+        values.pop("phrase", None)
+        limits = {
+            "intervalSeconds": (0.1, 3600.0),
+            "afterSeconds": (0.1, 3600.0),
+            "silenceMs": (10.0, 10000.0),
+            "minGapSeconds": (0.1, 3600.0),
+            "maxWaitSeconds": (0.0, 3600.0),
+            "audioRmsThreshold": (0.0, 1.0),
+            "clickMs": (10.0, 1000.0),
+            "gain": (0.001, 1.0),
+            "f0Hz": (40.0, 500.0),
+            "f1Hz": (100.0, 5000.0),
+            "f2Hz": (200.0, 8000.0),
+        }
+        for key, (minimum, maximum) in limits.items():
+            if key not in values:
+                continue
+            try:
+                parsed = float(values[key])
+            except (TypeError, ValueError) as error:
+                raise ValidationError(f"{key} must be a number") from error
+            if not minimum <= parsed <= maximum:
+                raise ValidationError(f"{key} must be between {minimum:g} and {maximum:g}")
+            values[key] = parsed
+        effective = {**base, **values}
+        if effective.get("action") == "continue" and effective.get("mode") == "fixed":
+            raise ValidationError(
+                "action 'continue' requires trigger mode 'on_silence'; interval is unsafe for floor grants"
+            )
+        if not float(effective["f0Hz"]) < float(effective["f1Hz"]) < float(effective["f2Hz"]):
+            raise ValidationError("frequencies must be ordered f0_hz < f1_hz < f2_hz")
+        return values
+
+    def get_companion_click_config(
+        self,
+        scope: str = "global",
+        *,
+        channel_key: str = "",
+        test_profile: str = "",
+    ) -> dict[str, Any]:
+        normalized_scope = str(scope or "global").strip().lower()
+        if normalized_scope == "meeting":
+            normalized_scope = "channel"
+        if normalized_scope not in {"global", "channel", "test"}:
+            raise ValidationError("scope must be global, channel, or test")
+        profile_path = self._meet_profile_path()
+        state = self._meet_profile_state(profile_path)
+        saved_global = self._companion_patch_from_storage(state.get("companion_click"))
+        global_default = self._normalize_companion_click_setting(saved_global)
+        _default, channels = self._meet_companion_click_maps(profile_path)
+        tests = self._test_companion_click_map(profile_path)
+        channel_url = self._meet_assignment_key(channel_key) if channel_key else ""
+        if normalized_scope == "channel" and not channel_url:
+            raise ValidationError("channel_key is required for channel scope")
+        profile_name = self._companion_test_profile(test_profile) if normalized_scope == "test" else ""
+        channel_patch = channels.get(channel_url, {}) if channel_url else {}
+        test_patch = tests.get(profile_name, {}) if profile_name else {}
+        effective = dict(global_default)
+        sources = {
+            key: ("global" if key in saved_global else "built-in")
+            for key in _COMPANION_FIELDS
+        }
+        if normalized_scope in {"channel", "test"} and channel_patch:
+            effective = self._normalize_companion_click_setting(channel_patch, effective)
+            sources.update({key: "channel" for key in channel_patch})
+        if normalized_scope == "test" and test_patch:
+            effective = self._normalize_companion_click_setting(test_patch, effective)
+            sources.update({key: "test" for key in test_patch})
+        override = (
+            saved_global if normalized_scope == "global"
+            else channel_patch if normalized_scope == "channel"
+            else test_patch
+        )
+        scope_key = (
+            "global"
+            if normalized_scope == "global"
+            else self._companion_channel_scope_key(channel_url)
+            if normalized_scope == "channel"
+            else f"test:{profile_name}"
+        )
+        legacy_source = "override" if normalized_scope != "global" and bool(override) else "default"
+        known_meeting_urls = self._known_meeting_urls(profile_path)
+        return {
+            **effective,
+            "meetingUrl": channel_url,
+            "channelKey": (
+                self._companion_channel_scope_key(channel_url) if channel_url else ""
+            ),
+            "testProfile": profile_name,
+            "source": legacy_source,
+            "scope": normalized_scope,
+            "scopeKey": scope_key,
+            "effective": effective,
+            "sources": sources,
+            "override": override,
+            "hasOverride": bool(override),
+            "overriddenFields": sorted(override),
+            "inheritedFields": sorted(set(_COMPANION_FIELDS) - set(override)),
+            "globalDefault": global_default,
+            "builtInDefaults": dict(_COMPANION_BUILTINS),
+            "channelOverride": channel_patch,
+            "testOverride": test_patch,
+            "knownMeetingUrls": known_meeting_urls,
+            "knownChannels": [
+                {
+                    "key": self._companion_channel_scope_key(url),
+                    "provider": "Google Meet",
+                    "code": url.rsplit("/", 1)[-1],
+                    "label": url.rsplit("/", 1)[-1],
+                    "url": url,
+                }
+                for url in known_meeting_urls
+            ],
+            "knownTestProfiles": sorted(set(tests) | {"count20", "abcs"}),
+            "precedence": ["test", "channel", "global", "built-in"],
+        }
+
+    def set_companion_click_config(
+        self,
+        scope: str,
+        values: dict[str, Any],
+        *,
+        channel_key: str = "",
+        test_profile: str = "",
+        replace: bool = False,
+    ) -> dict[str, Any]:
+        normalized_scope = str(scope or "").strip().lower()
+        if normalized_scope == "meeting":
+            normalized_scope = "channel"
+        current = self.get_companion_click_config(
+            normalized_scope,
+            channel_key=channel_key,
+            test_profile=test_profile,
+        )
+        patch = self._validate_companion_patch(values, current["effective"])
+        profile_path = self._meet_profile_path()
+        if normalized_scope == "global":
+            stored = {} if replace else self._companion_patch_from_storage(
+                self._meet_profile_state(profile_path).get("companion_click")
+            )
+            stored.update(patch)
+            setting = self._normalize_companion_click_setting(stored)
+            self._set_meet_profile_state(profile_path, companion_click=setting)
+        elif normalized_scope == "channel":
+            channel_url = self._meet_assignment_key(channel_key)
+            _default, overrides = self._meet_companion_click_maps(profile_path)
+            existing = {} if replace else dict(overrides.get(channel_url, {}))
+            existing.update(patch)
+            if replace:
+                existing = {
+                    key: value for key, value in existing.items()
+                    if value != current["globalDefault"].get(key)
+                }
+            overrides[channel_url] = existing
+            if not existing:
+                overrides.pop(channel_url, None)
+            self._set_meet_profile_state(profile_path, meeting_companion_click=overrides)
+            self._remember_known_meeting_urls(profile_path, {channel_url})
+        else:
+            profile_name = self._companion_test_profile(test_profile)
+            profiles = self._test_companion_click_map(profile_path)
+            existing = {} if replace else dict(profiles.get(profile_name, {}))
+            existing.update(patch)
+            if replace:
+                base = self.get_companion_click_config("channel", channel_key=channel_key)["effective"] if channel_key else current["globalDefault"]
+                existing = {
+                    key: value for key, value in existing.items()
+                    if value != base.get(key)
+                }
+            profiles[profile_name] = existing
+            if not existing:
+                profiles.pop(profile_name, None)
+            self._set_meet_profile_state(profile_path, test_companion_click=profiles)
+        return self.get_companion_click_config(
+            normalized_scope,
+            channel_key=channel_key,
+            test_profile=test_profile,
+        )
+
+    def clear_companion_click_config(
+        self,
+        scope: str,
+        *,
+        channel_key: str = "",
+        test_profile: str = "",
+    ) -> dict[str, Any]:
+        normalized_scope = str(scope or "").strip().lower()
+        if normalized_scope == "meeting":
+            normalized_scope = "channel"
+        profile_path = self._meet_profile_path()
+        if normalized_scope == "global":
+            self._set_meet_profile_state(
+                profile_path,
+                companion_click={
+                    key: _COMPANION_BUILTINS[key] for key in _COMPANION_FIELDS
+                },
+            )
+        elif normalized_scope == "channel":
+            channel_url = self._meet_assignment_key(channel_key)
+            _default, overrides = self._meet_companion_click_maps(profile_path)
+            overrides.pop(channel_url, None)
+            self._set_meet_profile_state(profile_path, meeting_companion_click=overrides)
+            self._remember_known_meeting_urls(profile_path, {channel_url})
+        elif normalized_scope == "test":
+            profile_name = self._companion_test_profile(test_profile)
+            profiles = self._test_companion_click_map(profile_path)
+            profiles.pop(profile_name, None)
+            self._set_meet_profile_state(profile_path, test_companion_click=profiles)
+        else:
+            raise ValidationError("scope must be global, channel, or test")
+        return self.get_companion_click_config(
+            normalized_scope,
+            channel_key=channel_key,
+            test_profile=test_profile,
+        )
+
+    def activate_companion_click_test(self, test_profile: str, channel_key: str) -> dict[str, Any]:
+        profile_name = self._companion_test_profile(test_profile)
+        channel_url = self._meet_assignment_key(channel_key)
+        profile_path = self._meet_profile_path()
+        self._set_meet_profile_state(
+            profile_path,
+            active_test_companion_click={
+                "testProfile": profile_name,
+                "channelKey": channel_url,
+                "expiresAt": time.time() + 5.0,
+            },
+        )
+        return self.get_companion_click_config(
+            "test", channel_key=channel_url, test_profile=profile_name
+        )
+
+    def deactivate_companion_click_test(
+        self,
+        test_profile: str = "",
+        channel_key: str = "",
+    ) -> dict[str, Any]:
+        profile_path = self._meet_profile_path()
+        active = self._meet_profile_state(profile_path).get("active_test_companion_click", {})
+        meeting_url = str(active.get("channelKey") or "") if isinstance(active, dict) else ""
+        active_profile = str(active.get("testProfile") or "") if isinstance(active, dict) else ""
+        requested_profile = self._companion_test_profile(test_profile) if test_profile else ""
+        requested_channel = self._meet_assignment_key(channel_key) if channel_key else ""
+        if (
+            (requested_profile and requested_profile != active_profile)
+            or (requested_channel and requested_channel != meeting_url)
+        ):
+            return {
+                "active": bool(meeting_url and active_profile),
+                "deactivated": False,
+                "testProfile": active_profile or None,
+                "channelKey": meeting_url or None,
+            }
+        self._set_meet_profile_state(profile_path, active_test_companion_click={})
+        if meeting_url:
+            self.invalidate_meeting_floor(
+                meeting_url,
+                reason="test-stopped",
+                test_profile=active_profile,
+                cancel_waiters=True,
+            )
+        return {"active": False}
+
+    def _active_companion_test(self, meeting_url: str, test_profile: str) -> bool:
+        active = self._meet_profile_state(self._meet_profile_path()).get(
+            "active_test_companion_click", {}
+        )
+        return bool(
+            isinstance(active, dict)
+            and active.get("channelKey") == meeting_url
+            and active.get("testProfile") == test_profile
+            and float(active.get("expiresAt") or 0.0) > time.time()
+        )
+
+    def meeting_floor_status(self, meeting_url: str) -> dict[str, Any]:
+        key = self._meet_assignment_key(meeting_url)
+        with self._meeting_floor_lock:
+            status = dict(self._meeting_floor_status.get(key, {}))
+            profile_name = str(status.get("testProfile") or "")
+            if profile_name and not self._active_companion_test(key, profile_name):
+                self.tts.invalidate_floor(
+                    key, cancel_waiters=True, test_profile=profile_name
+                )
+                status["floorOpen"] = False
+                status["lastDeferredReason"] = "test-lease-expired"
+                self._meeting_floor_status[key] = dict(status)
+        return {
+            "meetingUrl": key,
+            "lastAction": status.get("lastAction"),
+            "floorOpen": bool(status.get("floorOpen")),
+            "floorGrantedAt": status.get("floorGrantedAt"),
+            "floorGrantedTo": status.get("floorGrantedTo"),
+            "floorGrantCount": int(status.get("floorGrantCount") or 0),
+            "floorDeferredCount": int(status.get("floorDeferredCount") or 0),
+            "actionEvaluationCount": int(status.get("actionEvaluationCount") or 0),
+            "noOpSelectionCount": int(status.get("noOpSelectionCount") or 0),
+            "lastDeferredReason": status.get("lastDeferredReason"),
+            "lastNoOpReason": status.get("lastNoOpReason"),
+            "lastEventKey": status.get("lastEventKey"),
+            "testProfile": status.get("testProfile"),
+        }
+
+    def queue_meeting_floor_utterance(
+        self,
+        meeting_url: str,
+        agent_id: str,
+        text: str,
+        *,
+        test_profile: str = "",
+        role: str = "companion",
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Hold one eligible agent utterance until this meeting's floor opens."""
+
+        key = self._meet_assignment_key(meeting_url)
+        profile_name = self._companion_test_profile(test_profile) if test_profile else ""
+        if profile_name and not self._active_companion_test(key, profile_name):
+            raise ConflictError("the selected silence test is not active for this meeting")
+        config = self.get_companion_click_config(
+            "test" if profile_name else "channel",
+            channel_key=key,
+            test_profile=profile_name,
+        )
+        if not config["effective"].get("enabled") or config["effective"].get("action") != "continue":
+            raise ConflictError("silence action Continue is not enabled for this meeting/test")
+        normalized_role = str(role or "companion").strip().lower()
+        if normalized_role not in MEET_ROLES:
+            raise ValidationError("role must be host, companion, or guest")
+        assignments = self.get_meet_role_assignments(key).get("role_account_map", {})
+        if normalized_role in {"host", "companion"} and not assignments.get(normalized_role):
+            raise ConflictError(f"Meet role {normalized_role!r} is not currently assigned")
+        result = self.speak(
+            str(agent_id or "").strip(),
+            text,
+            destination="companion",
+            meeting_url=key,
+            correlation_id=correlation_id,
+            wait_for_floor=True,
+            floor_test_profile=profile_name,
+            floor_role=normalized_role,
+        )
+        if result.get("floor_consumed"):
+            now = time.time()
+            with self._meeting_floor_lock:
+                previous = self._meeting_floor_status.get(key, {})
+                self._meeting_floor_status[key] = {
+                    **previous,
+                    "lastAction": "continue",
+                    "floorOpen": False,
+                    "floorGrantedAt": now,
+                    "floorGrantedTo": str(agent_id or "").strip(),
+                    "floorGrantCount": int(previous.get("floorGrantCount") or 0) + 1,
+                    "testProfile": profile_name or None,
+                }
+            self.publish(
+                stream=STREAM_CONVERSATION,
+                type=CONVERSATION_FLOOR_CONTINUE,
+                data={
+                    **self.meeting_floor_status(key),
+                    "releasedFromOpenFloor": True,
+                    "utteranceId": result.get("id"),
+                },
+                source_id=str(agent_id or "agent"),
+                source_kind="agent",
+                correlation_id=correlation_id,
+            )
+        return {**result, "meetingUrl": key, "testProfile": profile_name or None}
+
+    def evaluate_meeting_silence_action(
+        self,
+        meeting_url: str,
+        event_key: str,
+        action: str,
+        *,
+        test_profile: str = "",
+        role: str = "",
+        trigger: str = "silence",
+    ) -> dict[str, Any]:
+        """Record or execute one canonical silence action evaluation."""
+
+        normalized_action = str(action or "").strip().lower()
+        if normalized_action == "continue":
+            return self.continue_meeting_floor(
+                meeting_url,
+                event_key,
+                test_profile=test_profile,
+                role=role,
+                trigger=trigger,
+            )
+        if normalized_action != "nothing":
+            raise ValidationError("action evaluation supports only 'continue' or 'nothing'")
+        key = self._meet_assignment_key(meeting_url)
+        edge = str(event_key or "").strip()
+        if not edge:
+            raise ValidationError("event_key is required")
+        profile_name = self._companion_test_profile(test_profile) if test_profile else ""
+        if profile_name and not self._active_companion_test(key, profile_name):
+            raise ConflictError("stale or stopped silence test action")
+        config = self.get_companion_click_config(
+            "test" if profile_name else "channel",
+            channel_key=key,
+            test_profile=profile_name,
+        )
+        effective = config["effective"]
+        if not effective.get("enabled") or effective.get("action") != "nothing":
+            raise ConflictError("Say nothing is not the active silence action")
+        with self._meeting_floor_lock:
+            previous = self._meeting_floor_status.get(key, {})
+            if previous.get("lastNoOpEventKey") == edge:
+                return {**self.meeting_floor_status(key), "accepted": False, "duplicate": True}
+            self._meeting_floor_status[key] = {
+                **previous,
+                "lastAction": "nothing",
+                "actionEvaluationCount": int(previous.get("actionEvaluationCount") or 0) + 1,
+                "noOpSelectionCount": int(previous.get("noOpSelectionCount") or 0) + 1,
+                "lastNoOpReason": "configured-say-nothing",
+                "lastNoOpEventKey": edge,
+                "testProfile": profile_name or None,
+            }
+        status = self.meeting_floor_status(key)
+        published = self.publish(
+            stream=STREAM_DIAGNOSTICS,
+            type=CONVERSATION_SILENCE_ACTION_EVALUATED,
+            data={
+                **status,
+                "action": "nothing",
+                "outcome": "suppressed-no-op",
+                "reason": "configured-say-nothing",
+                "eventKey": edge,
+                "trigger": str(trigger or "silence"),
+                "role": str(role or ""),
+            },
+            source_id="meet-bridge",
+            source_kind="system",
+            correlation_id=edge,
+            idempotency_key=f"meeting-silence-nothing:{key}:{edge}",
+        )
+        return {
+            **status,
+            "accepted": True,
+            "action": "nothing",
+            "outcome": "suppressed-no-op",
+            "reason": "configured-say-nothing",
+            "eventId": published["id"],
+            "granted": False,
+        }
+
+    def continue_meeting_floor(
+        self,
+        meeting_url: str,
+        event_key: str,
+        *,
+        test_profile: str = "",
+        role: str = "",
+        trigger: str = "silence",
+    ) -> dict[str, Any]:
+        """Consume one silence edge as a durable, meeting-scoped floor signal."""
+
+        key = self._meet_assignment_key(meeting_url)
+        edge = str(event_key or "").strip()
+        if not edge:
+            raise ValidationError("event_key is required")
+        profile_name = self._companion_test_profile(test_profile) if test_profile else ""
+        if profile_name and not self._active_companion_test(key, profile_name):
+            raise ConflictError("stale or stopped silence test floor grant")
+        config = self.get_companion_click_config(
+            "test" if profile_name else "channel",
+            channel_key=key,
+            test_profile=profile_name,
+        )
+        effective = config["effective"]
+        if not effective.get("enabled") or effective.get("action") != "continue":
+            raise ConflictError("Continue is not the active silence action")
+        if effective.get("mode") != "reactive":
+            raise ConflictError("Continue cannot use the interval trigger")
+        with self._meeting_floor_lock:
+            previous = self._meeting_floor_status.get(key, {})
+            if previous.get("lastEventKey") == edge:
+                return {**self.meeting_floor_status(key), "accepted": False, "duplicate": True}
+        result = self.tts.open_floor(
+            key,
+            event_key=edge,
+            test_profile=profile_name,
+            role=str(role or ""),
+        )
+        now = time.time()
+        with self._meeting_floor_lock:
+            previous = self._meeting_floor_status.get(key, {})
+            deferred = bool(result.get("deferred"))
+            state = {
+                **previous,
+                "lastAction": "continue",
+                "floorOpen": bool(result.get("floor_open")),
+                "floorGrantedAt": now if result.get("granted") else previous.get("floorGrantedAt"),
+                "floorGrantedTo": result.get("agent_id") if result.get("granted") else previous.get("floorGrantedTo"),
+                "floorGrantCount": int(previous.get("floorGrantCount") or 0) + int(bool(result.get("granted"))),
+                "floorDeferredCount": int(previous.get("floorDeferredCount") or 0) + int(deferred),
+                "actionEvaluationCount": int(previous.get("actionEvaluationCount") or 0) + 1,
+                "lastDeferredReason": result.get("reason") if deferred else None,
+                "lastEventKey": edge,
+                "testProfile": profile_name or None,
+            }
+            self._meeting_floor_status[key] = state
+        status = self.meeting_floor_status(key)
+        published = self.publish(
+            stream=STREAM_CONVERSATION,
+            type=CONVERSATION_FLOOR_CONTINUE,
+            data={
+                **status,
+                "trigger": str(trigger or "silence"),
+                "utteranceId": result.get("utterance_id"),
+                "accepted": True,
+            },
+            source_id="meet-companion",
+            source_kind="system",
+            correlation_id=edge,
+            idempotency_key=f"meeting-floor:{key}:{edge}",
+        )
+        return {**status, **result, "accepted": True, "event": published}
+
+    def invalidate_meeting_floor(
+        self,
+        meeting_url: str,
+        *,
+        reason: str,
+        test_profile: str = "",
+        cancel_waiters: bool = False,
+    ) -> dict[str, Any]:
+        key = self._meet_assignment_key(meeting_url)
+        count = self.tts.invalidate_floor(
+            key,
+            cancel_waiters=cancel_waiters,
+            test_profile=str(test_profile or ""),
+        )
+        with self._meeting_floor_lock:
+            previous = self._meeting_floor_status.get(key, {})
+            self._meeting_floor_status[key] = {
+                **previous,
+                "floorOpen": False,
+                "lastDeferredReason": str(reason or "invalidated"),
+            }
+        event = self.publish(
+            stream=STREAM_CONVERSATION,
+            type=CONVERSATION_FLOOR_INVALIDATED,
+            data={
+                **self.meeting_floor_status(key),
+                "reason": str(reason or "invalidated"),
+                "invalidatedCount": count,
+            },
+            source_id="meet-companion",
+            source_kind="system",
+        )
+        return {**self.meeting_floor_status(key), "invalidatedCount": count, "event": event}
 
     def _meet_role_assignments(self, accounts: dict[str, dict[str, Any]], role_account_map: dict[str, str]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -940,6 +1826,52 @@ class WsCollabService:
             "next_launch_command": " ".join(f'"{part}"' if " " in part else part for part in command),
         }
 
+    def _companion_wiring_runtime_config(self) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        saved = self.sound_settings.get(COMPANION_WIRING_KEY)
+        if not isinstance(saved, dict):
+            return None, {"valid": False, "errors": ["four cable endpoints have not been saved"]}
+        try:
+            device_ids = {
+                name: str((saved.get(name) or {}).get("serverDeviceId") or "")
+                for name in COMPANION_WIRING_ENDPOINTS
+            }
+            runtime = build_wiring_config(device_ids, self.devices.list())
+        except ValidationError as error:
+            return saved, {"valid": False, "errors": [str(error)]}
+        return runtime, validate_wiring_config(runtime)
+
+    def get_companion_cable_wiring(self, *, runtime_only: bool = False) -> dict[str, Any]:
+        config, validation = self._companion_wiring_runtime_config()
+        if runtime_only:
+            return {"config": config, "validation": validation}
+        health = self._meet_bridge_health(timeout=0.25)
+        return {
+            "config": config,
+            "validation": validation,
+            "devices": self.devices.list(),
+            "generation": self.devices.generation,
+            "applied": (health or {}).get("companionCableWiring"),
+            "bridge": {
+                "online": health is not None,
+                "meetingUrl": (health or {}).get("meetingUrl"),
+            },
+        }
+
+    def save_companion_cable_wiring(self, payload: dict[str, Any]) -> dict[str, Any]:
+        config = build_wiring_config(payload, self.devices.list())
+        self.sound_settings.set(COMPANION_WIRING_KEY, config)
+        return self.get_companion_cable_wiring()
+
+    def start_companion_wiring_capture(self, device_id: str) -> dict[str, Any]:
+        config, validation = self._companion_wiring_runtime_config()
+        expected = str(((config or {}).get("receive_capture_input") or {}).get("serverDeviceId") or "")
+        if not validation.get("valid") or not expected or str(device_id or "") != expected:
+            raise ValidationError("capture device does not match the saved RECEIVE recording endpoint")
+        return self.secondary_capture.start(device_id=expected)
+
+    def stop_companion_wiring_capture(self) -> dict[str, Any]:
+        return self.secondary_capture.stop()
+
     def set_meet_browser_settings(
         self,
         browser_backend: str,
@@ -1006,7 +1938,7 @@ class WsCollabService:
             command.extend(["--companion-click-audio-rms-threshold", f"{float(companion_click.get('audioRmsThreshold') or 0.015):g}"])
             command.extend(["--companion-click-ms", f"{float(companion_click.get('clickMs') or 100.0):g}"])
             command.extend(["--companion-click-gain", f"{float(companion_click.get('gain') or 0.12):g}"])
-            command.extend(["--companion-click-sound", str(companion_click.get("sound") or "uh")])
+            command.extend(["--companion-click-action", str(companion_click.get("action") or "say:uh")])
             command.extend(["--companion-click-f0", f"{float(companion_click.get('f0Hz') or 125.0):g}"])
             command.extend(["--companion-click-f1", f"{float(companion_click.get('f1Hz') or 600.0):g}"])
             command.extend(["--companion-click-f2", f"{float(companion_click.get('f2Hz') or 1300.0):g}"])
@@ -1030,6 +1962,13 @@ class WsCollabService:
             "role_overrides": role_overrides,
             "meeting_role_account_maps": meeting_role_account_maps,
             "known_meeting_urls": known_meeting_urls,
+            "forgotten_meeting_urls": sorted({
+                url
+                for candidate in self._meet_profile_state(profile_path).get(
+                    "forgotten_meeting_urls", []
+                )
+                if (url := self._normal_meet_url(candidate))
+            }),
             "companion_click": companion_click,
             "inherited_roles": [
                 role for role in role_account_map
@@ -1111,17 +2050,17 @@ class WsCollabService:
         return self.get_meet_role_assignments(key)
 
     def get_meet_companion_click(self, meeting_url: str = "") -> dict[str, Any]:
-        profile_path = self._meet_profile_path()
-        known_meeting_urls = self._known_meeting_urls(profile_path)
-        default, overrides = self._meet_companion_click_maps(profile_path)
-        effective = self._effective_meet_companion_click(profile_path, meeting_url)
-        return {
-            **effective,
-            "scope": "meeting" if meeting_url else "global",
-            "globalDefault": default,
-            "meetingOverrides": overrides,
-            "knownMeetingUrls": known_meeting_urls,
+        response = self.get_companion_click_config(
+            "channel" if meeting_url else "global",
+            channel_key=meeting_url,
+        )
+        default, overrides = self._meet_companion_click_maps(self._meet_profile_path())
+        response["meetingOverrides"] = {
+            key: self._normalize_companion_click_setting(patch, default)
+            for key, patch in overrides.items()
         }
+        response["legacyScope"] = "meeting" if meeting_url else "global"
+        return response
 
     def set_meet_companion_click(
         self,
@@ -1140,6 +2079,7 @@ class WsCollabService:
         gain: float | int | str | None = None,
         sound: str | None = None,
         phrase: str | None = None,
+        action: str | None = None,
         f0_hz: float | int | str | None = None,
         f1_hz: float | int | str | None = None,
         f2_hz: float | int | str | None = None,
@@ -1172,23 +2112,32 @@ class WsCollabService:
         parsed_trigger = str(trigger or current.get("trigger") or "caption").lower()
         if parsed_trigger not in {"caption", "audio", "both"}:
             raise ValidationError("trigger must be 'caption', 'audio', or 'both'")
-        parsed_sound = str(sound or current.get("sound") or "uh").lower()
-        if parsed_sound not in {"uh", "click"}:
-            if parsed_sound in {"uhuh", "hmm"}:
-                phrase = phrase or parsed_sound
-                parsed_sound = "uh"
-            else:
-                raise ValidationError("legacy sound must be 'uh' or 'click'")
-        parsed_phrase = str(
-            phrase if phrase is not None else (parsed_sound if sound is not None else current.get("phrase") or parsed_sound)
-        ).lower()
-        if parsed_phrase not in {"uh", "uhuh", "hmm"}:
-            if phrase is None and parsed_phrase == "click":
-                parsed_phrase = "click"
-            else:
-                raise ValidationError("phrase must be 'uh', 'uhuh', or 'hmm'")
+        legacy_phrase = str(phrase if phrase is not None else sound or "").strip().lower()
+        if legacy_phrase and legacy_phrase not in {"uh", "uhuh", "hmm", "click"}:
+            label = "phrase" if phrase is not None else "legacy sound"
+            raise ValidationError(f"{label} must be 'uh', 'uhuh', 'hmm', or 'click'")
+        parsed_action = str(
+            action if action is not None else (
+                f"say:{legacy_phrase}" if legacy_phrase
+                else current.get("action") or "say:uh"
+            )
+        ).strip().lower()
+        allowed_actions = (
+            _COMPANION_CLIENT_ACTIONS
+            if action is not None
+            else _COMPANION_ACTIONS
+        )
+        if parsed_action not in allowed_actions:
+            raise ValidationError(
+                "action must be 'continue', 'nothing', 'say:uh', 'say:uhuh', or 'say:hmm'"
+            )
+        if parsed_action == "continue" and parsed_mode == "fixed":
+            raise ValidationError(
+                "action 'continue' requires trigger mode 'on_silence'; interval is unsafe for floor grants"
+            )
         setting = {
             "enabled": bool(enabled),
+            "action": parsed_action,
             "intervalSeconds": positive(interval_seconds, "intervalSeconds", "interval_seconds"),
             "mode": parsed_mode,
             "trigger": parsed_trigger,
@@ -1199,8 +2148,6 @@ class WsCollabService:
             "audioRmsThreshold": nonnegative(audio_rms_threshold, "audioRmsThreshold", "audio_rms_threshold"),
             "clickMs": positive(click_ms, "clickMs", "click_ms"),
             "gain": positive(gain, "gain", "gain"),
-            "sound": parsed_sound,
-            "phrase": parsed_phrase,
             "f0Hz": positive(f0_hz, "f0Hz", "f0_hz"),
             "f1Hz": positive(f1_hz, "f1Hz", "f1_hz"),
             "f2Hz": positive(f2_hz, "f2Hz", "f2_hz"),
@@ -1234,39 +2181,14 @@ class WsCollabService:
         return self.get_meet_companion_click()
 
     def clear_meet_companion_click(self, meeting_url: str = "") -> dict[str, Any]:
-        profile_path = self._meet_profile_path()
         if meeting_url:
-            key = self._meet_assignment_key(meeting_url)
-            _default, overrides = self._meet_companion_click_maps(profile_path)
-            overrides = dict(overrides)
-            overrides.pop(key, None)
-            self._set_meet_profile_state(profile_path, meeting_companion_click=overrides)
-            self._remember_known_meeting_urls(profile_path, {key})
-            return self.get_meet_companion_click(key)
-        self._set_meet_profile_state(
-            profile_path,
-            companion_click={
-                "enabled": False,
-                "intervalSeconds": 2.0,
-                "mode": "reactive",
-                "trigger": "caption",
-                "afterSeconds": 10.0,
-                "silenceMs": 500.0,
-                "minGapSeconds": 6.0,
-                "maxWaitSeconds": 0.0,
-                "audioRmsThreshold": 0.015,
-                "clickMs": 100.0,
-                "gain": 0.12,
-                "sound": "uh",
-                "phrase": "uh",
-                "f0Hz": 125.0,
-                "f1Hz": 600.0,
-                "f2Hz": 1300.0,
-            },
-        )
+            self.clear_companion_click_config("channel", channel_key=meeting_url)
+            return self.get_meet_companion_click(meeting_url)
+        self.clear_companion_click_config("global")
         return self.get_meet_companion_click()
 
     def start_meet_bridge(self, meeting_url: str = "", *, new: bool = False) -> dict[str, Any]:
+        target = self._unforget_and_remember_meeting(meeting_url) if meeting_url else ""
         health = self._meet_bridge_health(timeout=0.75)
         process_running = self._meet_bridge_tracked_process_running()
         pid_running = None if health or process_running else self._meet_bridge_pid_running()
@@ -1279,7 +2201,6 @@ class WsCollabService:
                 "meeting_url": (health or {}).get("meetingUrl"),
                 "pid": pid_running,
             }
-        target = self._meet_assignment_key(meeting_url) if meeting_url else ""
         settings = self.get_meet_role_assignments(target)
         assignments = {
             str(row.get("role") or ""): row
@@ -1337,8 +2258,7 @@ class WsCollabService:
             argv.extend(["--companion-click-audio-rms-threshold", f"{float(click.get('audioRmsThreshold') or 0.015):g}"])
             argv.extend(["--companion-click-ms", f"{float(click.get('clickMs') or 100.0):g}"])
             argv.extend(["--companion-click-gain", f"{float(click.get('gain') or 0.12):g}"])
-            argv.extend(["--companion-click-sound", str(click.get("sound") or "uh")])
-            argv.extend(["--companion-click-phrase", str(click.get("phrase") or click.get("sound") or "uh")])
+            argv.extend(["--companion-click-action", str(click.get("action") or "say:uh")])
             argv.extend(["--companion-click-f0", f"{float(click.get('f0Hz') or 125.0):g}"])
             argv.extend(["--companion-click-f1", f"{float(click.get('f1Hz') or 600.0):g}"])
             argv.extend(["--companion-click-f2", f"{float(click.get('f2Hz') or 1300.0):g}"])
@@ -1355,6 +2275,7 @@ class WsCollabService:
         process_env = os.environ.copy()
         process_env["PYTHONUNBUFFERED"] = "1"
         process_env["WS_COLLAB_STATE_DIR"] = str(Path(self.config.state_dir).resolve())
+        process_env["WS_COLLAB_BRIDGE_TOKEN"] = self._meet_bridge_worker_credential()
         if not self.config.auth_disabled:
             token = ""
             for preferred_role in ("admin", "operator", "worker"):
@@ -1426,10 +2347,15 @@ class WsCollabService:
         import urllib.error
         import urllib.request
 
+        headers = {"content-type": "application/json"}
+        if path in {"/wire-companion-audio", "/disconnect-companion-audio"}:
+            headers["authorization"] = (
+                f"Bearer {self._meet_bridge_worker_credential()}"
+            )
         request = urllib.request.Request(
             f"http://127.0.0.1:48699{path}",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"content-type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -1442,6 +2368,13 @@ class WsCollabService:
                 return {"ok": False, "error": str(error)}
         except Exception:
             return None
+
+    def _meet_bridge_wiring(
+        self, payload: dict[str, Any], *, path: str, timeout: float = 20.0
+    ) -> dict[str, Any] | None:
+        """Call one narrow loopback wiring operation; never accepts raw commands."""
+
+        return self._meet_bridge_speech(payload, timeout=timeout, path=path)
 
     def _companion_tts_status(self) -> dict[str, Any]:
         return dict(self._companion_tts_status_cache)
@@ -1629,6 +2562,41 @@ class WsCollabService:
             raise NotFoundError("Meet bridge worker is offline")
         return health
 
+    def wire_companion_audio(
+        self, meeting_url: str = "", *, reason: str = "manual"
+    ) -> dict[str, Any]:
+        config, validation = self._companion_wiring_runtime_config()
+        if not validation.get("valid") or config is None:
+            raise ValidationError(
+                "companion cable wiring is invalid",
+                details={"errors": validation.get("errors") or []},
+            )
+        result = self._meet_bridge_wiring(
+            {
+                "meeting_url": self._normal_meet_url(meeting_url) if meeting_url else "",
+                "reason": "manual" if reason != "auto" else "auto",
+            },
+            path="/wire-companion-audio",
+        )
+        if result is None:
+            raise NotFoundError("Meet bridge worker is offline")
+        if not result.get("ok"):
+            raise ConflictError(str(result.get("error") or "companion cable wiring failed"))
+        return result
+
+    def disconnect_companion_audio_wiring(self, meeting_url: str = "") -> dict[str, Any]:
+        result = self._meet_bridge_wiring(
+            {
+                "meeting_url": self._normal_meet_url(meeting_url) if meeting_url else "",
+                "reason": "manual-disconnect",
+            },
+            path="/disconnect-companion-audio",
+            timeout=5.0,
+        )
+        if result is None:
+            raise NotFoundError("Meet bridge worker is offline")
+        return result
+
     def meet_bridge_captions(self, since: float | str = 0.0, from_end: int | str | None = None) -> dict[str, Any]:
         import urllib.parse
         import urllib.request
@@ -1659,10 +2627,12 @@ class WsCollabService:
         value = str(command or "").strip()
         if not value:
             raise ValidationError("command is required")
+        join = re.fullmatch(r"/join\s+(.+)", value, re.IGNORECASE)
+        if join:
+            self._unforget_and_remember_meeting(join.group(1).strip())
         result = self._meet_bridge_command(value, timeout=2.0)
         if result is not None:
             return result
-        join = re.fullmatch(r"/join\s+(.+)", value)
         if join:
             started = self.start_meet_bridge(join.group(1).strip())
         elif value == "/new":
@@ -3726,6 +4696,9 @@ class WsCollabService:
         correlation_id: str | None = None,
         destination: str | None = None,
         meeting_url: str | None = None,
+        wait_for_floor: bool = False,
+        floor_test_profile: str = "",
+        floor_role: str = "",
     ) -> dict[str, Any]:
         profile = self.voices.get_profile(agent_id)
         if profile and not profile.speaking_permission:
@@ -3761,6 +4734,9 @@ class WsCollabService:
             priority=effective_priority,
             correlation_id=correlation_id,
             interrupt=interrupt,
+            wait_for_floor=wait_for_floor,
+            floor_test_profile=floor_test_profile,
+            floor_role=floor_role,
         )
         result["voice_resolution"] = resolution
         result["destination"] = {

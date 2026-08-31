@@ -43,6 +43,19 @@ def test_admin_ui_state_rejects_invalid_page_and_non_json_state(tmp_path) -> Non
         store.set_page("meet", {"bad": object()})
 
 
+def test_admin_ui_state_can_clear_one_auxiliary_page(tmp_path) -> None:
+    store = AdminUIState(tmp_path)
+    store.set_page("meet", {"display": {"text": "old meeting"}})
+    store.set_page("silences", {"display": {"text": "keep"}})
+
+    assert store.clear_page("meet") == {
+        "page": "meet",
+        "exists": False,
+        "state": {},
+    }
+    assert store.get_page("silences")["exists"] is True
+
+
 def test_admin_ui_state_endpoints_round_trip(client, admin_headers) -> None:
     response = client.post(
         f"{V1}/admin/ui-state/devices",
