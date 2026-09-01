@@ -130,18 +130,29 @@ from .scripts_js import (
     COMPANION_CABLE_VERIFY_JS,
     CANCEL_COMPANION_AUDIO_JS,
     GUM_PATCH_JS,
+    MEET_DEVICE_DISCOVERY_JS,
+    MEET_MEDIA_STATE_JS,
     SELECT_MIC_DEVICE_JS,
     SEND_CHAT_JS_TEMPLATE,
     SPEAK_INTO_MEETING_JS,
     autojoin_js,
+    meet_device_sync_js,
+    set_meet_media_muted_js,
 )
 from .tracker import CaptionTracker
-from ..meet_browser_settings import MeetBrowserSettings, companion_click_runtime_layers
+from ..meet_browser_settings import (
+    MeetBrowserSettings,
+    companion_click_runtime_layers,
+    select_startup_meeting,
+)
 from ..urls import (
+    MEET_BRIDGE_AUTHENTICATED_PATHS,
     MEET_BRIDGE_CAPTIONS,
     MEET_BRIDGE_COMMAND,
+    MEET_BRIDGE_DEVICE_SYNC,
     MEET_BRIDGE_DISCONNECT_AUDIO,
     MEET_BRIDGE_HEALTH,
+    MEET_BRIDGE_MEDIA_MUTE,
     MEET_BRIDGE_SPEECH,
     MEET_BRIDGE_SPEECH_CANCEL,
     MEET_BRIDGE_SPEECH_STATUS,
@@ -158,10 +169,7 @@ CAPTION_DUPLICATE_WINDOW_SECONDS = 15.0
 CAPTION_DUPLICATE_RECENT_LIMIT = 400
 CAPTION_PUSH_BINDING = "__wsCollabCaptionPush"
 CAPTION_PUSH_HEALTH_SECONDS = 5.0
-_BRIDGE_WIRING_ROUTES = {
-    MEET_BRIDGE_WIRE_AUDIO,
-    MEET_BRIDGE_DISCONNECT_AUDIO,
-}
+_BRIDGE_AUTHENTICATED_ROUTES = MEET_BRIDGE_AUTHENTICATED_PATHS
 
 
 def _header_value(headers: Any, name: str) -> str:
@@ -217,13 +225,19 @@ def saved_companion_wiring_config(
             "bridge wiring accepts only a meeting reference; save device selections "
             "through the main server first"
         )
-    saved = mailbox.companion_cable_wiring()
+    saved = scoped_companion_wiring(mailbox, payload.get("meeting_url"))
     if not (saved.get("validation") or {}).get("valid") or not isinstance(
         saved.get("config"), dict
     ):
         errors = (saved.get("validation") or {}).get("errors") or []
         raise ValueError("; ".join(errors) or "saved companion cable wiring is invalid")
     return saved["config"]
+
+
+def scoped_companion_wiring(mailbox: Any, meeting_url: Any) -> dict[str, Any]:
+    """Load canonical wiring for exactly one normalized active meeting."""
+
+    return mailbox.companion_cable_wiring(meeting_key(meeting_url))
 CAPTION_PUSH_POLL_INTERVAL = 2.0
 CAPTION_PUSH_MAX_PAYLOAD_BYTES = 256 * 1024
 CAPTION_PUSH_REINSTALL_SECONDS = 10.0
@@ -639,6 +653,134 @@ def _cable_eval(tab: Any, script: str, *, timeout: int = 12) -> dict[str, Any]:
     return payload
 
 
+def read_meet_media_state(tab: Any) -> dict[str, Any]:
+    """Read observable local participant/media state without guessing."""
+
+    raw = tab.evaluate(MEET_MEDIA_STATE_JS)
+    payload = json.loads(raw) if isinstance(raw, str) and raw.strip() else raw
+    if not isinstance(payload, dict):
+        raise RuntimeError("Meet media state returned a non-object")
+    routing = payload.get("speakerRouting")
+    return {
+        "inCall": payload.get("inCall") is True,
+        "micMuted": payload.get("micMuted")
+        if isinstance(payload.get("micMuted"), bool)
+        else None,
+        "speakersMuted": payload.get("speakersMuted")
+        if isinstance(payload.get("speakersMuted"), bool)
+        else None,
+        "mediaElementCount": int(payload.get("mediaElementCount") or 0),
+        "speakerRouting": routing if isinstance(routing, dict) else None,
+    }
+
+
+def read_meet_device_candidates(tab: Any) -> dict[str, Any]:
+    raw = tab.evaluate(MEET_DEVICE_DISCOVERY_JS, await_promise=True, timeout=5)
+    payload = json.loads(raw) if isinstance(raw, str) and raw.strip() else raw
+    if not isinstance(payload, dict):
+        raise RuntimeError("Meet device discovery returned a non-object")
+    devices = payload.get("devices")
+    payload["devices"] = devices if isinstance(devices, list) else []
+    return payload
+
+
+def sync_meet_devices(
+    tab: Any, mic: dict[str, Any], speakers: dict[str, Any]
+) -> dict[str, Any]:
+    mic_label = str((mic or {}).get("label") or "").strip()
+    speaker_label = str((speakers or {}).get("label") or "").strip()
+    if not mic_label or not speaker_label:
+        raise ValueError("microphone and speaker labels are required")
+    raw = tab.evaluate(
+        meet_device_sync_js(mic_label, speaker_label),
+        await_promise=True,
+        timeout=15,
+    )
+    payload = json.loads(raw) if isinstance(raw, str) and raw.strip() else raw
+    if not isinstance(payload, dict):
+        raise RuntimeError("Meet device synchronization returned a non-object")
+    return payload
+
+
+def set_meet_media_muted(tab: Any, target: str, muted: bool) -> dict[str, Any]:
+    """Apply one explicit local Meet mic/speaker state change."""
+
+    if target not in {"mic", "speakers"}:
+        raise ValueError("target must be 'mic' or 'speakers'")
+    if not isinstance(muted, bool):
+        raise ValueError("muted must be a boolean")
+    raw = tab.evaluate(
+        set_meet_media_muted_js(target, muted),
+        await_promise=True,
+        timeout=3,
+    )
+    payload = json.loads(raw) if isinstance(raw, str) and raw.strip() else raw
+    if not isinstance(payload, dict):
+        raise RuntimeError("Meet media mutation returned a non-object")
+    if target == "mic" and payload.get("ok") is True:
+        actual = payload.get("micMuted")
+        if not isinstance(actual, bool) or actual is not muted:
+            return {
+                "ok": False,
+                "target": target,
+                "muted": muted,
+                "micMuted": actual if isinstance(actual, bool) else None,
+                "error": (
+                    "Meet microphone state did not verify: "
+                    f"requested {'muted' if muted else 'unmuted'}, "
+                    f"observed {actual if isinstance(actual, bool) else 'unknown'}"
+                ),
+            }
+    return payload
+
+
+def invalidate_role_device_sync_if_unverified(
+    holder: dict[str, Any], role: str, media: dict[str, Any]
+) -> None:
+    """Demote stale speaker verification when the tab or sink observer drifts."""
+
+    sync = (holder.get("role_device_sync") or {}).get(role)
+    if not isinstance(sync, dict) or sync.get("state") != "synced":
+        return
+    reason = None
+    if not media.get("inCall"):
+        reason = media.get("mediaStateError") or f"{role} tab is no longer in-call"
+    else:
+        actual = sync.get("actual") or {}
+        speakers = actual.get("speakers") if isinstance(actual, dict) else {}
+        requires_observer = (
+            isinstance(speakers, dict) and speakers.get("observerVerified") is True
+        )
+        routing = media.get("speakerRouting")
+        if requires_observer and (
+            not isinstance(routing, dict) or routing.get("verified") is not True
+        ):
+            reason = (
+                (routing or {}).get("lastError")
+                if isinstance(routing, dict)
+                else None
+            ) or "speaker sink observer is absent, pending, or drifted"
+    if reason:
+        holder["role_device_sync"][role] = {
+            **sync,
+            "state": "error",
+            "verified": False,
+            "updatedAt": time.time(),
+            "error": str(reason),
+        }
+
+
+def companion_mic_policy(holder: dict[str, Any], automatic: str) -> str:
+    """Honor an operator mic override instead of immediately undoing it."""
+
+    override = holder.get("companion_mic_muted_override")
+    if override is True:
+        return "muted"
+    if override is False:
+        return "speaking"
+    return automatic
+
+
 def disconnect_companion_audio_wiring(
     tab: Any,
     mailbox: Any,
@@ -732,7 +874,7 @@ def wire_companion_audio(
         holder["companion_wiring_mic_verified"] = bool((prepared.get("mic") or {}).get("verified"))
         holder["companion_wiring_browser_devices"] = prepared.get("browserDevices") or []
         capture_id = str((config.get("receive_capture_input") or {}).get("serverDeviceId") or "")
-        capture = mailbox.start_companion_wiring_capture(capture_id)
+        capture = mailbox.start_companion_wiring_capture(capture_id, meeting_url)
         holder["companion_wiring_capture_health"] = capture
         if (
             not capture.get("listening")
@@ -2336,6 +2478,94 @@ def message_text(message: dict[str, Any]) -> str:
     return ""
 
 
+class ReconnectPolicy:
+    """Deterministic bounded reconnect scheduler with injectable time/jitter."""
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        jitter: Callable[[], float] = lambda: 0.5,
+        base_seconds: float = 1.0,
+        cap_seconds: float = 30.0,
+        max_attempts: int = 6,
+    ):
+        self.clock = clock
+        self.jitter = jitter
+        self.base_seconds = base_seconds
+        self.cap_seconds = cap_seconds
+        self.max_attempts = max_attempts
+        self._roles: dict[str, dict[str, Any]] = {}
+
+    def _state(self, role: str) -> dict[str, Any]:
+        return self._roles.setdefault(
+            role,
+            {
+                "attempt": 0,
+                "nextAttemptAt": None,
+                "suppressed": False,
+                "state": "idle",
+                "lastError": None,
+            },
+        )
+
+    def suppress(self, role: str, reason: str = "intentional operator disconnect") -> None:
+        state = self._state(role)
+        state.update(
+            suppressed=True,
+            state="suppressed",
+            nextAttemptAt=None,
+            lastError=reason,
+        )
+
+    def clear(self, role: str) -> None:
+        self._roles[role] = {
+            "attempt": 0,
+            "nextAttemptAt": None,
+            "suppressed": False,
+            "state": "idle",
+            "lastError": None,
+        }
+
+    def unexpected_loss(self, role: str, *, enabled: bool, error: str) -> dict[str, Any]:
+        state = self._state(role)
+        state["lastError"] = error
+        if state["suppressed"]:
+            return dict(state)
+        if not enabled:
+            state.update(state="disabled", nextAttemptAt=None)
+            return dict(state)
+        attempt = int(state["attempt"]) + 1
+        state["attempt"] = attempt
+        if attempt > self.max_attempts:
+            state.update(state="exhausted", nextAttemptAt=None)
+            return dict(state)
+        raw_delay = min(self.cap_seconds, self.base_seconds * (2 ** (attempt - 1)))
+        jitter_factor = 0.8 + (max(0.0, min(1.0, float(self.jitter()))) * 0.4)
+        delay = min(self.cap_seconds, raw_delay * jitter_factor)
+        state.update(
+            state="waiting",
+            nextAttemptAt=self.clock() + delay,
+            delaySeconds=delay,
+        )
+        return dict(state)
+
+    def ready(self, role: str) -> bool:
+        state = self._state(role)
+        return (
+            not state["suppressed"]
+            and state.get("state") == "waiting"
+            and float(state.get("nextAttemptAt") or 0.0) <= self.clock()
+        )
+
+    def success(self, role: str) -> None:
+        self.clear(role)
+        self._roles[role]["state"] = "connected"
+
+    def status(self) -> dict[str, dict[str, Any]]:
+        return json.loads(json.dumps(self._roles))
+
+
 def main() -> None:
     migrated_default = ensure_default_profile_migrated()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2650,6 +2880,7 @@ def main() -> None:
         "tab": host_tab,
         "host_account": host_account,
         "url": str(tab_info.get("url") or "").split("?")[0],
+        "last_meeting_url": str(tab_info.get("url") or "").split("?")[0],
         "tab_id": tab_info.get("id"),
         "sso_accounts": signed_sso_accounts,
         "sso_accounts_scanned_at": time.time(),
@@ -2757,6 +2988,11 @@ def main() -> None:
         "companion_tts_output_device_index": None,
         "companion_say_artifact_started_at": 0.0,
         "companion_say_artifact_until": 0.0,
+        "host_mic_muted_override": None,
+        "host_speakers_muted_override": None,
+        "companion_mic_muted_override": None,
+        "companion_speakers_muted_override": None,
+        "role_device_sync": {},
     }
     companion_wiring_lock = threading.RLock()
     update_sso_satisfaction(
@@ -2816,6 +3052,21 @@ def main() -> None:
         )
 
     stop = threading.Event()
+    reconnect_policy = ReconnectPolicy()
+
+    def reconnect_enabled(target_url: str | None) -> bool:
+        key = meeting_key(target_url)
+        if not key:
+            return False
+        try:
+            return (
+                MeetBrowserSettings(settings_dir)
+                .get_meeting_routing(Path(args.profile).expanduser(), key)
+                .get("reconnect_after_disconnect")
+                is True
+            )
+        except ValueError:
+            return False
 
     def whoami(tab: CdpTab | None) -> dict[str, Any] | None:
         return read_google_account(tab)
@@ -3196,7 +3447,13 @@ def main() -> None:
                 if time.time() >= float(holder.get("speaking_until") or 0):
                     try:
                         audible = bool(setting["enabled"]) and str(setting.get("action") or "").startswith("say:")
-                        tab.evaluate(autojoin_js("speaking" if audible else "muted"))
+                        tab.evaluate(
+                            autojoin_js(
+                                companion_mic_policy(
+                                    holder, "speaking" if audible else "muted"
+                                )
+                            )
+                        )
                     except Exception as error:  # noqa: BLE001
                         _log_companion_click(log, "sync-mic", f"[click] companion mic-policy failed: {error}", err=True, interval=10.0)
         return setting
@@ -3232,13 +3489,68 @@ def main() -> None:
     install_caption_push(holder["tab"], role="host", log=log)
     sync_companion_click_for_meeting("startup", force=True)
 
+    def _media_state(role: str, tab: Any) -> dict[str, Any]:
+        if tab is None:
+            media = {
+                "inCall": False,
+                "micMuted": None,
+                "speakersMuted": None,
+                "mediaElementCount": 0,
+                "speakerRouting": None,
+                "mediaStateError": "tab is not attached",
+            }
+            invalidate_role_device_sync_if_unverified(holder, role, media)
+            return media
+        try:
+            media = {**read_meet_media_state(tab), "mediaStateError": None}
+        except Exception as error:  # noqa: BLE001
+            media = {
+                "inCall": False,
+                "micMuted": None,
+                "speakersMuted": None,
+                "mediaElementCount": 0,
+                "speakerRouting": None,
+                "mediaStateError": str(error),
+            }
+        invalidate_role_device_sync_if_unverified(holder, role, media)
+        return media
+
+    def _apply_media_overrides(role: str, tab: Any) -> None:
+        if tab is None:
+            return
+        for target in ("mic", "speakers"):
+            override = holder.get(f"{role}_{target}_muted_override")
+            if isinstance(override, bool):
+                try:
+                    result = set_meet_media_muted(tab, target, override)
+                    holder[f"{role}_{target}_override_error"] = (
+                        None if result.get("ok") else result.get("error")
+                    )
+                except Exception as error:  # noqa: BLE001
+                    holder[f"{role}_{target}_override_error"] = str(error)
+
     def _controlled_clients() -> list[dict[str, Any]]:
-        """Every participant the bridge actively drives, and which device
-        stands in for their mic/speaker -- HOST is real hardware and is
-        never automated, so it is deliberately not listed here (its own
-        profile/SSO info is on the top-level status as "hostProfile"
-        instead)."""
-        clients: list[dict[str, Any]] = []
+        """Every participant tab actively driven by this bridge."""
+
+        host_profile = _host_profile_info()
+        host_media = _media_state("host", holder.get("tab"))
+        sync_state = holder.get("role_device_sync") or {}
+        try:
+            host_devices = read_meet_device_candidates(holder.get("tab"))
+        except Exception as error:  # noqa: BLE001
+            host_devices = {"ok": False, "error": str(error), "devices": []}
+        clients: list[dict[str, Any]] = [{
+            "role": "host",
+            "state": "in-call" if host_media["inCall"] else "attached",
+            "mic": "COMPUTER",
+            "speak": "COMPUTER",
+            "profile": host_profile.get("label"),
+            "account": host_profile.get("account"),
+            "authuser": role_authuser("host"),
+            "audioDevices": host_devices,
+            "deviceSync": sync_state.get("host"),
+            **host_media,
+        }]
         if args.companion:
             companion_account = holder.get("companion_account")
             if holder.get("companion_tab") is not None:
@@ -3253,9 +3565,16 @@ def main() -> None:
                 active_tts_output_index = tts_output_device_index
             speak = (f"device #{active_tts_output_index} (virtual cable)" if active_tts_output_index is not None
                      else "(WebAudio synthetic speaker patch)")
+            companion_media = _media_state("companion", holder.get("companion_tab"))
+            try:
+                companion_devices = read_meet_device_candidates(
+                    holder.get("companion_tab")
+                )
+            except Exception as error:  # noqa: BLE001
+                companion_devices = {"ok": False, "error": str(error), "devices": []}
             clients.append({
                 "role": "companion",
-                "state": "in-call" if holder.get("companion_tab") else "not-yet-joined",
+                "state": holder.get("companion_state") or "not-yet-joined",
                 "mic": mic,
                 "speak": speak,
                 "companionClick": update_companion_click_status(status, holder),
@@ -3266,6 +3585,9 @@ def main() -> None:
                 "profile": holder.get("companion_profile"),
                 "account": companion_account or {"label": "unknown -- no live window to check", "signedIn": False, "email": None},
                 "authuser": role_authuser("companion"),
+                "audioDevices": companion_devices,
+                "deviceSync": sync_state.get("companion"),
+                **companion_media,
             })
         return clients
 
@@ -3315,6 +3637,7 @@ def main() -> None:
             and tab_id
             and holder.get("companion_state") == "in-call"
             and holder.get("companion_mic_ready")
+            and holder.get("companion_mic_muted_override") is not True
             and active
             and requested == active
             and (
@@ -3333,6 +3656,8 @@ def main() -> None:
             error = f"companion is not in-call ({holder.get('companion_state') or 'unknown'})"
         elif not holder.get("companion_mic_ready"):
             error = "companion synthetic microphone is not ready"
+        elif holder.get("companion_mic_muted_override") is True:
+            error = "companion microphone is manually muted"
         elif holder.get("companion_wiring_desired") and holder.get("companion_wiring_phase") != "wired":
             error = "companion two-cable wiring is not feedback-safe and ready"
         return {
@@ -3359,9 +3684,34 @@ def main() -> None:
     def _run_companion_wiring(
         payload: dict[str, Any], *, trusted_config: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        config = trusted_config or saved_companion_wiring_config(mailbox, payload)
-        requested = meeting_key(payload.get("meeting_url")) if payload.get("meeting_url") else meeting_key(holder.get("url"))
+        supplied_config = payload.get("config")
+        clean_payload = {
+            key: value for key, value in payload.items() if key != "config"
+        }
+        requested = (
+            meeting_key(clean_payload.get("meeting_url"))
+            if clean_payload.get("meeting_url")
+            else meeting_key(holder.get("url"))
+        )
         active = meeting_key(holder.get("url"))
+        if trusted_config is not None:
+            config = trusted_config
+        elif supplied_config is not None:
+            if not isinstance(supplied_config, dict):
+                raise ValueError("config must be an object")
+            required = {
+                "receive_playback_sink",
+                "receive_capture_input",
+                "transmit_tts_output",
+                "transmit_companion_mic",
+            }
+            if not required.issubset(supplied_config):
+                raise ValueError("config is missing required two-cable endpoints")
+            config = supplied_config
+        else:
+            config = saved_companion_wiring_config(
+                mailbox, {**clean_payload, "meeting_url": requested}
+            )
         tab = holder.get("companion_tab")
         tab_id = str(holder.get("companion_tab_id") or "")
         if not active or requested != active:
@@ -3377,7 +3727,7 @@ def main() -> None:
                 config,
                 meeting_url=active,
                 tab_id=tab_id,
-                reason=str(payload.get("reason") or "manual"),
+                reason=str(clean_payload.get("reason") or "manual"),
             )
 
     def _disconnect_companion_wiring(reason: str) -> dict[str, Any]:
@@ -3396,6 +3746,147 @@ def main() -> None:
             return disconnect_companion_audio_wiring(
                 tab, mailbox, holder, status, reason=reason
             )
+
+    def _set_role_media_mute(payload: dict[str, Any]) -> dict[str, Any]:
+        unknown = set(payload) - {"meeting_url", "role", "target", "muted"}
+        if unknown:
+            raise ValueError(f"unsupported media-mute fields: {', '.join(sorted(unknown))}")
+        role = str(payload.get("role") or "").strip().lower()
+        target = str(payload.get("target") or "").strip().lower()
+        muted = payload.get("muted")
+        if role not in {"host", "companion"}:
+            raise ValueError("role must be 'host' or 'companion'")
+        if target not in {"mic", "speakers"}:
+            raise ValueError("target must be 'mic' or 'speakers'")
+        if not isinstance(muted, bool):
+            raise ValueError("muted must be a boolean")
+        requested = meeting_key(payload.get("meeting_url"))
+        active = meeting_key(holder.get("url"))
+        if requested and requested != active:
+            return {"ok": False, "error": "selected meeting is not active"}
+        tab = holder.get("tab") if role == "host" else holder.get("companion_tab")
+        if tab is None:
+            return {"ok": False, "error": f"{role} tab is not attached"}
+        before = _media_state(role, tab)
+        if not before.get("inCall"):
+            return {
+                "ok": False,
+                "error": before.get("mediaStateError") or f"{role} is not in the call",
+            }
+        result = set_meet_media_muted(tab, target, muted)
+        if not result.get("ok"):
+            return result
+        observed = _media_state(role, tab)
+        observed_value = (
+            observed.get("micMuted")
+            if target == "mic"
+            else observed.get("speakersMuted")
+        )
+        if not isinstance(observed_value, bool) or observed_value is not muted:
+            return {
+                "ok": False,
+                "role": role,
+                "target": target,
+                "muted": muted,
+                "observed": observed,
+                "error": (
+                    f"Meet {target} state did not verify after mutation: "
+                    f"requested {muted}, observed "
+                    f"{observed_value if isinstance(observed_value, bool) else 'unknown'}"
+                ),
+            }
+        holder[f"{role}_{target}_muted_override"] = muted
+        if role == "companion" and target == "mic" and muted:
+            companion_audio.invalidate("companion microphone manually muted")
+        return {
+            "ok": True,
+            "role": role,
+            "target": target,
+            "muted": muted,
+            "observed": observed,
+        }
+
+    def _sync_role_devices(payload: dict[str, Any]) -> dict[str, Any]:
+        unknown = set(payload) - {
+            "meeting_url",
+            "role",
+            "mic",
+            "speakers",
+            "companion_wiring",
+        }
+        if unknown:
+            raise ValueError(
+                f"unsupported device-sync fields: {', '.join(sorted(unknown))}"
+            )
+        role = str(payload.get("role") or "").strip().lower()
+        if role not in {"host", "companion"}:
+            raise ValueError("role must be 'host' or 'companion'")
+        reconnect_policy.clear(role)
+        requested = meeting_key(payload.get("meeting_url"))
+        active = meeting_key(holder.get("url"))
+        if not requested or requested != active:
+            return {"ok": False, "error": "selected meeting is not active"}
+        tab = holder.get("tab") if role == "host" else holder.get("companion_tab")
+        state_value = (
+            _media_state("host", tab).get("inCall")
+            if role == "host"
+            else holder.get("companion_state") == "in-call"
+        )
+        if tab is None or not state_value:
+            return {"ok": False, "error": f"{role} must be attached and in-call"}
+        holder["role_device_sync"][role] = {
+            "state": "syncing",
+            "meetingUrl": active,
+            "updatedAt": time.time(),
+            "error": None,
+        }
+        if role == "companion":
+            wiring = payload.get("companion_wiring")
+            if not isinstance(wiring, dict):
+                result = {
+                    "ok": False,
+                    "error": "companion two-cable wiring is required",
+                }
+            else:
+                result = _run_companion_wiring(
+                    {
+                        "meeting_url": active,
+                        "reason": "device-sync",
+                    },
+                    trusted_config=wiring,
+                )
+        else:
+            result = sync_meet_devices(
+                tab,
+                payload.get("mic") or {},
+                payload.get("speakers") or {},
+            )
+        holder["role_device_sync"][role] = {
+            "state": "synced" if result.get("ok") else "error",
+            "meetingUrl": active,
+            "updatedAt": time.time(),
+            "verified": result.get("ok") is True
+            and (
+                result.get("verified") is True
+                or (
+                    result.get("sinkVerified") is True
+                    and result.get("micVerified") is True
+                    and result.get("ttsOutputVerified") is True
+                )
+            ),
+            "actual": result.get("actual")
+            or {
+                "mic": result.get("mic"),
+                "speakers": result.get("speakers"),
+            },
+            "error": result.get("error"),
+        }
+        return {
+            **result,
+            "role": role,
+            "meetingUrl": active,
+            "deviceSync": holder["role_device_sync"][role],
+        }
 
     def invalidate_floor(reason: str, target_url: str | None = None) -> None:
         target = meeting_key(target_url or holder.get("url"))
@@ -3522,6 +4013,7 @@ def main() -> None:
                     update_companion_heard_stt_status(status, holder)
                     update_companion_cable_wiring_status(status, holder)
                     status["companionAudio"] = companion_audio.status()
+                    status["reconnect"] = reconnect_policy.status()
                     with captions_lock:
                         _refresh_caption_transport_state(
                             status,
@@ -3555,7 +4047,7 @@ def main() -> None:
                     self.send_header("content-length", "0")
                     self.end_headers()
                     return
-                if route in _BRIDGE_WIRING_ROUTES:
+                if route in _BRIDGE_AUTHENTICATED_ROUTES:
                     body = json.dumps(
                         {
                             "ok": False,
@@ -3587,7 +4079,7 @@ def main() -> None:
                     self.send_header("content-length", "0")
                     self.end_headers()
                     return
-                if route in _BRIDGE_WIRING_ROUTES:
+                if route in _BRIDGE_AUTHENTICATED_ROUTES:
                     auth_error = bridge_worker_request_error(
                         self.headers, worker_secret
                     )
@@ -3608,6 +4100,12 @@ def main() -> None:
                     payload = json.loads(raw or b"{}")
                     if route == MEET_BRIDGE_WIRE_AUDIO:
                         body_obj = _run_companion_wiring(payload)
+                        status_code = 200 if body_obj.get("ok") else 409
+                    elif route == MEET_BRIDGE_MEDIA_MUTE:
+                        body_obj = _set_role_media_mute(payload)
+                        status_code = 200 if body_obj.get("ok") else 409
+                    elif route == MEET_BRIDGE_DEVICE_SYNC:
+                        body_obj = _sync_role_devices(payload)
                         status_code = 200 if body_obj.get("ok") else 409
                     elif route == MEET_BRIDGE_DISCONNECT_AUDIO:
                         requested = meeting_key(payload.get("meeting_url")) if payload.get("meeting_url") else meeting_key(holder.get("url"))
@@ -3670,7 +4168,7 @@ def main() -> None:
                 body = json.dumps(body_obj).encode("utf-8")
                 self.send_response(status_code)
                 self.send_header("content-type", "application/json")
-                if route not in _BRIDGE_WIRING_ROUTES:
+                if route not in _BRIDGE_AUTHENTICATED_ROUTES:
                     self.send_header("access-control-allow-origin", "*")
                 self.send_header("content-length", str(len(body)))
                 self.end_headers()
@@ -3708,16 +4206,18 @@ def main() -> None:
             holder.pop("companion_wiring_manual_suppression", None)
             holder["companion_wiring_retry_count"] = 0
             holder["companion_wiring_next_retry_at"] = 0.0
-        if (
+        already_wired = (
             holder.get("companion_wiring_phase") == "wired"
             and holder.get("companion_wiring_tab_id") == holder.get("companion_tab_id")
             and holder.get("companion_wiring_meeting_url") == meeting_key(holder.get("url"))
-        ):
-            return
+        )
         attempts = int(holder.get("companion_wiring_retry_count") or 0)
         try:
-            saved = mailbox.companion_cable_wiring()
+            active_meeting = meeting_key(holder.get("url"))
+            saved = scoped_companion_wiring(mailbox, active_meeting)
             if not (saved.get("validation") or {}).get("valid"):
+                if already_wired:
+                    _disconnect_companion_wiring("configuration-invalid")
                 if isinstance(saved.get("config"), dict):
                     holder["companion_wiring_desired"] = saved.get("config")
                 holder["companion_wiring_retry_count"] = 3
@@ -3728,12 +4228,15 @@ def main() -> None:
                 update_companion_cable_wiring_status(status, holder)
                 return
             revision = companion_wiring_revision(saved["config"])
-            if holder.get("companion_wiring_config_revision") != revision:
+            config_changed = holder.get("companion_wiring_config_revision") != revision
+            if config_changed:
                 holder["companion_wiring_config_revision"] = revision
                 holder.pop("companion_wiring_manual_suppression", None)
                 holder["companion_wiring_retry_count"] = 0
                 holder["companion_wiring_next_retry_at"] = 0.0
                 attempts = 0
+            if already_wired and not config_changed:
+                return
             if attempts >= 3 or time.monotonic() < float(
                 holder.get("companion_wiring_next_retry_at") or 0.0
             ):
@@ -3852,6 +4355,28 @@ def main() -> None:
                     wanted_room=target if operator_joined else None,
                 )
                 if not info:
+                    if operator_joined:
+                        reconnect_state = reconnect_policy.status().get(
+                            "companion", {}
+                        )
+                        if reconnect_state.get("state") not in {
+                            "waiting",
+                            "suppressed",
+                            "disabled",
+                            "exhausted",
+                        }:
+                            reconnect_state = reconnect_policy.unexpected_loss(
+                                "companion",
+                                enabled=reconnect_enabled(target),
+                                error="companion tab was lost unexpectedly",
+                            )
+                        if reconnect_state.get("state") in {
+                            "suppressed",
+                            "disabled",
+                            "exhausted",
+                        } or not reconnect_policy.ready("companion"):
+                            stop.wait(1)
+                            continue
                     reusable_tab = find_role_meet_tab(companion_cdp, "companion")
                     if reusable_tab is None:
                         log(
@@ -3893,6 +4418,11 @@ def main() -> None:
                     if not operator_joined and not reused_tab:
                         print("[companion] authuser tab opened -- sign in with the assigned account if needed; I wait for the first in-call sighting before taking over.", flush=True)
                     if not (info and info.get("webSocketDebuggerUrl")):
+                        reconnect_policy.unexpected_loss(
+                            "companion",
+                            enabled=reconnect_enabled(target),
+                            error="companion reconnect did not produce a controlled tab",
+                        )
                         stop.wait(3)
                         continue
                 if companion_tab is None:
@@ -3972,6 +4502,8 @@ def main() -> None:
                         + "staying muted and deaf; remote audio is tapped without speaker playback when enabled.",
                         role="companion",
                     )
+                if state == "in-call":
+                    reconnect_policy.success("companion")
                 if state == "signin" and not operator_joined:
                     if not told_waiting:
                         told_waiting = True
@@ -4052,6 +4584,9 @@ def main() -> None:
                 ):
                     _disconnect_companion_wiring("meeting-switched")
                 if state == "in-call":
+                    # Establish persistent operator intent before wiring
+                    # finalization decides whether remote media may be audible.
+                    _apply_media_overrides("companion", companion_tab)
                     _auto_wire_companion_if_ready(companion_tab)
                     _verify_live_companion_wiring(companion_tab)
                 # While say_into_meeting() owns the mic, don't fight it with
@@ -4063,7 +4598,9 @@ def main() -> None:
                         holder.get("companion_click_enabled")
                         and str(holder.get("companion_click_action") or "").startswith("say:")
                     )
-                    mic_policy = "speaking" if audible_backchannel else "muted"
+                    mic_policy = companion_mic_policy(
+                        holder, "speaking" if audible_backchannel else "muted"
+                    )
                     verdict = companion_tab.evaluate(autojoin_js(mic_policy))
                     if verdict == "unmuted-for-speech" and audible_backchannel:
                         _log_companion_click(log, "unmuted", "[click] companion unmuted for synthetic ticker", interval=60.0)
@@ -4123,8 +4660,12 @@ def main() -> None:
                     and not holder.get("companion_wiring_desired")
                 ):
                     forward_companion_heard_audio(companion_tab, mailbox, holder, status, log=log)
-                elif holder.get("companion_wiring_phase") != "wired":
+                elif (
+                    holder.get("companion_wiring_phase") != "wired"
+                    and holder.get("companion_speakers_muted_override") is not False
+                ):
                     companion_tab.evaluate('document.querySelectorAll("audio,video").forEach((m) => { m.muted = true; m.volume = 0; })')
+                _apply_media_overrides("companion", companion_tab)
             except Exception as error:  # noqa: BLE001
                 _disconnect_companion_wiring("companion-cdp-error")
                 invalidate_sso_satisfaction(holder, "companion-cdp-error", clear_roles=("companion",))
@@ -4138,6 +4679,12 @@ def main() -> None:
                 holder["companion_click_installed"] = False
                 update_companion_click_status(status, holder)
                 log(f"[companion] {error}", err=True, role="companion")
+                if operator_joined:
+                    reconnect_policy.unexpected_loss(
+                        "companion",
+                        enabled=reconnect_enabled(target),
+                        error=str(error),
+                    )
                 stop.wait(3)
             stop.wait(3)
 
@@ -4205,7 +4752,9 @@ def main() -> None:
         }
         holder["speaking_until"] = holder["companion_say_artifact_until"]
         try:
-            unmute_verdict = tab.evaluate(autojoin_js("speaking"))
+            unmute_verdict = tab.evaluate(
+                autojoin_js(companion_mic_policy(holder, "speaking"))
+            )
             if cancel_event.wait(0.3):
                 raise RuntimeError("companion speech cancelled before playback")
             physical_output_index = holder.get("companion_tts_output_device_index")
@@ -4237,7 +4786,13 @@ def main() -> None:
                         holder.get("companion_click_enabled")
                         and str(holder.get("companion_click_action") or "").startswith("say:")
                     )
-                    tab.evaluate(autojoin_js("speaking" if audible else "muted"))
+                    tab.evaluate(
+                        autojoin_js(
+                            companion_mic_policy(
+                                holder, "speaking" if audible else "muted"
+                            )
+                        )
+                    )
                 except Exception as error:  # noqa: BLE001
                     log(f"[say] re-mute failed: {error}", err=True, role="companion")
 
@@ -4268,8 +4823,11 @@ def main() -> None:
         threading.Thread(target=companion_loop, daemon=True).start()
         print("[companion] armed: a muted second authuser tab in the browser will sit in the meeting so Google keeps it alive", flush=True)
 
-    def switch_to(target_url: str | None) -> None:
+    def switch_to(target_url: str | None, *, explicit: bool = True) -> None:
         """Leave for another meeting: /join <url> or /new (fresh servant room)."""
+        if explicit:
+            reconnect_policy.clear("host")
+            reconnect_policy.clear("companion")
         if target_url:
             try:
                 MeetBrowserSettings(click_settings_dir).unforget_meeting_url(
@@ -4349,6 +4907,7 @@ def main() -> None:
         record_role_verified("host", holder["host_account"])
         holder["tab_id"] = info.get("id")
         holder["url"] = str(info.get("url") or "").split("?")[0]
+        holder["last_meeting_url"] = holder["url"]
         sync_companion_click_for_meeting("switch", force=True)
         install_caption_push(holder["tab"], role="host", log=log)
         if old:
@@ -4357,6 +4916,7 @@ def main() -> None:
             except Exception:
                 pass
         log(f"[bridge] now bridging: {holder['url']}", role="host")
+        reconnect_policy.success("host")
         _snapshot_current_meeting_state()
         announce(f"Meet bridge moved -- now in: {holder['url']}", {"source": "google-meet-bridge", "meetingUrl": holder["url"]})
 
@@ -4508,10 +5068,23 @@ def main() -> None:
             invalidate_sso_satisfaction(holder, f"{wanted}-process-killed")
             holder[key] = process
             if wanted == "host":
+                invalidate_role_device_sync_if_unverified(
+                    holder,
+                    "host",
+                    {"inCall": False, "mediaStateError": "host process was killed"},
+                )
                 holder["tab"] = None
                 holder["tab_id"] = None
                 holder["url"] = None
             else:
+                invalidate_role_device_sync_if_unverified(
+                    holder,
+                    "companion",
+                    {
+                        "inCall": False,
+                        "mediaStateError": "companion process was killed",
+                    },
+                )
                 companion_audio.invalidate("companion process killed")
                 holder["companion_tab"] = None
                 holder["companion_tab_id"] = None
@@ -4542,6 +5115,10 @@ def main() -> None:
             return "disconnect failed: guest/client tabs are not implemented yet"
         if wanted not in (None, "host", "companion"):
             return f"disconnect failed: unknown role {wanted!r}"
+        for disconnected_role in (
+            ("host", "companion") if wanted is None else (wanted,)
+        ):
+            reconnect_policy.suppress(disconnected_role)
         closed: list[str] = []
         failed: list[str] = []
         if wanted in (None, "host", "companion"):
@@ -4556,6 +5133,11 @@ def main() -> None:
                     tab.close()
                 except Exception:
                     pass
+                invalidate_role_device_sync_if_unverified(
+                    holder,
+                    "host",
+                    {"inCall": False, "mediaStateError": "host tab was disconnected"},
+                )
                 holder["tab"] = None
                 holder["tab_id"] = None
                 holder["url"] = None
@@ -4574,6 +5156,14 @@ def main() -> None:
                     companion_tab.close()
                 except Exception:
                     pass
+                invalidate_role_device_sync_if_unverified(
+                    holder,
+                    "companion",
+                    {
+                        "inCall": False,
+                        "mediaStateError": "companion tab was disconnected",
+                    },
+                )
                 holder["companion_tab"] = None
                 holder["companion_tab_id"] = None
                 holder["companion_state"] = "not-attached"
@@ -4701,7 +5291,6 @@ def main() -> None:
     warned = ""
     autojoin_at = 0.0
     last_autojoin_verdict = ""
-    lost_since: float | None = None
     fallback_logged_keys: set[str] = set()
     next_poll_at = 0.0
     push_reinstall_at = {role: 0.0 for role in CAPTION_ROLES}
@@ -4738,11 +5327,49 @@ def main() -> None:
             if time.time() >= next_poll_at:
                 try:
                     payloads = read_caption_payloads(holder, log=log)
-                    lost_since = None
+                    reconnect_policy.success("host")
                 except Exception as error:  # noqa: BLE001
-                    print(f"[bridge] tab lost ({error}); reattaching?", file=sys.stderr, flush=True)
-                    time.sleep(2.0)
-                    info = find_role_meet_tab(cdp_endpoint, "host", wanted_room=holder.get("url"))
+                    target = str(
+                        holder.get("url") or holder.get("last_meeting_url") or ""
+                    )
+                    current_reconnect = reconnect_policy.status().get("host", {})
+                    if current_reconnect.get("state") not in {
+                        "waiting",
+                        "suppressed",
+                        "disabled",
+                        "exhausted",
+                    }:
+                        current_reconnect = reconnect_policy.unexpected_loss(
+                            "host",
+                            enabled=reconnect_enabled(target),
+                            error=str(error),
+                        )
+                    if current_reconnect.get("state") in {
+                        "suppressed",
+                        "disabled",
+                        "exhausted",
+                    } or not reconnect_policy.ready("host"):
+                        stop.wait(0.25)
+                        continue
+                    print(
+                        f"[bridge] host tab lost ({error}); bounded reconnect attempt "
+                        f"{current_reconnect.get('attempt')}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    try:
+                        info = find_role_meet_tab(
+                            cdp_endpoint, "host", wanted_room=target
+                        )
+                    except Exception as reconnect_error:  # noqa: BLE001
+                        info = None
+                        reconnect_policy.unexpected_loss(
+                            "host",
+                            enabled=reconnect_enabled(target),
+                            error=str(reconnect_error),
+                        )
+                        stop.wait(0.25)
+                        continue
                     if info:
                         invalidate_sso_satisfaction(holder, "host-tab-reconnected", clear_roles=("host",))
                         scan_sso_accounts_now(allow_scan=True)
@@ -4757,19 +5384,34 @@ def main() -> None:
                         except RuntimeError as verify_error:
                             invalidate_sso_satisfaction(holder, "host-verification-failed", clear_roles=("host",))
                             print(f"[bridge] refusing reattached host tab: {verify_error}", file=sys.stderr, flush=True)
+                            reconnect_policy.unexpected_loss(
+                                "host",
+                                enabled=reconnect_enabled(target),
+                                error=str(verify_error),
+                            )
                             continue
                         record_role_verified("host", holder["host_account"])
                         holder["tab_id"] = info.get("id")
                         holder["url"] = str(info.get("url") or "").split("?")[0]
+                        holder["last_meeting_url"] = holder["url"]
                         sync_companion_click_for_meeting("reattach", force=True)
                         install_caption_push(holder["tab"], role="host", log=log)
-                        lost_since = None
+                        reconnect_policy.success("host")
                     elif not args.attach_only:
-                        lost_since = lost_since or time.time()
-                        if time.time() - lost_since > 20:
-                            print("[bridge] meeting gone -- creating a fresh servant meeting...", flush=True)
-                            lost_since = None
-                            switch_to(None)
+                        previous_tab = holder.get("tab")
+                        switch_to(target or None, explicit=False)
+                        if holder.get("tab") is previous_tab:
+                            reconnect_policy.unexpected_loss(
+                                "host",
+                                enabled=reconnect_enabled(target),
+                                error="host reconnect could not reopen the controlled tab",
+                            )
+                    else:
+                        reconnect_policy.unexpected_loss(
+                            "host",
+                            enabled=reconnect_enabled(target),
+                            error="attach-only reconnect could not find the host tab",
+                        )
                     continue
                 note = ""
                 for role, payload in payloads:
@@ -4802,15 +5444,20 @@ def main() -> None:
             # Always tick (not gated on caption "quiet"/"ok" state) --
             # autojoin_js is idempotent and harmlessly returns "in-call" when
             # there's nothing to do.
-            if not args.no_autojoin and time.time() - autojoin_at > 2.5:
+            if time.time() - autojoin_at > 2.5:
                 autojoin_at = time.time()
+                if not args.no_autojoin:
+                    try:
+                        verdict = tab.evaluate(autojoin_js("keep"))
+                        if verdict not in ("in-call", "waiting-prejoin") and verdict != last_autojoin_verdict:
+                            log(f"[bridge] autojoin: {verdict}", role="host")
+                        last_autojoin_verdict = verdict
+                    except Exception as error:  # noqa: BLE001
+                        log(f"[bridge] autojoin failed: {error}", err=True, role="host")
                 try:
-                    verdict = tab.evaluate(autojoin_js("keep"))
-                    if verdict not in ("in-call", "waiting-prejoin") and verdict != last_autojoin_verdict:
-                        log(f"[bridge] autojoin: {verdict}", role="host")
-                    last_autojoin_verdict = verdict
+                    _apply_media_overrides("host", tab)
                 except Exception as error:  # noqa: BLE001
-                    log(f"[bridge] autojoin failed: {error}", err=True, role="host")
+                    log(f"[bridge] host media override failed: {error}", err=True, role="host")
             stop.wait(0.05)
     except KeyboardInterrupt:
         pass

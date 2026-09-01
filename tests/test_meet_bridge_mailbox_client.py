@@ -73,6 +73,24 @@ def test_secondary_capture_start_uses_audio_endpoint(monkeypatch) -> None:
     assert captured["body"] == {"device_id": "dev-1"}
 
 
+def test_companion_wiring_runtime_request_is_meeting_scoped(monkeypatch) -> None:
+    client = MailboxClient(token="worker-token")
+    captured = {}
+
+    def call(path, *, method="GET", body=None):
+        captured.update(path=path, method=method, body=body)
+        return {"validation": {"valid": True}}
+
+    monkeypatch.setattr(client, "_call", call)
+    meeting = "https://meet.google.com/abc-defg-hij"
+
+    assert client.companion_cable_wiring(meeting)["validation"]["valid"] is True
+    assert captured["path"] == (
+        "/meet/companion-cable-wiring/runtime"
+        "?meeting_url=https%3A%2F%2Fmeet.google.com%2Fabc-defg-hij"
+    )
+
+
 def test_companion_browser_audio_uses_shared_secondary_endpoint(monkeypatch) -> None:
     client = MailboxClient(token="worker-token")
     captured = {}

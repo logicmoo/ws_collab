@@ -79,6 +79,7 @@ const state = {
   meetKnownUrls: [...DEFAULT_DRIVER_MEETING_URLS, ...DEFAULT_CLIENT_MEETING_URLS],
   meetForgottenUrls: [],
   meetGlobalAssignments: null,
+  meetRouting: {},
   meetCompanion: {
     target: "global",
     meetingUrl: "",
@@ -94,6 +95,9 @@ const state = {
     payload: null,
     loading: false,
     dirty: false,
+    requestGeneration: 0,
+    requestKey: "",
+    draftRevision: 0,
   },
   silences: {
     run: null,
@@ -2020,6 +2024,128 @@ async function postMeetCommand(command) {
   loadMeet();
 }
 
+async function postMeetMediaMute(meetingUrl, role, target, muted) {
+  const resultEl = $("meet-command-result");
+  const label = target === "mic" ? "microphone" : "speakers";
+  resultEl.textContent = `${role} ${label} — sending…`;
+  try {
+    await api(`${MEET_BRIDGE_BASE}/media-mute`, {
+      method: "POST",
+      body: { meeting_url: meetingUrl, role, target, muted },
+    });
+    resultEl.textContent = `${role} ${label} → ${muted ? "muted" : "unmuted"}`;
+  } catch (error) {
+    resultEl.textContent = `${role} ${label} → error: ${error.message}`;
+    pushError(error.message);
+  }
+  loadMeet();
+}
+
+function meetRoutingState(meetingUrl) {
+  const key = meetAssignmentKey(meetingUrl);
+  if (!state.meetRouting[key]) {
+    state.meetRouting[key] = {
+      payload: null,
+      drafts: {},
+      dirtyRoles: new Set(),
+      roleStatus: {},
+      roleRevisions: {},
+    };
+  }
+  return state.meetRouting[key];
+}
+
+async function loadMeetingRouting(meetingUrl) {
+  const key = meetAssignmentKey(meetingUrl);
+  if (!key || key === "(unknown meeting)") return null;
+  const routeState = meetRoutingState(key);
+  try {
+    routeState.payload = await api(`${API_BASE}/meet/routing?meeting_url=${encodeURIComponent(key)}`);
+    return routeState.payload;
+  } catch (error) {
+    routeState.loadError = error.message;
+    return null;
+  }
+}
+
+async function updateMeetingRouting(meetingUrl, patch, message) {
+  const routeState = meetRoutingState(meetingUrl);
+  routeState.policyStatus = "Saving…";
+  try {
+    routeState.payload = await api(`${API_BASE}/meet/routing`, {
+      method: "POST",
+      body: { meeting_url: meetingUrl, ...patch },
+    });
+    routeState.policyStatus = message || "Saved; Sync devices to apply.";
+  } catch (error) {
+    routeState.policyStatus = `Error: ${error.message}`;
+    pushError(error.message);
+  }
+  loadMeet();
+}
+
+function setMeetingDeviceDraft(meetingUrl, role, field, option) {
+  const routeState = meetRoutingState(meetingUrl);
+  routeState.drafts[role] = routeState.drafts[role] || {};
+  routeState.drafts[role][field] = option && option.value
+    ? {
+        label: option.dataset.deviceLabel || option.textContent,
+        deviceId: option.value,
+      }
+    : null;
+  routeState.dirtyRoles.add(role);
+  routeState.roleRevisions[role] = (routeState.roleRevisions[role] || 0) + 1;
+  routeState.roleStatus[role] = "Pending — Sync required";
+  loadMeet();
+}
+
+async function syncMeetingDevices(meetingUrl, role) {
+  const meetingKey = meetAssignmentKey(meetingUrl);
+  const routeState = meetRoutingState(meetingUrl);
+  const policy = (routeState.payload && routeState.payload.policy) || {};
+  const persisted = ((policy.roles || {})[role]) || {};
+  const draft = routeState.drafts[role] || {};
+  const devices = {
+    mic: draft.mic || persisted.mic,
+    speakers: draft.speakers || persisted.speakers,
+  };
+  const submittedRevision = routeState.roleRevisions[role] || 0;
+  const submittedSnapshot = JSON.stringify(routeState.drafts[role] || {});
+  if (!devices.mic || !devices.speakers) {
+    routeState.roleStatus[role] = "Error — select a mic and speakers";
+    loadMeet();
+    return;
+  }
+  routeState.roleStatus[role] = "Syncing…";
+  try {
+    await api(`${API_BASE}/meet/routing`, {
+      method: "POST",
+      body: { meeting_url: meetingUrl, roles: { [role]: devices } },
+    });
+    const result = await api(`${API_BASE}/meet/routing/sync`, {
+      method: "POST",
+      body: { meeting_url: meetingUrl, role },
+    });
+    const currentState = meetRoutingState(meetingKey);
+    const stillCurrent = meetAssignmentKey(meetingUrl) === meetingKey
+      && currentState === routeState
+      && (routeState.roleRevisions[role] || 0) === submittedRevision
+      && JSON.stringify(routeState.drafts[role] || {}) === submittedSnapshot;
+    if (stillCurrent) {
+      routeState.payload = result.routing;
+      routeState.drafts[role] = {};
+      routeState.dirtyRoles.delete(role);
+      routeState.roleStatus[role] = "Synced and verified";
+    } else {
+      routeState.roleStatus[role] = "Saved/synced previous selection; newer edits pending";
+    }
+  } catch (error) {
+    routeState.roleStatus[role] = `Error — ${error.message}`;
+    pushError(error.message);
+  }
+  loadMeet();
+}
+
 async function postMeetSso(path, body, confirmText) {
   if (confirmText && !confirm(confirmText)) return;
   const resultEl = $("br-result");
@@ -2588,19 +2714,29 @@ function syncCompanionTargetOptions(currentMeeting = "", payload = null) {
     const canFollowLiveRoom = companionScope() !== "channel";
     if (canFollowLiveRoom && current !== selectedMeeting) {
       const pendingCurrent = state.meetCompanion.pendingMeetingUrl === current;
+      const silenceDirty = companionScope() === "test" && companionFormIsDirty();
+      const wiringDirty = state.companionCableWiring.dirty;
       if (
-        companionScope() === "test"
-        && companionFormIsDirty()
+        (silenceDirty || wiringDirty)
         && (!pendingCurrent || !state.meetCompanion.pendingMeetingUrl)
-        && !confirm("Discard unsaved Tests here changes and switch to the bridge's current room?")
+        && !confirm(
+          wiringDirty
+            ? "Discard unsaved cable wiring changes and switch to the bridge's current room?"
+            : "Discard unsaved Tests here changes and switch to the bridge's current room?",
+        )
       ) {
         state.meetCompanion.pendingMeetingUrl = current;
         setCompanionResult(
-          `Unsaved Tests here changes remain bound to ${meetRoomId(selectedMeeting)}; they will not be saved to ${meetRoomId(current)}.`,
+          `Unsaved scoped changes remain bound to ${meetRoomId(selectedMeeting)}; they will not be saved to ${meetRoomId(current)}.`,
         );
-      } else if (!(companionScope() === "test" && companionFormIsDirty() && pendingCurrent)) {
+      } else if (!((silenceDirty || wiringDirty) && pendingCurrent)) {
+        const previousMeeting = companionMeetingKey(state.meetCompanion.meetingUrl);
         state.meetCompanion.meetingUrl = current;
         state.meetCompanion.pendingMeetingUrl = "";
+        if (previousMeeting !== current) {
+          invalidateCompanionCableWiring(current);
+          loadCompanionCableWiring();
+        }
       }
     }
   }
@@ -3044,6 +3180,15 @@ const COMPANION_CABLE_SELECTS = {
   transmit_companion_mic: "companion-cable-transmit-mic",
 };
 
+function companionCableDraftSnapshot() {
+  const snapshot = {};
+  Object.entries(COMPANION_CABLE_SELECTS).forEach(([key, id]) => {
+    const select = $(id);
+    snapshot[key] = select ? select.value : "";
+  });
+  return snapshot;
+}
+
 function companionCableDeviceLabel(device) {
   const capability = [
     device.supports_output ? "PLAYBACK" : "",
@@ -3092,7 +3237,7 @@ function renderCompanionCableWiring(health = state.meetCompanion.health) {
   if (disconnect) disconnect.disabled = !applied.wired && applied.phase !== "failed";
   const validationErrors = (payload.validation && payload.validation.errors) || [];
   $("companion-cable-eligibility").textContent = endpointsValid && connected
-    ? "Ready to apply to the current in-call companion. Wiring is fail-closed and RECEIVE remains muted until capture verifies healthy."
+    ? `Ready to apply to the current in-call companion (${payload.scope || "unknown scope"}). Wiring is fail-closed and RECEIVE remains muted until capture verifies healthy.`
     : validationErrors.length
       ? `Not ready: ${validationErrors.join("; ")}`
       : "Not ready: select the currently active channel and wait for its companion to be in-call.";
@@ -3126,30 +3271,98 @@ function renderCompanionCableWiring(health = state.meetCompanion.health) {
 }
 
 async function loadCompanionCableWiring() {
-  if (state.companionCableWiring.loading) return;
+  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
+  const generation = state.companionCableWiring.requestGeneration;
+  const draftRevision = state.companionCableWiring.draftRevision;
+  const draftSnapshot = JSON.stringify(companionCableDraftSnapshot());
+  const wasDirty = state.companionCableWiring.dirty;
+  const requestKey = `${generation}:${meetingUrl}`;
+  if (
+    state.companionCableWiring.loading
+    && state.companionCableWiring.requestKey === requestKey
+  ) return;
   state.companionCableWiring.loading = true;
+  state.companionCableWiring.requestKey = requestKey;
   try {
-    state.companionCableWiring.payload = await api(`${API_BASE}/meet/companion-cable-wiring`);
-    state.companionCableWiring.dirty = false;
+    const query = meetingUrl ? `?meeting_url=${encodeURIComponent(meetingUrl)}` : "";
+    const payload = await api(`${API_BASE}/meet/companion-cable-wiring${query}`);
+    if (
+      generation !== state.companionCableWiring.requestGeneration
+      || meetingUrl !== companionMeetingKey(state.meetCompanion.meetingUrl)
+    ) return;
+    state.companionCableWiring.payload = payload;
+    const draftUnchanged = draftRevision === state.companionCableWiring.draftRevision
+      && draftSnapshot === JSON.stringify(companionCableDraftSnapshot());
+    if (draftUnchanged && !wasDirty) state.companionCableWiring.dirty = false;
     renderCompanionCableWiring();
   } catch (error) {
-    $("companion-cable-result").textContent = `Could not load wiring: ${error.message}`;
+    if (
+      generation === state.companionCableWiring.requestGeneration
+      && meetingUrl === companionMeetingKey(state.meetCompanion.meetingUrl)
+    ) {
+      $("companion-cable-result").textContent = `Could not load wiring: ${error.message}`;
+    }
   } finally {
-    state.companionCableWiring.loading = false;
+    if (state.companionCableWiring.requestKey === requestKey) {
+      state.companionCableWiring.loading = false;
+      state.companionCableWiring.requestKey = "";
+    }
   }
 }
 
+function invalidateCompanionCableWiring(meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl)) {
+  state.companionCableWiring.requestGeneration += 1;
+  state.companionCableWiring.requestKey = "";
+  state.companionCableWiring.payload = null;
+  state.companionCableWiring.loading = false;
+  state.companionCableWiring.dirty = false;
+  Object.values(COMPANION_CABLE_SELECTS).forEach((id) => {
+    const select = $(id);
+    if (select) select.replaceChildren(el("option", "", "Loading scoped endpoints…"));
+  });
+  const status = $("companion-cable-status");
+  if (status) status.replaceChildren();
+  const eligibility = $("companion-cable-eligibility");
+  if (eligibility) {
+    eligibility.textContent = meetingUrl
+      ? `Loading cable wiring for ${meetRoomId(meetingUrl)}…`
+      : "Loading global cable wiring defaults…";
+  }
+  const result = $("companion-cable-result");
+  if (result) result.textContent = "";
+}
+
 async function saveCompanionCableWiring() {
-  const body = {};
-  Object.entries(COMPANION_CABLE_SELECTS).forEach(([key, id]) => { body[key] = $(id).value; });
+  const body = companionCableDraftSnapshot();
+  const meetingUrl = companionMeetingKey(state.meetCompanion.meetingUrl);
+  const generation = state.companionCableWiring.requestGeneration;
+  const submittedRevision = state.companionCableWiring.draftRevision;
+  const submittedSnapshot = JSON.stringify(body);
+  body.meeting_url = meetingUrl;
   $("companion-cable-result").textContent = "Saving only; no audio will be unmuted…";
   try {
-    state.companionCableWiring.payload = await api(`${API_BASE}/meet/companion-cable-wiring`, { method: "POST", body });
-    state.companionCableWiring.dirty = false;
-    $("companion-cable-result").textContent = "Saved. Use Wire now to apply.";
-    renderCompanionCableWiring();
+    const payload = await api(`${API_BASE}/meet/companion-cable-wiring`, { method: "POST", body });
+    if (
+      generation !== state.companionCableWiring.requestGeneration
+      || meetingUrl !== companionMeetingKey(state.meetCompanion.meetingUrl)
+    ) return;
+    const unchanged = submittedRevision === state.companionCableWiring.draftRevision
+      && submittedSnapshot === JSON.stringify(companionCableDraftSnapshot());
+    if (unchanged) {
+      state.companionCableWiring.payload = payload;
+      state.companionCableWiring.dirty = false;
+      $("companion-cable-result").textContent = "Saved. Use Wire now to apply.";
+      renderCompanionCableWiring();
+    } else {
+      $("companion-cable-result").textContent = "Saved previous selection; newer edits pending.";
+    }
   } catch (error) {
-    $("companion-cable-result").textContent = `Not saved: ${error.message}`;
+    if (
+      generation === state.companionCableWiring.requestGeneration
+      && meetingUrl === companionMeetingKey(state.meetCompanion.meetingUrl)
+    ) {
+      $("companion-cable-result").textContent = `Not saved: ${error.message}`;
+    }
   }
 }
 
@@ -3299,18 +3512,39 @@ async function loadProcesses() {
  * meeting, role-scoped Foreground (raise that identity's browser window)
  * + Disconnect (hang up just that tab) buttons; for a not-current meeting,
  * Join/Rejoin instead (no live tab to foreground/disconnect there). Device
- * detail (Mic/Speak) is only meaningful for the CURRENT meeting — the
+ * Mic/Speak state is only meaningful for the CURRENT meeting — the
  * bridge doesn't retain live per-participant device state for meetings
- * it's left, only the coarser profile/state snapshot. Whether a mic is
- * "physical" or not is already obvious from its Mic text ("real
- * microphone" vs. a device name) — no separate checkbox needed for that. */
-function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
+ * it's left, only the coarser profile/state snapshot. */
+function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind, routing) {
+  const routeState = meetRoutingState(url);
+  const policy = (routing && routing.policy) || {};
   const rejoin = (state) => actionButton(state === "in-call" ? "Rejoin" : "Join", "", () => postMeetCommand(`/join ${url}`));
-  const captureListening = !!state.meetCaptureListening;
   const actionsFor = (role) => {
     const wrap = el("span", "meet-row-actions");
-    if (role === "host") wrap.append(actionButton(captureListening ? "Mute" : "Unmute", "mini", () => toggleMeetCapture(captureListening)));
+    const live = routing && routing.roleStates && routing.roleStates[role];
+    const rolePolicy = ((policy.roles || {})[role]) || {};
+    const draft = routeState.drafts[role] || {};
+    const selections = {
+      mic: draft.mic || rolePolicy.mic,
+      speakers: draft.speakers || rolePolicy.speakers,
+    };
+    const selectedEligible = (field, kindName) => {
+      const selected = selections[field];
+      if (!selected) return false;
+      return ((live && live.candidates) || []).some((candidate) =>
+        candidate.kind === kindName && candidate.eligible
+        && candidate.label === selected.label);
+    };
+    const sync = actionButton("Sync devices", "mini primary", () => syncMeetingDevices(url, role));
+    sync.disabled = !live || !live.syncEnabled
+      || !selectedEligible("mic", "audioinput")
+      || !selectedEligible("speakers", "audiooutput");
+    sync.title = sync.disabled
+      ? ((live && live.syncDisabledReason)
+        || "Select one available, eligible microphone and speaker.")
+      : "Persist these selections, apply them to the actual Meet tab, and verify them.";
     wrap.append(
+      sync,
       actionButton("Foreground", "mini", () => postMeetCommand(`/foreground ${role}`)),
       actionButton("Disconnect", "mini danger", () => postMeetCommand(`/disconnect ${role}`)),
     );
@@ -3322,39 +3556,133 @@ function meetUsRows(isCurrent, clients, url, hostProfile, roomSnapshot, kind) {
     link.href = "#browser";
     return link;
   };
+  const mediaCell = (client, role, target) => {
+    const wrap = el("span", "meet-media-cell");
+    const field = target === "mic" ? "mic" : "speakers";
+    const kindName = target === "mic" ? "audioinput" : "audiooutput";
+    const live = routing && routing.roleStates && routing.roleStates[role];
+    const candidates = ((live && live.candidates) || []).filter((candidate) => candidate.kind === kindName);
+    const observed = (live && live.observed) || {};
+    const synced = (live && live.sync) || {};
+    const persisted = ((((policy.roles || {})[role]) || {})[field]);
+    const selected = ((routeState.drafts[role] || {})[field]) || persisted;
+    const select = el("select", "meet-device-select");
+    select.setAttribute("aria-label", `${role} ${target === "mic" ? "microphone" : "speakers"} for ${meetRoomId(url)}`);
+    select.appendChild(new Option(`Choose ${target === "mic" ? "microphone" : "speakers"}…`, ""));
+    candidates.forEach((candidate) => {
+      const label = candidate.label
+        || `(label unavailable · ${candidate.deviceId || "unknown device"})`;
+      const isCurrent = target === "mic"
+        ? (observed.micLabels || []).includes(candidate.label)
+        : (observed.speakerDeviceIds || []).includes(candidate.deviceId);
+      const actual = synced.actual && (synced.actual[field]
+        || (field === "mic" && synced.actual.transmitCompanionMic)
+        || (field === "speakers" && synced.actual.receivePlaybackSink));
+      const isVerified = synced.verified === true && actual
+        && (actual.deviceId === candidate.deviceId || actual.actualDeviceId === candidate.deviceId);
+      const option = new Option(
+        `${label}${isCurrent ? " — current" : ""}${isVerified ? " — verified" : ""}${candidate.eligible ? "" : " — unavailable"}`,
+        candidate.deviceId || "",
+      );
+      option.dataset.deviceLabel = candidate.label || "";
+      option.disabled = !candidate.eligible;
+      option.title = candidate.ineligibleReason || "";
+      option.selected = !!selected && candidate.label === selected.label;
+      select.appendChild(option);
+    });
+    if (selected && !candidates.some((candidate) => candidate.label === selected.label)) {
+      const missing = new Option(`${selected.label} — not currently available`, selected.deviceId || "missing");
+      missing.dataset.deviceLabel = selected.label;
+      missing.disabled = true;
+      missing.selected = true;
+      select.appendChild(missing);
+    }
+    select.disabled = !isCurrent || !live || !live.controlled;
+    select.onchange = () => setMeetingDeviceDraft(url, role, field, select.selectedOptions[0]);
+    wrap.appendChild(select);
+    if (!client || client.state !== "in-call") return wrap;
+    const key = target === "mic" ? "micMuted" : "speakersMuted";
+    const noun = target === "mic" ? "mic" : "speakers";
+    const muted = client[key];
+    if (typeof muted !== "boolean") {
+      const unavailable = actionButton(`${target === "mic" ? "Mic" : "Speakers"} unavailable`, "mini");
+      unavailable.disabled = true;
+      unavailable.title = client.mediaStateError || `${noun} mute state is not observable in this Meet tab`;
+      wrap.appendChild(unavailable);
+      return wrap;
+    }
+    const button = actionButton(muted ? `Unmute ${noun}` : `Mute ${noun}`, "mini toggle", () =>
+      postMeetMediaMute(url, role, target, !muted));
+    button.setAttribute("aria-label", `${muted ? "Unmute" : "Mute"} ${role} ${noun} in Google Meet`);
+    button.setAttribute("aria-pressed", muted ? "true" : "false");
+    button.title = `${muted ? "Unmute" : "Mute"} the ${role} ${noun} in the Meet tab`;
+    wrap.appendChild(button);
+    return wrap;
+  };
   if (kind === "client") {
     const ssoVal = isCurrent ? null : (roomSnapshot && roomSnapshot.hostProfile);
-    const action = isCurrent ? actionsFor("guest") : actionButton("Join as guest (not implemented yet)", "mini", () => postMeetCommand("/foreground guest"));
-    const rows = [["GUEST_CLIENT", ssoLink(ssoVal), isCurrent ? "not implemented yet" : "not current", meetCopyLink(url), "\u2014", "\u2014", action]];
-    return { rows, note: "CLIENT/GUEST mode is designed but not built server-side yet — Foreground/Disconnect will honestly report “not implemented yet”; there is no live guest tab to join/leave." };
+    const guestActions = el("span", "meet-row-actions");
+    const unavailable = actionButton("Sync devices", "mini");
+    unavailable.disabled = true;
+    unavailable.title = "Guest/client connectors are not implemented.";
+    guestActions.appendChild(unavailable);
+    const rows = [["GUEST_CLIENT", ssoLink(ssoVal), isCurrent ? "not implemented yet" : "not current", "\u2014", "\u2014", guestActions]];
+    return { rows, note: "CLIENT/GUEST mode is designed but not built server-side yet — there is no live guest tab or media control to operate." };
   }
   if (!isCurrent) {
     const snapClients = (roomSnapshot && roomSnapshot.clients) || [];
     const snapCompanion = snapClients.find((c) => c.role === "companion");
     const asOf = roomSnapshot && roomSnapshot.updatedAt
       ? ` (as of ${shortTs(new Date(roomSnapshot.updatedAt * 1000).toISOString())})` : "";
+    const notCurrentActions = () => {
+      const actions = el("span", "meet-row-actions");
+      const sync = actionButton("Sync devices", "mini");
+      sync.disabled = true;
+      sync.title = "This meeting is not the current controlled meeting.";
+      actions.append(sync, rejoin("not current"));
+      return actions;
+    };
     const rows = [
-      ["HOST", meetSsoCombo(url, "host"), "not current" + asOf, meetCopyLink(url), "\u2014", "\u2014", rejoin("not current")],
-      ["COMPANION", meetSsoCombo(url, "companion"), "not current" + asOf, meetCopyLink(url), "\u2014", "\u2014", rejoin("not current")],
+      ["HOST", meetSsoCombo(url, "host"), "not current" + asOf, mediaCell(null, "host", "mic"), mediaCell(null, "host", "speakers"), notCurrentActions()],
+      ["COMPANION", meetSsoCombo(url, "companion"), "not current" + asOf, mediaCell(null, "companion", "mic"), mediaCell(null, "companion", "speakers"), notCurrentActions()],
     ];
     return { rows, note: roomSnapshot
       ? "Not the current meeting — SSO/state is the last known snapshot from when the bridge was last here; Join re-attaches the live driver. This driver slot is also available to relay a different real-world audio source into a Meet room here instead — a Discord Voice Channel, Zoom call, or plain audio call, for example — but that is not built yet; every driver today only probes this machine's Physical Computer mic/speakers."
       : "Not the current meeting — never seen live yet, so no snapshot exists; Join attaches the live driver here. This driver slot is also available to relay a different real-world audio source into a Meet room here instead — a Discord Voice Channel, Zoom call, or plain audio call, for example — but that is not built yet; every driver today only probes this machine's Physical Computer mic/speakers." };
   }
-  const rows = [["HOST", meetSsoCombo(url, "host"), "in-call", meetCopyLink(url), meetDevicesLink(), meetDevicesLink(), actionsFor("host")]];
+  const host = (clients || []).find((c) => c.role === "host");
+  const hostSync = routeState.roleStatus.host || (host && host.deviceSync && host.deviceSync.state);
+  const rows = [[
+    "HOST",
+    meetSsoCombo(url, "host"),
+    `${(host && host.state) || "\u2014"}${hostSync ? ` · ${hostSync}` : ""}`,
+    mediaCell(host, "host", "mic"),
+    mediaCell(host, "host", "speakers"),
+    actionsFor("host"),
+  ]];
   const companion = (clients || []).find((c) => c.role === "companion");
   if (companion) {
-    rows.push(["COMPANION", meetSsoCombo(url, "companion"), companion.state || "\u2014", meetCopyLink(url), companion.mic || "\u2014", companion.speak || "\u2014", actionsFor("companion")]);
+    rows.push([
+      "COMPANION",
+      meetSsoCombo(url, "companion"),
+      `${companion.state || "\u2014"}${routeState.roleStatus.companion ? ` · ${routeState.roleStatus.companion}` : ""}`,
+      mediaCell(companion, "companion", "mic"),
+      mediaCell(companion, "companion", "speakers"),
+      actionsFor("companion"),
+    ]);
   } else {
-    rows.push(["COMPANION", meetSsoCombo(url, "companion"), "not armed (no --companion)", meetCopyLink(url), "\u2014", "\u2014", "\u2014"]);
+    const unavailable = actionButton("Sync devices", "mini");
+    unavailable.disabled = true;
+    unavailable.title = "The bridge was not started with a controlled companion.";
+    rows.push(["COMPANION", meetSsoCombo(url, "companion"), "not armed (no --companion)", mediaCell(null, "companion", "mic"), mediaCell(null, "companion", "speakers"), unavailable]);
   }
   // Any OTHER controlled identity beyond host/companion (e.g. a future
   // CLIENT/GUEST sharing this driver) still gets listed, in whatever order
   // the bridge reported it. Foreground/Disconnect honestly report
   // "not implemented yet" server-side until that identity is real, rather
   // than silently no-op-ing or erroring obscurely.
-  (clients || []).filter((c) => c.role !== "companion").forEach((c) => rows.push([
-    (c.role || "").toUpperCase(), ssoLink({ label: c.profile, account: c.account }), c.state || "\u2014", meetCopyLink(url), c.mic || "\u2014", c.speak || "\u2014", actionsFor(c.role),
+  (clients || []).filter((c) => !["host", "companion"].includes(c.role)).forEach((c) => rows.push([
+    (c.role || "").toUpperCase(), ssoLink({ label: c.profile, account: c.account }), c.state || "\u2014", c.mic || "\u2014", c.speak || "\u2014", actionsFor(c.role),
   ]));
   return { rows, note: null };
 }
@@ -3628,15 +3956,6 @@ function meetDevicesLink() {
   return link;
 }
 
-async function toggleMeetCapture(listening) {
-  try {
-    await api(`${API_BASE}/audio/capture/${listening ? "stop" : "start"}`, { method: "POST", body: {} });
-  } catch (error) {
-    pushError(error.message);
-  }
-  loadMeet();
-}
-
 /* One streaming section: a small toolbar (Clear + an Autoscroll on/off
  * toggle, default ON per the operator's request) above a fixed-height
  * (~10 rows) scrollable box the operator can still drag taller (native CSS
@@ -3777,6 +4096,59 @@ function meetTranscriptSpeaker(c, rows) {
   return speaker || role || "Speaker";
 }
 
+function meetRoutingStrip(url, kind, routing) {
+  const strip = el("div", "meet-routing-strip");
+  const routeState = meetRoutingState(url);
+  if (kind === "client") {
+    strip.appendChild(el("span", "hint", "HOST I/O room is unavailable for unimplemented guest/client connectors."));
+    return strip;
+  }
+  if (!routing) {
+    strip.appendChild(el("span", "hint", routeState.loadError
+      ? `Routing unavailable: ${routeState.loadError}` : "Loading routing policy…"));
+    return strip;
+  }
+  const policy = routing.policy || {};
+  const adapterLabel = el("label", "meet-routing-field");
+  adapterLabel.appendChild(el("span", "mini-label", "HOST I/O room"));
+  const adapterSelect = el("select");
+  adapterSelect.setAttribute("aria-label", `HOST I/O room for ${meetRoomId(url)}`);
+  (routing.adapters || []).forEach((adapter) => {
+    const option = new Option(
+      `${adapter.label}${adapter.available ? "" : " — not configured"}`,
+      adapter.kind,
+    );
+    option.disabled = !adapter.available;
+    option.selected = adapter.kind === ((policy.room_adapter || {}).kind || "physical_computer");
+    option.title = adapter.reason || "";
+    adapterSelect.appendChild(option);
+  });
+  adapterSelect.onchange = () => updateMeetingRouting(
+    url,
+    { room_adapter: { kind: adapterSelect.value, id: adapterSelect.value } },
+    "Room adapter saved; Sync devices to apply.",
+  );
+  adapterLabel.appendChild(adapterSelect);
+
+  const check = (field, text) => {
+    const label = el("label", "check-label");
+    const input = el("input");
+    input.type = "checkbox";
+    input.checked = policy[field] === true;
+    input.setAttribute("aria-label", `${text} for ${meetRoomId(url)}`);
+    input.onchange = () => updateMeetingRouting(url, { [field]: input.checked }, `${text} saved.`);
+    label.append(input, document.createTextNode(text));
+    return label;
+  };
+  strip.append(
+    adapterLabel,
+    check("autostart", "Autostart"),
+    check("reconnect_after_disconnect", "Reconnect after unexpected disconnect"),
+    el("span", "meet-routing-status", routeState.policyStatus || ""),
+  );
+  return strip;
+}
+
 function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, debugRows, bridgeOnline, emitCount, hostProfile, meetingState, recipients) {
   rememberMeetKnownUrls(groups.map(({ url }) => (url && url !== "(unknown meeting)" ? url : "")));
   groups = groups.filter(({ kind }) => getMeetKindFilter(kind || "driver"));
@@ -3823,6 +4195,15 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     });
     connectBtn.title = "Connect the live driver to this meeting (same action as the Connector agents row buttons).";
     actions.appendChild(connectBtn);
+    const copyBtn = actionButton("Copy meeting", "mini", (e) => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(url).then(
+        () => { copyBtn.textContent = "Copied"; },
+        (error) => pushError(`Could not copy meeting: ${error.message}`),
+      );
+    });
+    copyBtn.title = `Copy ${url}`;
+    actions.appendChild(copyBtn);
     const accountsBtn = actionButton("Accounts", "mini", (e) => {
       e.stopPropagation();
       state.meetAssignmentScope = url;
@@ -3854,9 +4235,11 @@ function renderMeetTree(container, groups, currentUrl, clients, agentProfiles, d
     summary.appendChild(actions);
     meeting.appendChild(summary);
 
-    const us = meetUsRows(isCurrent, clients, url, hostProfile, (meetingState || {})[meetRoomId(url)], kind);
+    const routing = meetRoutingState(url).payload;
+    meeting.appendChild(meetRoutingStrip(url, kind, routing));
+    const us = meetUsRows(isCurrent, clients, url, hostProfile, (meetingState || {})[meetRoomId(url)], kind, routing);
     const usBody = el("div");
-    usBody.appendChild(table(["Who", "SSO", "State", "Meeting", "Mic", "Speak", "Actions"], us.rows));
+    usBody.appendChild(table(["Who", "SSO", "State", "Mic", "Speakers", "Actions"], us.rows));
     if (us.note) usBody.appendChild(el("div", "hint", us.note));
     totalConnectorRows += us.rows.length;
 
@@ -4025,12 +4408,7 @@ async function loadMeet() {
   } catch (_error) {
     // The bridge/status view remains useful if this auxiliary discovery call fails.
   }
-  try {
-    const capture = await api(`${API_BASE}/audio/capture`);
-    state.meetCaptureListening = !!capture.listening;
-  } catch (_error) {
-    state.meetCaptureListening = false;
-  }
+  await Promise.all(state.meetKnownUrls.map((url) => loadMeetingRouting(url)));
   try {
     health = await api(`${MEET_BRIDGE_BASE}/status`);
   } catch (error) {
@@ -4116,6 +4494,7 @@ async function loadMeet() {
   // remembers (most-recently-active-in-buffer order).
   const order = [currentMeetingKey, ...[...byMeeting.keys()].filter((u) => u !== currentMeetingKey)].filter(Boolean);
   const groups = order.filter((u) => byMeeting.has(u)).map((u) => ({ url: u, captions: byMeeting.get(u), kind: clientUrlSet.has(meetAssignmentKey(u)) ? "client" : "driver" }));
+  await Promise.all(groups.map(({ url }) => loadMeetingRouting(url)));
 
   const isMeetHovered = () => !!document.querySelector('.meet-scroll-box:hover');
   const hasSelectionInMeet = () => {
@@ -4149,7 +4528,7 @@ function meetPollOnce() {
   const active = document.activeElement;
   const meetPage = document.querySelector('.page[data-page="meet"]');
   const typingInMeet = active
-    && /^(INPUT|TEXTAREA)$/.test(active.tagName)
+    && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)
     && meetPage
     && meetPage.contains(active);
   const run = typingInMeet ? Promise.resolve() : loadMeet();
@@ -5556,10 +5935,15 @@ function wireEvents() {
   $("meet-companion-target").onchange = () => {
     const select = $("meet-companion-target");
     const nextTarget = select.value;
+    const wiringDirty = state.companionCableWiring.dirty;
     if (
       nextTarget !== state.meetCompanion.target
-      && companionFormIsDirty()
-      && !confirm("Discard unsaved Silence configuration changes and switch targets?")
+      && (companionFormIsDirty() || wiringDirty)
+      && !confirm(
+        wiringDirty
+          ? "Discard unsaved Silence and cable wiring changes and switch targets?"
+          : "Discard unsaved Silence configuration changes and switch targets?",
+      )
     ) {
       select.value = state.meetCompanion.target;
       return;
@@ -5573,6 +5957,8 @@ function wireEvents() {
     updateCompanionTargetControls();
     state.meetCompanion.configKey = "";
     loadCompanionInterjectorConfig();
+    invalidateCompanionCableWiring();
+    loadCompanionCableWiring();
     renderCompanionMetrics(state.meetCompanion.health);
   };
   syncCompanionTargetOptions();
@@ -5584,6 +5970,7 @@ function wireEvents() {
   Object.values(COMPANION_CABLE_SELECTS).forEach((id) => {
     $(id).onchange = () => {
       state.companionCableWiring.dirty = true;
+      state.companionCableWiring.draftRevision += 1;
       $("companion-cable-eligibility").textContent = "Unsaved endpoint changes. Save validates that RECEIVE and TRANSMIT are different virtual cables.";
       $("companion-cable-wire").disabled = true;
     };

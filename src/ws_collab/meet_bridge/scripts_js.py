@@ -9,6 +9,8 @@ specific behavior it depends on.
 
 from __future__ import annotations
 
+import json
+
 # Meet's own CSS class names churn across releases, so guessing specific
 # classes (the old approach) silently breaks and, worse, can silently DROP
 # captions when a text-pattern heuristic misfires with no visible error.
@@ -334,6 +336,361 @@ def autojoin_js(policy: str) -> str:
 """ % want
 
 
+# Read and control the media state of the local Meet participant. Microphone
+# state comes from Meet's own toolbar control; speaker state comes from the
+# remote media elements without changing their MediaStream tracks (the latter
+# is important because companion STT taps those tracks directly).
+MEET_MEDIA_STATE_JS = r"""
+(() => {
+  const buttons = [...document.querySelectorAll('button, [role="button"]')];
+  const label = (element) => (element.getAttribute("aria-label") || "").trim();
+  const micOn = buttons.find((button) => /^(turn off|mute) microphone\b/i.test(label(button)));
+  const micOff = buttons.find((button) => /^(turn on|unmute) microphone\b/i.test(label(button)));
+  const media = [...document.querySelectorAll("audio,video")].filter((element) => {
+    const stream = element.srcObject;
+    return stream && typeof stream.getAudioTracks === "function"
+      && stream.getAudioTracks().some((track) => track.readyState === "live");
+  });
+  const routing = window.__wsCollabMeetSpeakerRouting;
+  const routingActive = !!(routing && !routing.stopped && routing.observer);
+  const routingDrift = routingActive
+    ? media.filter((element) => element.sinkId !== routing.sinkId).length
+    : media.length;
+  return JSON.stringify({
+    inCall: !!document.querySelector('button[aria-label*="eave call" i]'),
+    micMuted: micOff ? true : (micOn ? false : null),
+    speakersMuted: media.length
+      ? media.every((element) => element.muted || element.volume === 0)
+      : null,
+    mediaElementCount: media.length,
+    speakerRouting: routing ? {
+      active: routingActive,
+      generation: routing.generation,
+      sinkId: routing.sinkId || "",
+      routedMediaCount: routing.elements ? routing.elements.size : 0,
+      eligibleMediaCount: media.length,
+      driftedMediaCount: routingDrift,
+      pendingCount: Number(routing.pending || 0),
+      lastError: routing.lastError || null,
+      verified: routingActive && !routing.lastError && !routing.pending && routingDrift === 0,
+    } : null,
+  });
+})()
+"""
+
+
+MEET_DEVICE_DISCOVERY_JS = r"""
+(async () => {
+  const normalize = (value) => String(value || "").normalize("NFKC")
+    .toLocaleLowerCase().trim().replace(/\s+/g, " ");
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+    return JSON.stringify({ ok: false, error: "browser media-device enumeration is unavailable", devices: [] });
+  }
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const media = [...document.querySelectorAll("audio,video")].filter((element) => {
+      const stream = element.srcObject;
+      return stream && typeof stream.getAudioTracks === "function"
+        && stream.getAudioTracks().some((track) => track.readyState === "live");
+    });
+    const controls = [...document.querySelectorAll(
+      'select[aria-label*="microphone" i], [role="listbox"][aria-label*="microphone" i]'
+    )];
+    const selectedMicLabels = controls.flatMap((control) =>
+      [...control.querySelectorAll('option:checked, [role="option"][aria-selected="true"]')]
+        .map((option) => (option.textContent || "").trim()).filter(Boolean));
+    return JSON.stringify({
+      ok: true,
+      labelsRestricted: devices.some((device) =>
+        (device.kind === "audioinput" || device.kind === "audiooutput") && !device.label),
+      devices: devices
+        .filter((device) => device.kind === "audioinput" || device.kind === "audiooutput")
+        .map((device) => ({
+          kind: device.kind,
+          label: device.label || "",
+          normalizedLabel: normalize(device.label),
+          deviceId: device.deviceId || "",
+          groupId: device.groupId || "",
+          available: !!device.label && !!device.deviceId
+            && device.deviceId !== "default" && device.deviceId !== "communications",
+        })),
+      observed: {
+        micLabels: [...new Set(selectedMicLabels)],
+        speakerDeviceIds: [...new Set(media.map((element) => element.sinkId).filter(Boolean))],
+        mediaElementCount: media.length,
+      },
+    });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error && error.message ? error.message : String(error), devices: [] });
+  }
+})()
+"""
+
+
+def meet_device_sync_js(mic_label: str, speaker_label: str) -> str:
+    """Build a fail-closed exact-label device synchronization operation."""
+
+    return r"""
+(async () => {
+  const WANT_MIC = %s;
+  const WANT_SPEAKER = %s;
+  const normalize = (value) => String(value || "").normalize("NFKC")
+    .toLocaleLowerCase().trim().replace(/\s+/g, " ");
+  const fail = (message, stage) => JSON.stringify({
+    ok: false, error: message, stage: stage || "validation", verified: false
+  });
+  if (!normalize(WANT_MIC) || !normalize(WANT_SPEAKER)) {
+    return fail("microphone and speaker labels are required");
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+    return fail("browser media-device enumeration is unavailable", "discovery");
+  }
+  try {
+    let devices = await navigator.mediaDevices.enumerateDevices();
+    if (devices.some((device) =>
+      (device.kind === "audioinput" || device.kind === "audiooutput") && !device.label)) {
+      return fail("device labels are unavailable until browser microphone permission is granted", "permission");
+    }
+    const exact = (kind, label) => {
+      const matches = devices.filter((device) =>
+        device.kind === kind && normalize(device.label) === normalize(label));
+      if (matches.length !== 1) {
+        throw new Error(`${matches.length} ${kind} devices exactly match "${normalize(label)}"`);
+      }
+      const match = matches[0];
+      if (!match.deviceId || match.deviceId === "default" || match.deviceId === "communications") {
+        throw new Error(`${kind} resolved to an empty/default device`);
+      }
+      return match;
+    };
+    const mic = exact("audioinput", WANT_MIC);
+    const speaker = exact("audiooutput", WANT_SPEAKER);
+
+    // Prove the selected microphone can produce an exact-device track before
+    // asking Meet's own settings control to switch its active sender.
+    const probe = await navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: { exact: mic.deviceId } }, video: false
+    });
+    const probeTrack = probe.getAudioTracks()[0];
+    const probeSettings = probeTrack && typeof probeTrack.getSettings === "function"
+      ? probeTrack.getSettings() : {};
+    if (!probeTrack || (probeSettings.deviceId && probeSettings.deviceId !== mic.deviceId)) {
+      probe.getTracks().forEach((track) => track.stop());
+      return fail("microphone exact-device probe did not verify", "microphone-probe");
+    }
+    probe.getTracks().forEach((track) => track.stop());
+
+    const findMicControl = () => document.querySelector(
+      'select[aria-label*="microphone" i], [role="listbox"][aria-label*="microphone" i]'
+    );
+    let micControl = findMicControl();
+    if (!micControl) {
+      const opener = [...document.querySelectorAll('button, [role="button"]')].find((button) =>
+        /audio settings/i.test(button.getAttribute("aria-label") || ""));
+      if (!opener) return fail("Meet audio settings control is unavailable", "microphone-control");
+      opener.click();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      micControl = findMicControl();
+    }
+    if (!micControl) return fail("Meet microphone selector is unavailable", "microphone-control");
+    const micOptions = [...micControl.querySelectorAll('option, [role="option"], [role="menuitemradio"]')]
+      .filter((option) => normalize(option.textContent) === normalize(mic.label));
+    if (micOptions.length !== 1) {
+      return fail(`${micOptions.length} Meet microphone options exactly match "${normalize(mic.label)}"`,
+        "microphone-control");
+    }
+    const micOption = micOptions[0];
+    if (micOption.tagName === "OPTION") {
+      micControl.value = micOption.value;
+      micControl.dispatchEvent(new Event("input", { bubbles: true }));
+      micControl.dispatchEvent(new Event("change", { bubbles: true }));
+      if (micControl.selectedOptions.length !== 1
+          || normalize(micControl.selectedOptions[0].textContent) !== normalize(mic.label)) {
+        return fail("Meet microphone selector did not settle on the requested device", "microphone-verify");
+      }
+    } else {
+      micOption.click();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const checked = micOption.getAttribute("aria-selected") === "true"
+        || micOption.getAttribute("aria-checked") === "true";
+      if (!checked) return fail("Meet microphone option did not report selected", "microphone-verify");
+    }
+
+    const eligibleMedia = () => [...document.querySelectorAll("audio,video")].filter((element) => {
+      const stream = element.srcObject;
+      return stream && typeof stream.getAudioTracks === "function"
+        && stream.getAudioTracks().some((track) => track.readyState === "live");
+    });
+    const media = eligibleMedia();
+    if (!media.length) return fail("no live remote media exists for speaker synchronization", "speaker");
+    for (const element of media) {
+      if (typeof element.setSinkId !== "function") {
+        return fail("setSinkId is unavailable", "speaker");
+      }
+      await element.setSinkId(speaker.deviceId);
+      if (element.sinkId !== speaker.deviceId) {
+        return fail("speaker sinkId did not settle on the requested device", "speaker-verify");
+      }
+    }
+    const previousRouting = window.__wsCollabMeetSpeakerRouting;
+    if (previousRouting && typeof previousRouting.stop === "function") previousRouting.stop();
+    const generation = Number(previousRouting && previousRouting.generation || 0) + 1;
+    const routing = {
+      generation,
+      sinkId: speaker.deviceId,
+      elements: new Set(),
+      pending: 0,
+      lastError: null,
+      stopped: false,
+      observer: null,
+      listeners: [],
+      queue: Promise.resolve(),
+    };
+    const respectManualMute = (element) => {
+      if (window.__wsCollabSpeakerMuted === true) {
+        element.muted = true;
+        element.volume = 0;
+      } else if (window.__wsCollabSpeakerMuted === false) {
+        element.muted = false;
+        element.volume = 0.8;
+      }
+    };
+    const routeElement = async (element) => {
+      if (routing.stopped || window.__wsCollabMeetSpeakerRouting !== routing) return;
+      if (typeof element.setSinkId !== "function") throw new Error("setSinkId is unavailable");
+      routing.pending += 1;
+      try {
+        await element.setSinkId(routing.sinkId);
+        if (element.sinkId !== routing.sinkId) {
+          throw new Error("speaker sinkId did not settle on the requested device");
+        }
+        respectManualMute(element);
+        routing.elements.add(element);
+      } finally {
+        routing.pending -= 1;
+      }
+    };
+    const reconcile = async () => {
+      routing.elements.forEach((element) => {
+        if (!element.isConnected || !eligibleMedia().includes(element)) routing.elements.delete(element);
+      });
+      const current = eligibleMedia();
+      await Promise.all(current
+        .filter((element) => element.sinkId !== routing.sinkId || !routing.elements.has(element))
+        .map(routeElement));
+      const drift = eligibleMedia().filter((element) => element.sinkId !== routing.sinkId);
+      if (drift.length) throw new Error(`${drift.length} live remote media elements use another speaker sink`);
+      routing.lastError = null;
+    };
+    const schedule = () => {
+      if (routing.stopped) return;
+      routing.queue = routing.queue.then(reconcile).catch((error) => {
+        routing.lastError = error && error.message ? error.message : String(error);
+      });
+    };
+    const onMedia = () => schedule();
+    routing.stop = () => {
+      routing.stopped = true;
+      if (routing.observer) routing.observer.disconnect();
+      routing.listeners.forEach(([event, listener]) =>
+        document.removeEventListener(event, listener, true));
+      routing.observer = null;
+    };
+    try {
+      routing.observer = new MutationObserver(schedule);
+      routing.observer.observe(document.documentElement || document, {
+        subtree: true, childList: true, attributes: true,
+        attributeFilter: ["src", "muted"],
+      });
+      ["loadedmetadata", "play", "playing", "emptied", "abort"].forEach((event) => {
+        document.addEventListener(event, onMedia, true);
+        routing.listeners.push([event, onMedia]);
+      });
+      window.__wsCollabMeetSpeakerRouting = routing;
+      await reconcile();
+    } catch (error) {
+      routing.lastError = error && error.message ? error.message : String(error);
+      routing.stop();
+      return fail(`speaker routing observer failed: ${routing.lastError}`, "speaker-observer");
+    }
+    return JSON.stringify({
+      ok: true,
+      verified: true,
+      mic: {
+        label: mic.label, normalizedLabel: normalize(mic.label),
+        deviceId: mic.deviceId, trackProbeVerified: true, meetControlVerified: true
+      },
+      speakers: {
+        label: speaker.label, normalizedLabel: normalize(speaker.label),
+        deviceId: speaker.deviceId, sinkVerified: true, mediaElementCount: media.length,
+        observerGeneration: generation, observerVerified: true
+      },
+    });
+  } catch (error) {
+    return fail(error && error.message ? error.message : String(error), "apply");
+  }
+})()
+""" % (json.dumps(str(mic_label)), json.dumps(str(speaker_label)))
+
+
+def set_meet_media_muted_js(target: str, muted: bool) -> str:
+    """Build a typed Meet media mutation; callers validate target first."""
+
+    return r"""
+(async () => {
+  const TARGET = %s;
+  const MUTED = %s;
+  const label = (element) => (element.getAttribute("aria-label") || "").trim();
+  const buttons = () => [...document.querySelectorAll('button, [role="button"]')];
+  const micOn = () => buttons().find((button) => /^(turn off|mute) microphone\b/i.test(label(button)));
+  const micOff = () => buttons().find((button) => /^(turn on|unmute) microphone\b/i.test(label(button)));
+  const micState = () => micOff() ? true : (micOn() ? false : null);
+  if (TARGET === "mic") {
+    const current = micState();
+    if (current === null) return JSON.stringify({ ok: false, error: "Meet microphone control is not observable" });
+    if (current !== MUTED) {
+      const control = MUTED ? micOn() : micOff();
+      if (!control || control.disabled || control.getAttribute("aria-disabled") === "true") {
+        return JSON.stringify({ ok: false, error: "Meet microphone control is missing or disabled" });
+      }
+      control.click();
+      const maxAttempts = Number(window.__wsCollabMediaMuteMaxAttempts || 20);
+      const pollMs = Number(window.__wsCollabMediaMutePollMs ?? 50);
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+        const observed = micState();
+        if (observed === MUTED) {
+          return JSON.stringify({ ok: true, target: TARGET, muted: MUTED, micMuted: observed });
+        }
+        if (observed === null) {
+          return JSON.stringify({ ok: false, error: "Meet microphone control disappeared after click", micMuted: null });
+        }
+      }
+      return JSON.stringify({
+        ok: false,
+        error: `Meet microphone ${MUTED ? "mute" : "unmute"} was ignored or timed out`,
+        micMuted: micState(),
+      });
+    }
+    return JSON.stringify({ ok: true, target: TARGET, muted: MUTED, micMuted: current });
+  } else {
+    const media = [...document.querySelectorAll("audio,video")].filter((element) => {
+      const stream = element.srcObject;
+      return stream && typeof stream.getAudioTracks === "function"
+        && stream.getAudioTracks().some((track) => track.readyState === "live");
+    });
+    if (!media.length) return JSON.stringify({ ok: false, error: "Meet speaker media is not observable" });
+    window.__wsCollabSpeakerMuted = MUTED;
+    media.forEach((element) => {
+      element.muted = MUTED;
+      element.volume = MUTED ? 0 : 0.8;
+    });
+  }
+  return JSON.stringify({ ok: true, target: TARGET, muted: MUTED });
+})()
+""" % (repr(target), "true" if muted else "false")
+
+
 # ---- OUT: post mailbox replies into the Meet chat --------------------------
 SEND_CHAT_JS_TEMPLATE = r"""
 (() => {
@@ -589,7 +946,16 @@ COMPANION_CABLE_FINALIZE_JS = r"""
     if (!element.isConnected || element.sinkId !== state.sinkId) return fail("RECEIVE media element/device changed before unmute");
   }
   if (!current()) return JSON.stringify({ ok: false, stale: true, feedbackSafeMuted: true, error: "stale companion cable wiring operation" });
-  media.forEach((element) => { element.volume = 0.8; element.muted = false; });
+  const speakerMuted = window.__wsCollabSpeakerMuted === true;
+  media.forEach((element) => {
+    if (speakerMuted) {
+      element.volume = 0;
+      element.muted = true;
+    } else {
+      element.volume = 0.8;
+      element.muted = false;
+    }
+  });
   if (media.some((element) => element.sinkId !== state.sinkId)) return fail("RECEIVE sink changed while unmuting");
   if (!current()) {
     media.forEach((element) => { element.muted = true; element.volume = 0; });
@@ -648,6 +1014,12 @@ COMPANION_CABLE_VERIFY_JS = r"""
     state.phase = "failed";
     state.feedbackSafeMuted = true;
     state.error = !sinkVerified ? "RECEIVE sink/media changed" : "TRANSMIT mic track changed";
+  } else {
+    const speakerMuted = window.__wsCollabSpeakerMuted === true;
+    media.forEach((element) => {
+      element.muted = speakerMuted;
+      element.volume = speakerMuted ? 0 : 0.8;
+    });
   }
   return JSON.stringify({
     ok: sinkVerified && micVerified,

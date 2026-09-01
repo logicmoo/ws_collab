@@ -102,11 +102,9 @@ you just want what's left.)
    `[3] [10] [20] [ALL]` preset buttons + an "Exact" custom textbox
    (replacing the old plain `<input type="number">`), `"all"` is a valid
    stored value meaning "no height cap, grow with content."
-10. Meeting-cell copy-link — the Connectors table's "Meeting" column shows
-    just the room id (e.g. `bgb-xqts-xjt`) and copies the full URL to the
-    clipboard on click (`meetCopyLink()`), instead of showing/linking the
-    raw URL. The separate meeting-URL link in each `<details>`'s
-    `<summary>` (opens the meeting in a new tab) is untouched.
+10. Meeting URL/copy is meeting-scoped — the redundant Connectors-table
+    `Meeting` column was removed. The `<details>` header retains the URL link
+    and now has a `Copy meeting` action.
 11. Default Chrome profile directory moved from
     `~/.cache/ws_collab_models/meet_bridge_profile` to
     `<plugin_root>/collab_state/meet_bridge_profile` (`cdp.py`
@@ -176,21 +174,24 @@ you just want what's left.)
       `POST /ws_collab/audio/secondary-capture/start`
       (body `{device_id}`), `POST /ws_collab/audio/secondary-capture/stop`, plus a
       way to read its state.
-    - `bridge.py`'s `companion_loop()`: tab-muting is now conditional on a
-      new `--companion-listen-device <name>` flag (parallel naming to
-      `--tts-output-device`/`--mic-select-device`). When set, the
-      companion's `<audio>/<video>` elements are **not** muted/deafened
-      (so their audio actually plays out to whatever real device the
-      operator has routed that Chrome window's output to via Windows' own
-      per-app audio mixer — a manual, one-time setup step, same category as
-      the existing virtual-cable setup) and it logs clearly that this is
-      intentional. Default (flag unset): today's exact mute/deafen
-      behavior, unchanged.
+    - `bridge.py` keeps legacy direct remote-MediaStream capture available,
+      while validated two-cable mode routes RECEIVE into the server's
+      secondary capture and TRANSMIT into the companion. Browser media stays
+      fail-closed until exact sink/track/capture verification.
     - Devices-page UI controls/state for the new secondary capture source.
     - This is genuinely not end-to-end testable without real hardware/a
       live Meet call — only unit-testable pieces (start/stop/state
       transitions with a mock device backend, REST wiring, the bridge's
       conditional-mute logic) have real test coverage.
+15. **Per-meeting routing and lifecycle policy** — the active browser profile's
+    atomic `MeetBrowserSettings` record now stores room-adapter kind/id,
+    HOST/COMPANION mic and speaker descriptors, optional companion wiring,
+    single-autostart policy, and reconnect policy. Only the physical-computer
+    adapter is implemented; future kinds are explicit unavailable capability
+    records. The meeting header edits policy, connector rows edit devices and
+    apply them with verified `Sync devices`, and role-scoped mute buttons remain
+    separate manual overrides. Explicit Disconnect suppresses bounded reconnect
+    until Join/Rejoin/Sync/new bridge start.
 
 ## REMAINING WORK — this is the actual TODO, do these in order
 

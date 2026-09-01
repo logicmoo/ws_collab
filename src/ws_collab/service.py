@@ -33,6 +33,7 @@ from .companion_wiring import (
     ENDPOINTS as COMPANION_WIRING_ENDPOINTS,
     WIRING_KEY as COMPANION_WIRING_KEY,
     build_wiring_config,
+    normalize_device_label,
     validate_wiring_config,
 )
 from .admin_ui_state import AdminUIState
@@ -84,11 +85,14 @@ from .workers import WorkerMonitor
 from . import __version__
 from .urls import (
     DEFAULT_ROUTE_PREFIX,
+    MEET_BRIDGE_AUTHENTICATED_PATHS,
     MEET_BRIDGE_CAPTIONS,
     MEET_BRIDGE_COMMAND,
+    MEET_BRIDGE_DEVICE_SYNC,
     MEET_BRIDGE_DISCONNECT_AUDIO,
     MEET_BRIDGE_HEALTH,
     MEET_BRIDGE_HTTP_PATHS,
+    MEET_BRIDGE_MEDIA_MUTE,
     MEET_BRIDGE_ORIGIN,
     MEET_BRIDGE_SPEECH,
     MEET_BRIDGE_SPEECH_CANCEL,
@@ -117,7 +121,11 @@ from .meet_bridge.cdp import (
     set_browser_nav_profile,
 )
 from .meet_bridge import navigator
-from .meet_browser_settings import MeetBrowserSettings, normalize_meeting_url
+from .meet_browser_settings import (
+    MeetBrowserSettings,
+    normalize_meeting_url,
+    select_startup_meeting,
+)
 
 
 # The canonical capture source that STT engine routes hang off.
@@ -132,6 +140,35 @@ _COMPANION_TTS_DURATION_GRACE_SECONDS = 15.0
 # to this ceiling (effectively "all") and only truncate the final result.
 _MAX_SCAN = 100_000
 MEET_ROLES = ("host", "companion", "guest")
+MEET_ROOM_ADAPTERS = (
+    {
+        "kind": "physical_computer",
+        "label": "Physical computer",
+        "available": True,
+        "capabilities": ["browser_device_sync"],
+    },
+    {
+        "kind": "discord",
+        "label": "Discord room",
+        "available": False,
+        "reason": "not configured; no Discord adapter is installed",
+        "capabilities": [],
+    },
+    {
+        "kind": "zoom",
+        "label": "Zoom room",
+        "available": False,
+        "reason": "not configured; no Zoom adapter is installed",
+        "capabilities": [],
+    },
+    {
+        "kind": "audio_call",
+        "label": "Plain audio call",
+        "available": False,
+        "reason": "not configured; no audio-call adapter is installed",
+        "capabilities": [],
+    },
+)
 _MEET_URL_RE = re.compile(
     r"https?://meet\.google\.com/([a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4})(?:[/?#][^\s\"'<)]*)?",
     re.IGNORECASE,
@@ -725,6 +762,7 @@ class WsCollabService:
         raw_known = state.get("known_meeting_urls", [])
         raw_maps = state.get("meeting_role_account_maps", {})
         raw_click_maps = state.get("meeting_companion_click", {})
+        raw_routing = state.get("meeting_routing", {})
         candidates: list[Any] = []
         if isinstance(raw_known, list):
             candidates.extend(raw_known)
@@ -732,6 +770,8 @@ class WsCollabService:
             candidates.extend(raw_maps.keys())
         if isinstance(raw_click_maps, dict):
             candidates.extend(raw_click_maps.keys())
+        if isinstance(raw_routing, dict):
+            candidates.extend(raw_routing.keys())
         candidates.extend(urls)
         for candidate in candidates:
             url = self._normal_meet_url(candidate)
@@ -770,6 +810,7 @@ class WsCollabService:
             "forgotten_meeting_urls",
             "meeting_role_account_maps",
             "meeting_companion_click",
+            "meeting_routing",
         ):
             self._collect_meet_urls_from_value(state.get(name), found, f"profile {name}")
         for url, source in self._historical_meet_urls(profile_path).items():
@@ -809,7 +850,11 @@ class WsCollabService:
             state["forgotten_meeting_urls"] = sorted(
                 (prior_forgotten | forget) - set(keep)
             )
-            for map_name in ("meeting_role_account_maps", "meeting_companion_click"):
+            for map_name in (
+                "meeting_role_account_maps",
+                "meeting_companion_click",
+                "meeting_routing",
+            ):
                 mapping = state.get(map_name, {})
                 if isinstance(mapping, dict):
                     state[map_name] = {
@@ -1847,8 +1892,19 @@ class WsCollabService:
             "next_launch_command": " ".join(f'"{part}"' if " " in part else part for part in command),
         }
 
-    def _companion_wiring_runtime_config(self) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-        saved = self.sound_settings.get(COMPANION_WIRING_KEY)
+    def _companion_wiring_runtime_config(
+        self, meeting_url: str = ""
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        saved = None
+        if meeting_url:
+            policy = self.meet_browser_settings.get_meeting_routing(
+                self._meet_profile_path(), meeting_url
+            )
+            candidate = policy.get("companion_wiring")
+            if isinstance(candidate, dict):
+                saved = candidate
+        if saved is None:
+            saved = self.sound_settings.get(COMPANION_WIRING_KEY)
         if not isinstance(saved, dict):
             return None, {"valid": False, "errors": ["four cable endpoints have not been saved"]}
         try:
@@ -1861,14 +1917,28 @@ class WsCollabService:
             return saved, {"valid": False, "errors": [str(error)]}
         return runtime, validate_wiring_config(runtime)
 
-    def get_companion_cable_wiring(self, *, runtime_only: bool = False) -> dict[str, Any]:
-        config, validation = self._companion_wiring_runtime_config()
+    def get_companion_cable_wiring(
+        self, meeting_url: str = "", *, runtime_only: bool = False
+    ) -> dict[str, Any]:
+        normalized = self._meet_assignment_key(meeting_url) if meeting_url else ""
+        config, validation = self._companion_wiring_runtime_config(normalized)
         if runtime_only:
             return {"config": config, "validation": validation}
+        policy = (
+            self.meet_browser_settings.get_meeting_routing(
+                self._meet_profile_path(), normalized
+            )
+            if normalized
+            else {}
+        )
         health = self._meet_bridge_health(timeout=0.25)
         return {
             "config": config,
             "validation": validation,
+            "meetingUrl": normalized or None,
+            "scope": "meeting"
+            if isinstance(policy.get("companion_wiring"), dict)
+            else "global-default",
             "devices": self.devices.list(),
             "generation": self.devices.generation,
             "applied": (health or {}).get("companionCableWiring"),
@@ -1878,13 +1948,25 @@ class WsCollabService:
             },
         }
 
-    def save_companion_cable_wiring(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def save_companion_cable_wiring(
+        self, payload: dict[str, Any], meeting_url: str = ""
+    ) -> dict[str, Any]:
         config = build_wiring_config(payload, self.devices.list())
+        if meeting_url:
+            normalized = self._meet_assignment_key(meeting_url)
+            self.meet_browser_settings.update_meeting_routing(
+                self._meet_profile_path(),
+                normalized,
+                {"companion_wiring": config},
+            )
+            return self.get_companion_cable_wiring(normalized)
         self.sound_settings.set(COMPANION_WIRING_KEY, config)
         return self.get_companion_cable_wiring()
 
-    def start_companion_wiring_capture(self, device_id: str) -> dict[str, Any]:
-        config, validation = self._companion_wiring_runtime_config()
+    def start_companion_wiring_capture(
+        self, device_id: str, meeting_url: str = ""
+    ) -> dict[str, Any]:
+        config, validation = self._companion_wiring_runtime_config(meeting_url)
         expected = str(((config or {}).get("receive_capture_input") or {}).get("serverDeviceId") or "")
         if not validation.get("valid") or not expected or str(device_id or "") != expected:
             raise ValidationError("capture device does not match the saved RECEIVE recording endpoint")
@@ -1913,6 +1995,313 @@ class WsCollabService:
                 require_sso_consent,
             )
         return self.get_meet_browser_settings()
+
+    @staticmethod
+    def _routing_device_descriptor(raw: Any, field: str) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise ValidationError(f"{field} must be a device descriptor object")
+        unknown = set(raw) - {"label", "deviceId", "device_id", "normalizedLabel"}
+        if unknown:
+            raise ValidationError(f"unknown {field} field: {sorted(unknown)[0]}")
+        label = str(raw.get("label") or "").strip()
+        if not label:
+            raise ValidationError(f"{field}.label is required")
+        normalized = normalize_device_label(label)
+        device_id = str(raw.get("deviceId", raw.get("device_id", "")) or "").strip()
+        if device_id in {"default", "communications"}:
+            raise ValidationError(f"{field}.deviceId must identify a specific device")
+        return {
+            "label": label,
+            "normalizedLabel": normalized,
+            "deviceId": device_id or None,
+        }
+
+    def _decorate_browser_devices(
+        self, devices: list[dict[str, Any]], *, role: str, policy: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        server_by_label: dict[str, list[dict[str, Any]]] = {}
+        for device in self.devices.list():
+            server_by_label.setdefault(
+                normalize_device_label(device.get("name")), []
+            ).append(device)
+        wiring, wiring_validation = self._companion_wiring_runtime_config(
+            str(policy.get("meeting_url") or "")
+        )
+        expected = {}
+        if role == "companion" and wiring_validation.get("valid") and wiring:
+            expected = {
+                "audioinput": normalize_device_label(
+                    (wiring.get("transmit_companion_mic") or {}).get("label")
+                ),
+                "audiooutput": normalize_device_label(
+                    (wiring.get("receive_playback_sink") or {}).get("label")
+                ),
+            }
+        result = []
+        for raw in devices:
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            normalized = normalize_device_label(
+                row.get("normalizedLabel") or row.get("label")
+            )
+            server_matches = server_by_label.get(normalized, [])
+            classes = sorted(
+                {
+                    str(value)
+                    for match in server_matches
+                    for value in (match.get("classes") or [])
+                }
+            )
+            row["classes"] = classes
+            row["normalizedLabel"] = normalized
+            row["available"] = (
+                row.get("available") is True
+                and bool(normalized)
+                and str(row.get("deviceId") or "")
+                not in {"", "default", "communications"}
+            )
+            if role == "host":
+                row["eligible"] = row["available"] and "physical" in classes
+                row["ineligibleReason"] = (
+                    None
+                    if row["eligible"]
+                    else (
+                        "device is unavailable or its label is hidden"
+                        if not row["available"]
+                        else "HOST physical-computer routing requires a verified physical device"
+                    )
+                )
+            else:
+                required = expected.get(str(row.get("kind") or ""))
+                row["eligible"] = row["available"] and bool(required) and normalized == required
+                row["ineligibleReason"] = (
+                    None
+                    if row["eligible"]
+                    else (
+                        "save a valid meeting-scoped two-cable wiring first"
+                        if not required
+                        else "COMPANION devices must match its saved RECEIVE/TRANSMIT cable endpoints"
+                    )
+                )
+            result.append(row)
+        return result
+
+    def get_meet_routing(self, meeting_url: str) -> dict[str, Any]:
+        key = self._meet_assignment_key(meeting_url)
+        profile = self._meet_profile_path()
+        policy = self.meet_browser_settings.get_meeting_routing(profile, key)
+        health = self._meet_bridge_health_for_settings()
+        active = self._normal_meet_url((health or {}).get("meetingUrl"))
+        clients = {
+            str(row.get("role") or ""): row
+            for row in (health or {}).get("clients", [])
+            if isinstance(row, dict)
+        }
+        role_states: dict[str, Any] = {}
+        for role in ("host", "companion"):
+            client = clients.get(role) if active == key else None
+            discovery = (client or {}).get("audioDevices") or {}
+            candidates = self._decorate_browser_devices(
+                discovery.get("devices") or [], role=role, policy=policy
+            )
+            enabled = bool(
+                client
+                and (
+                    client.get("inCall") is True
+                    or client.get("state") == "in-call"
+                )
+            )
+            reason = None
+            if not enabled:
+                reason = (
+                    "meeting is not current"
+                    if active and active != key
+                    else "controlled role is offline or not in-call"
+                )
+            elif discovery.get("ok") is not True:
+                enabled = False
+                reason = str(discovery.get("error") or "device discovery is unavailable")
+            role_states[role] = {
+                "controlled": client is not None,
+                "state": (client or {}).get("state") or "offline",
+                "current": active == key,
+                "candidates": candidates,
+                "labelsRestricted": discovery.get("labelsRestricted") is True,
+                "observed": discovery.get("observed") or {},
+                "sync": (client or {}).get("deviceSync"),
+                "syncEnabled": enabled,
+                "syncDisabledReason": reason,
+            }
+        policies = self.meet_browser_settings.list_meeting_routing(profile)
+        return {
+            "policy": policy,
+            "adapters": list(MEET_ROOM_ADAPTERS),
+            "roleStates": role_states,
+            "activeMeeting": active,
+            "autostartMeeting": next(
+                (
+                    url
+                    for url in sorted(policies)
+                    if policies[url].get("autostart") is True
+                ),
+                None,
+            ),
+        }
+
+    def set_meet_routing(
+        self, meeting_url: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValidationError("routing policy must be an object")
+        unknown = set(payload) - {
+            "room_adapter",
+            "roles",
+            "autostart",
+            "reconnect_after_disconnect",
+        }
+        if unknown:
+            raise ValidationError(f"unknown routing policy field: {sorted(unknown)[0]}")
+        key = self._meet_assignment_key(meeting_url)
+        patch: dict[str, Any] = {}
+        if "room_adapter" in payload:
+            adapter = payload["room_adapter"]
+            if isinstance(adapter, str):
+                adapter = {"kind": adapter, "id": adapter}
+            if not isinstance(adapter, dict):
+                raise ValidationError("room_adapter must be an object")
+            kind = str(adapter.get("kind") or "").strip().lower()
+            registered = next(
+                (row for row in MEET_ROOM_ADAPTERS if row["kind"] == kind), None
+            )
+            if registered is None:
+                raise ValidationError(f"unknown room adapter kind: {kind!r}")
+            if registered.get("available") is not True:
+                raise ConflictError(str(registered.get("reason") or "adapter unavailable"))
+            patch["room_adapter"] = {
+                "kind": kind,
+                "id": str(adapter.get("id") or kind).strip() or kind,
+            }
+        if "autostart" in payload:
+            if type(payload["autostart"]) is not bool:
+                raise ValidationError("autostart must be a boolean")
+            patch["autostart"] = payload["autostart"]
+        if "reconnect_after_disconnect" in payload:
+            if type(payload["reconnect_after_disconnect"]) is not bool:
+                raise ValidationError("reconnect_after_disconnect must be a boolean")
+            patch["reconnect_after_disconnect"] = payload[
+                "reconnect_after_disconnect"
+            ]
+        if "roles" in payload:
+            roles = payload["roles"]
+            if not isinstance(roles, dict):
+                raise ValidationError("roles must be an object")
+            unknown_roles = set(roles) - {"host", "companion"}
+            if unknown_roles:
+                raise ValidationError(f"unsupported controlled role: {sorted(unknown_roles)[0]}")
+            role_patch: dict[str, dict[str, Any]] = {}
+            for role, raw_role in roles.items():
+                if not isinstance(raw_role, dict):
+                    raise ValidationError(f"roles.{role} must be an object")
+                unknown_fields = set(raw_role) - {"mic", "speakers"}
+                if unknown_fields:
+                    raise ValidationError(
+                        f"unknown roles.{role} field: {sorted(unknown_fields)[0]}"
+                    )
+                role_value: dict[str, Any] = {}
+                for field in ("mic", "speakers"):
+                    if field in raw_role:
+                        role_value[field] = self._routing_device_descriptor(
+                            raw_role[field], f"roles.{role}.{field}"
+                        )
+                role_patch[role] = role_value
+            patch["roles"] = role_patch
+        try:
+            self.meet_browser_settings.update_meeting_routing(
+                self._meet_profile_path(), key, patch
+            )
+        except ValueError as error:
+            raise ValidationError(str(error)) from error
+        return self.get_meet_routing(key)
+
+    def sync_meet_routing_devices(
+        self, meeting_url: str, role: str
+    ) -> dict[str, Any]:
+        key = self._meet_assignment_key(meeting_url)
+        role_value = str(role or "").strip().lower()
+        if role_value not in {"host", "companion"}:
+            raise ValidationError("role must be 'host' or 'companion'")
+        routing = self.get_meet_routing(key)
+        role_state = routing["roleStates"][role_value]
+        if not role_state.get("syncEnabled"):
+            raise ConflictError(
+                str(role_state.get("syncDisabledReason") or "role cannot be synchronized")
+            )
+        desired = (routing["policy"].get("roles") or {}).get(role_value) or {}
+        resolved: dict[str, dict[str, Any]] = {}
+        for field, kind in (("mic", "audioinput"), ("speakers", "audiooutput")):
+            descriptor = desired.get(field)
+            if not isinstance(descriptor, dict):
+                raise ValidationError(f"select a specific {role_value} {field} device first")
+            wanted = normalize_device_label(descriptor.get("label"))
+            matches = [
+                row
+                for row in role_state.get("candidates", [])
+                if row.get("kind") == kind
+                and normalize_device_label(row.get("label")) == wanted
+            ]
+            if len(matches) != 1:
+                raise ConflictError(
+                    f"{len(matches)} available {kind} devices exactly match {wanted!r}"
+                )
+            match = matches[0]
+            if match.get("eligible") is not True:
+                raise ConflictError(str(match.get("ineligibleReason") or "device is ineligible"))
+            resolved[field] = {
+                "label": str(match.get("label") or ""),
+                "normalizedLabel": wanted,
+                "deviceId": str(match.get("deviceId") or ""),
+            }
+        payload: dict[str, Any] = {
+            "meeting_url": key,
+            "role": role_value,
+            **resolved,
+        }
+        if role_value == "companion":
+            wiring, validation = self._companion_wiring_runtime_config(key)
+            if wiring is None or not validation.get("valid"):
+                raise ValidationError(
+                    "companion cable wiring is invalid",
+                    details={"errors": validation.get("errors") or []},
+                )
+            payload["companion_wiring"] = wiring
+        result = self._meet_bridge_speech(
+            payload, timeout=20.0, path=MEET_BRIDGE_DEVICE_SYNC
+        )
+        if result is None:
+            raise NotFoundError("Meet bridge worker is offline")
+        if not result.get("ok") or not (result.get("deviceSync") or {}).get("verified"):
+            raise ConflictError(
+                str(result.get("error") or "Meet device synchronization did not verify")
+            )
+        try:
+            update = self.meet_browser_settings.update_role_devices_if_unchanged(
+                self._meet_profile_path(),
+                key,
+                role_value,
+                dict(desired),
+                resolved,
+            )
+        except ValueError as error:
+            raise ConflictError(str(error)) from error
+        if not update.get("updated"):
+            raise ConflictError(
+                f"{role_value} desired devices changed while synchronization was in progress; retry"
+            )
+        return {
+            **result,
+            "routing": self.get_meet_routing(key),
+        }
 
     def get_meet_role_assignments(self, meeting_url: str = "") -> dict[str, Any]:
         profile_path = self._meet_profile_path()
@@ -2025,35 +2414,18 @@ class WsCollabService:
             selected[role_name] = value
         if meeting_url:
             key = self._meet_assignment_key(meeting_url)
-            state = self._meet_profile_state(profile_path)
-            maps = state.get("meeting_role_account_maps", {})
-            maps = dict(maps) if isinstance(maps, dict) else {}
-            raw_overrides = maps.get(key, {})
-            overrides = {
-                role: account_id
-                for role, account_id in (raw_overrides.items() if isinstance(raw_overrides, dict) else [])
-                if role in MEET_ROLES and account_id in accounts
-            }
+            role_patch: dict[str, str | None] = {}
             for role_name in MEET_ROLES:
                 if role_name not in supplied:
                     continue
                 account_id = selected[role_name]
                 if not account_id or account_id == "__default__":
-                    overrides.pop(role_name, None)
+                    role_patch[role_name] = None
                 else:
-                    overrides[role_name] = account_id
-            effective = self._meet_role_account_map(accounts, profile_path)
-            effective.update(overrides)
-            if overrides:
-                maps[key] = overrides
-            else:
-                maps.pop(key, None)
-            self._set_meet_profile_state(
-                profile_path,
-                accounts=accounts,
-                meeting_role_account_maps=maps,
+                    role_patch[role_name] = account_id
+            self.meet_browser_settings.update_meeting_role_accounts(
+                profile_path, key, role_patch
             )
-            self._remember_known_meeting_urls(profile_path, {key})
             return self.get_meet_role_assignments(key)
         cleaned = {role: account_id for role, account_id in selected.items() if account_id}
         self._set_meet_profile_state(profile_path, accounts=accounts, role_account_map=cleaned)
@@ -2062,12 +2434,9 @@ class WsCollabService:
     def clear_meet_role_assignments(self, meeting_url: str) -> dict[str, Any]:
         profile_path = self._meet_profile_path()
         key = self._meet_assignment_key(meeting_url)
-        state = self._meet_profile_state(profile_path)
-        maps = state.get("meeting_role_account_maps", {})
-        maps = dict(maps) if isinstance(maps, dict) else {}
-        maps.pop(key, None)
-        self._set_meet_profile_state(profile_path, meeting_role_account_maps=maps)
-        self._remember_known_meeting_urls(profile_path, {key})
+        self.meet_browser_settings.update_meeting_role_accounts(
+            profile_path, key, {}, clear=True
+        )
         return self.get_meet_role_assignments(key)
 
     def get_meet_companion_click(self, meeting_url: str = "") -> dict[str, Any]:
@@ -2222,6 +2591,23 @@ class WsCollabService:
                 "meeting_url": (health or {}).get("meetingUrl"),
                 "pid": pid_running,
             }
+        if not target and not new:
+            profile_path = self._meet_profile_path()
+            profile_state = self.meet_browser_settings.get_profile_state(profile_path)
+            forgotten = {
+                normalized
+                for value in profile_state.get("forgotten_meeting_urls", [])
+                if (normalized := self._normal_meet_url(value))
+            }
+            target = (
+                select_startup_meeting(
+                    None,
+                    False,
+                    self.meet_browser_settings.list_meeting_routing(profile_path),
+                    forgotten,
+                )
+                or ""
+            )
         settings = self.get_meet_role_assignments(target)
         assignments = {
             str(row.get("role") or ""): row
@@ -2369,7 +2755,7 @@ class WsCollabService:
         import urllib.request
 
         headers = {"content-type": "application/json"}
-        if path in {MEET_BRIDGE_WIRE_AUDIO, MEET_BRIDGE_DISCONNECT_AUDIO}:
+        if path in MEET_BRIDGE_AUTHENTICATED_PATHS:
             headers["authorization"] = (
                 f"Bearer {self._meet_bridge_worker_credential()}"
             )
@@ -2586,7 +2972,10 @@ class WsCollabService:
     def wire_companion_audio(
         self, meeting_url: str = "", *, reason: str = "manual"
     ) -> dict[str, Any]:
-        config, validation = self._companion_wiring_runtime_config()
+        normalized = (
+            self._meet_assignment_key(meeting_url) if meeting_url else ""
+        )
+        config, validation = self._companion_wiring_runtime_config(normalized)
         if not validation.get("valid") or config is None:
             raise ValidationError(
                 "companion cable wiring is invalid",
@@ -2596,6 +2985,7 @@ class WsCollabService:
             {
                 "meeting_url": self._normal_meet_url(meeting_url) if meeting_url else "",
                 "reason": "manual" if reason != "auto" else "auto",
+                "config": config,
             },
             path=MEET_BRIDGE_WIRE_AUDIO,
         )
@@ -2664,6 +3054,32 @@ class WsCollabService:
         if started.get("pid"):
             verdict += f" (pid {started['pid']})"
         return {**started, "verdict": verdict}
+
+    def set_meet_media_mute(
+        self, role: str, target: str, muted: bool, meeting_url: str = ""
+    ) -> dict[str, Any]:
+        role_value = str(role or "").strip().lower()
+        target_value = str(target or "").strip().lower()
+        if role_value not in {"host", "companion"}:
+            raise ValidationError("role must be 'host' or 'companion'")
+        if target_value not in {"mic", "speakers"}:
+            raise ValidationError("target must be 'mic' or 'speakers'")
+        if not isinstance(muted, bool):
+            raise ValidationError("muted must be a boolean")
+        payload = {
+            "role": role_value,
+            "target": target_value,
+            "muted": muted,
+            "meeting_url": self._normal_meet_url(meeting_url) if meeting_url else "",
+        }
+        result = self._meet_bridge_speech(
+            payload, timeout=3.0, path=MEET_BRIDGE_MEDIA_MUTE
+        )
+        if result is None:
+            raise NotFoundError("Meet bridge worker is offline")
+        if not result.get("ok"):
+            raise ConflictError(str(result.get("error") or "Meet media mute failed"))
+        return result
 
     def _meet_bridge_can_reuse_sso(self, health: dict[str, Any] | None, path: Path) -> bool:
         if not health:
@@ -5599,6 +6015,8 @@ class WsCollabService:
             MEET_BRIDGE_HEALTH: "Report internal Meet bridge worker health.",
             MEET_BRIDGE_CAPTIONS: "Return captions captured by the internal Meet bridge.",
             MEET_BRIDGE_COMMAND: "Send a navigation or control command to the Meet bridge.",
+            MEET_BRIDGE_MEDIA_MUTE: "Set role-scoped Meet microphone or speaker mute state.",
+            MEET_BRIDGE_DEVICE_SYNC: "Synchronize role-scoped Meet microphone and speaker devices.",
             MEET_BRIDGE_SPEECH: "Queue speech for playback into the active Meet.",
             MEET_BRIDGE_SPEECH_CANCEL: "Cancel queued or active Meet bridge speech.",
             MEET_BRIDGE_SPEECH_STATUS: "Return status for queued Meet bridge speech.",
@@ -5611,7 +6029,9 @@ class WsCollabService:
                     "Internal Meet bridge",
                     ["GET", "OPTIONS"] if path in {MEET_BRIDGE_HEALTH, MEET_BRIDGE_CAPTIONS} else ["POST", "OPTIONS"],
                     path,
-                    "worker-token" if path in {MEET_BRIDGE_WIRE_AUDIO, MEET_BRIDGE_DISCONNECT_AUDIO} else "loopback-only",
+                    "worker-token"
+                    if path in MEET_BRIDGE_AUTHENTICATED_PATHS
+                    else "loopback-only",
                     "internal-worker",
                     "internal-worker",
                     internal_descriptions[path],

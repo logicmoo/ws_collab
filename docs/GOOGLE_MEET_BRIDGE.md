@@ -247,6 +247,30 @@ input before checking the live caption.
 
 ### Companion-heard audio into Whisper and other STT drivers
 
+#### Per-meeting room and device routing
+
+Each normalized meeting has a durable routing policy in
+`MeetBrowserSettings`. `HOST I/O room` is an adapter descriptor; the production
+adapter registry currently enables only **Physical computer**. Discord, Zoom,
+and plain audio-call kinds are reserved capability entries and are reported as
+not configured—selecting them cannot claim or start an integration.
+
+HOST and COMPANION each persist desired browser microphone and speaker
+descriptors. Device IDs are hints because Chromium can rotate them; Sync
+re-resolves a unique exact normalized label, rejects default/blank/ambiguous
+matches, applies the pair to the actual current controlled tab, then reports
+the observed track/control and sink verification. Physical-computer HOST
+choices must correlate to enumerated physical hardware. COMPANION choices must
+equal the TRANSMIT recording and RECEIVE playback endpoints from its valid,
+distinct two-cable policy.
+
+The meeting header owns `Autostart` and `Reconnect after unexpected
+disconnect`. At most one meeting can autostart. Explicit `--meet` or `--new`
+wins over that policy; tombstoned meetings are excluded. Unexpected tab loss
+uses bounded exponential backoff with jitter and surfaced state/last error.
+An operator Disconnect suppresses reconnect for that role until Join/Rejoin,
+Sync, or a new bridge start clears it.
+
 #### Feedback-safe two-cable wiring
 
 The Silences page can persist and apply four exact machine endpoints. RECEIVE
@@ -297,16 +321,25 @@ The Chrome/CDP automation remains in a child worker because it has blocking
 browser and audio loops. Its loopback-only port (`48699` by default) uses only
 the internal namespace `/ws_collab/meet-bridge`: `GET /health` and
 `GET /captions`, plus `POST /command`, `/speech`, `/speech/status`,
-`/speech/cancel`, `/wire-companion-audio`, and
+`/speech/cancel`, `/media-mute`, `/device-sync`, `/wire-companion-audio`, and
 `/disconnect-companion-audio` relative to that namespace. Root paths on port
 48699 are not compatibility aliases and return 404. The UI uses the
 authenticated main-service proxy rather than accessing this port directly.
+The typed `/media-mute` operation is role-scoped and authenticated. Health
+reports observable `micMuted` and `speakersMuted` values per controlled client;
+`null` means the current Meet DOM/media state cannot be observed. Companion
+manual overrides persist across polling. A manual mic mute makes companion TTS
+temporarily unavailable, while speaker muting leaves direct MediaStream STT
+capture intact and is respected by cable-wiring verification.
+Health also reports role-scoped browser device candidates, whether labels are
+permission-restricted, the last verified sync result, and reconnect state.
 
 `ws_collab.drivers.stt.google_meet` polls the internal
 `/ws_collab/meet-bridge/captions` route for whatever wall-clock
 window an `AudioSegment` covers and resolves it through the normal
 disambiguator/timeline pipeline, exactly like a native engine. The admin
-UI's **Google Meet** page (deep ops view: HOST+COMPANION connector rows,
+UI's **Google Meet** page (deep ops view: meeting-level URL/copy/routing policy,
+plus HOST+COMPANION connector rows without a redundant Meeting column,
 per-meeting captions/debug) and **Meet Bridge** page (a simpler live
 transcript + join/new front door) both consume the authenticated server API.
 

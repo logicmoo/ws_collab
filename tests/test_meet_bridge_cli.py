@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 
 import pytest
 
 from ws_collab.meet_bridge import bridge
-from ws_collab.urls import MEET_BRIDGE_HTTP_PATHS, meet_bridge_route_allowed
+from ws_collab.meet_bridge.scripts_js import (
+    MEET_MEDIA_STATE_JS,
+    meet_device_sync_js,
+    set_meet_media_muted_js,
+)
+from ws_collab.urls import (
+    MEET_BRIDGE_HTTP_PATHS,
+    MEET_BRIDGE_DEVICE_SYNC,
+    MEET_BRIDGE_MEDIA_MUTE,
+    meet_bridge_route_allowed,
+)
 
 
 def test_loopback_handler_accepts_only_canonical_namespaced_routes() -> None:
@@ -25,11 +37,324 @@ def test_loopback_handler_accepts_only_canonical_namespaced_routes() -> None:
         "/wire-companion-audio",
         "/v1/status",
         "/v1/meet-bridge/health",
-        "/ws_collab/v1/meet-bridge/health",
     ):
         assert not meet_bridge_route_allowed("GET", old_path)
         assert not meet_bridge_route_allowed("POST", old_path)
         assert not meet_bridge_route_allowed("OPTIONS", old_path)
+
+
+class _MediaTab:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.scripts = []
+
+    def evaluate(self, script, **_kwargs):
+        self.scripts.append(script)
+        return next(self.responses)
+
+
+def test_meet_media_state_and_typed_mutations() -> None:
+    tab = _MediaTab(
+        [
+            '{"inCall":true,"micMuted":false,"speakersMuted":true,"mediaElementCount":2}',
+            '{"ok":true,"target":"mic","muted":true,"micMuted":true}',
+            '{"ok":true,"target":"speakers","muted":false}',
+        ]
+    )
+
+    assert bridge.read_meet_media_state(tab) == {
+        "inCall": True,
+        "micMuted": False,
+        "speakersMuted": True,
+        "mediaElementCount": 2,
+        "speakerRouting": None,
+    }
+    assert bridge.set_meet_media_muted(tab, "mic", True)["ok"] is True
+    assert bridge.set_meet_media_muted(tab, "speakers", False)["ok"] is True
+    assert "turn off|mute" in tab.scripts[1]
+    assert "window.__wsCollabSpeakerMuted" in tab.scripts[2]
+    assert ".enabled =" not in tab.scripts[2]
+    with pytest.raises(ValueError, match="target"):
+        bridge.set_meet_media_muted(tab, "capture", True)
+    with pytest.raises(ValueError, match="boolean"):
+        bridge.set_meet_media_muted(tab, "mic", 1)
+
+
+def test_mic_mutation_polls_rerender_and_rejects_ignored_click() -> None:
+    script = f"""
+global.window = global;
+window.__wsCollabMediaMuteMaxAttempts = 3;
+window.__wsCollabMediaMutePollMs = 0;
+let muted = false;
+let ignoreClick = false;
+const button = () => ({{
+  disabled: false,
+  getAttribute(name) {{
+    if (name === "aria-disabled") return "false";
+    if (name === "aria-label") return muted ? "Turn on microphone" : "Turn off microphone";
+    return "";
+  }},
+  click() {{ if (!ignoreClick) muted = !muted; }},
+}});
+global.document = {{
+  querySelectorAll() {{ return [button()]; }},
+}};
+(async () => {{
+  const accepted = JSON.parse(await eval({json.dumps(set_meet_media_muted_js("mic", True))}));
+  muted = false;
+  ignoreClick = true;
+  const ignored = JSON.parse(await eval({json.dumps(set_meet_media_muted_js("mic", True))}));
+  console.log(JSON.stringify({{ accepted, ignored }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["accepted"]["ok"] is True
+    assert payload["accepted"]["micMuted"] is True
+    assert payload["ignored"]["ok"] is False
+    assert payload["ignored"]["micMuted"] is False
+    assert "ignored or timed out" in payload["ignored"]["error"]
+
+
+def test_bridge_rejects_success_shaped_unverified_mic_result() -> None:
+    accepted = _MediaTab(['{"ok":true,"target":"mic","muted":true,"micMuted":true}'])
+    ignored = _MediaTab(['{"ok":true,"target":"mic","muted":true,"micMuted":false}'])
+
+    assert bridge.set_meet_media_muted(accepted, "mic", True)["ok"] is True
+    rejected = bridge.set_meet_media_muted(ignored, "mic", True)
+    assert rejected["ok"] is False
+    assert rejected["micMuted"] is False
+    assert "did not verify" in rejected["error"]
+
+
+def test_companion_manual_media_policy_survives_automation() -> None:
+    assert bridge.companion_mic_policy({}, "muted") == "muted"
+    assert (
+        bridge.companion_mic_policy(
+            {"companion_mic_muted_override": False}, "muted"
+        )
+        == "speaking"
+    )
+    assert (
+        bridge.companion_mic_policy(
+            {"companion_mic_muted_override": True}, "speaking"
+        )
+        == "muted"
+    )
+    assert "window.__wsCollabSpeakerMuted === true" in bridge.COMPANION_CABLE_VERIFY_JS
+    assert MEET_BRIDGE_MEDIA_MUTE in MEET_BRIDGE_HTTP_PATHS
+    assert MEET_BRIDGE_MEDIA_MUTE in bridge._BRIDGE_AUTHENTICATED_ROUTES
+    assert MEET_BRIDGE_DEVICE_SYNC in bridge._BRIDGE_AUTHENTICATED_ROUTES
+
+
+class _AsyncMediaTab:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.calls = []
+
+    def evaluate(self, script, **kwargs):
+        self.calls.append((script, kwargs))
+        return next(self.responses)
+
+
+def test_device_discovery_and_sync_report_only_verified_browser_state() -> None:
+    tab = _AsyncMediaTab(
+        [
+            '{"ok":true,"labelsRestricted":false,"devices":[{"kind":"audioinput",'
+            '"label":"Mic","deviceId":"mic-1","available":true}]}',
+            '{"ok":true,"verified":true,"mic":{"label":"Mic","deviceId":"mic-1"},'
+            '"speakers":{"label":"Speakers","deviceId":"speaker-1"}}',
+        ]
+    )
+    discovery = bridge.read_meet_device_candidates(tab)
+    synced = bridge.sync_meet_devices(
+        tab, {"label": "Mic"}, {"label": "Speakers"}
+    )
+
+    assert discovery["devices"][0]["deviceId"] == "mic-1"
+    assert synced["verified"] is True
+    assert tab.calls[0][1] == {"await_promise": True, "timeout": 5}
+    assert tab.calls[1][1] == {"await_promise": True, "timeout": 15}
+    assert 'matches.length !== 1' in tab.calls[1][0]
+    assert 'deviceId === "default"' in tab.calls[1][0]
+    assert "setSinkId" in tab.calls[1][0]
+
+
+def test_speaker_routing_observer_routes_new_media_and_reports_drift() -> None:
+    sync_script = meet_device_sync_js("Mic", "Speakers")
+    script = f"""
+global.window = global;
+global.Event = class Event {{ constructor(type) {{ this.type = type; }} }};
+let media = [];
+let observer = null;
+global.MutationObserver = class {{
+  constructor(callback) {{ this.callback = callback; observer = this; }}
+  observe() {{ this.active = true; }}
+  disconnect() {{ this.active = false; }}
+}};
+const track = {{
+  readyState: "live",
+  getSettings() {{ return {{ deviceId: "mic-1" }}; }},
+  stop() {{}},
+}};
+const stream = {{
+  getAudioTracks() {{ return [track]; }},
+  getTracks() {{ return [track]; }},
+}};
+const makeMedia = () => ({{
+  srcObject: stream, sinkId: "", muted: false, volume: 0.8, isConnected: true,
+  async setSinkId(id) {{ this.sinkId = id; }},
+}});
+media.push(makeMedia());
+const micOption = {{
+  tagName: "OPTION", value: "mic-1", textContent: "Mic",
+  getAttribute() {{ return null; }}, click() {{}},
+}};
+const micControl = {{
+  value: "", selectedOptions: [micOption],
+  querySelectorAll() {{ return [micOption]; }},
+  dispatchEvent() {{}},
+}};
+global.document = {{
+  documentElement: {{}},
+  querySelector(selector) {{
+    if (selector.includes('select[aria-label')) return micControl;
+    if (selector.includes('eave call')) return {{}};
+    return null;
+  }},
+  querySelectorAll(selector) {{
+    if (selector === "audio,video") return media;
+    if (selector.includes("button")) return [];
+    return [];
+  }},
+  addEventListener() {{}},
+  removeEventListener() {{}},
+}};
+global.navigator.mediaDevices = {{
+  async enumerateDevices() {{ return [
+    {{ kind: "audioinput", label: "Mic", deviceId: "mic-1" }},
+    {{ kind: "audiooutput", label: "Speakers", deviceId: "speaker-1" }},
+  ]; }},
+  async getUserMedia() {{ return stream; }},
+}};
+(async () => {{
+  const synced = JSON.parse(await eval({json.dumps(sync_script)}));
+  if (!observer) throw new Error(JSON.stringify(synced));
+  const added = makeMedia();
+  media.push(added);
+  observer.callback([]);
+  await window.__wsCollabMeetSpeakerRouting.queue;
+  media[0].sinkId = "drifted";
+  const status = JSON.parse(eval({json.dumps(MEET_MEDIA_STATE_JS)}));
+  console.log(JSON.stringify({{ synced, addedSink: added.sinkId, status }}));
+}})().catch((error) => {{ console.error(error); process.exit(1); }});
+"""
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["synced"]["verified"] is True
+    assert payload["addedSink"] == "speaker-1"
+    assert payload["status"]["speakerRouting"]["verified"] is False
+    assert payload["status"]["speakerRouting"]["driftedMediaCount"] == 1
+
+
+def test_speaker_routing_drift_and_tab_loss_invalidate_synced_status() -> None:
+    holder = {
+        "role_device_sync": {
+            "host": {
+                "state": "synced",
+                "verified": True,
+                "actual": {"speakers": {"observerVerified": True}},
+            }
+        }
+    }
+    bridge.invalidate_role_device_sync_if_unverified(
+        holder,
+        "host",
+        {
+            "inCall": True,
+            "speakerRouting": {
+                "verified": False,
+                "lastError": "one live element drifted",
+            },
+        },
+    )
+    assert holder["role_device_sync"]["host"]["verified"] is False
+    assert holder["role_device_sync"]["host"]["state"] == "error"
+    assert holder["role_device_sync"]["host"]["error"] == "one live element drifted"
+
+    holder["role_device_sync"]["host"].update(
+        {"state": "synced", "verified": True, "error": None}
+    )
+    bridge.invalidate_role_device_sync_if_unverified(
+        holder,
+        "host",
+        {"inCall": False, "mediaStateError": "tab is not attached"},
+    )
+    assert holder["role_device_sync"]["host"]["verified"] is False
+    assert holder["role_device_sync"]["host"]["error"] == "tab is not attached"
+
+
+def test_startup_policy_precedence_and_tombstones() -> None:
+    policies = {
+        "https://meet.google.com/xyz-abcd-efg": {"autostart": True},
+        "https://meet.google.com/abc-defg-hij": {"autostart": True},
+    }
+    assert bridge.select_startup_meeting("explicit-room", False, policies) == "explicit-room"
+    assert bridge.select_startup_meeting(None, True, policies) is None
+    assert (
+        bridge.select_startup_meeting(None, False, policies)
+        == "https://meet.google.com/abc-defg-hij"
+    )
+    assert (
+        bridge.select_startup_meeting(
+            None,
+            False,
+            policies,
+            {"https://meet.google.com/abc-defg-hij"},
+        )
+        == "https://meet.google.com/xyz-abcd-efg"
+    )
+    assert (
+        bridge.select_startup_meeting(None, False, policies, set(policies)) is None
+    )
+
+
+def test_reconnect_policy_is_bounded_and_operator_disconnect_is_sticky() -> None:
+    now = [10.0]
+    policy = bridge.ReconnectPolicy(
+        clock=lambda: now[0],
+        jitter=lambda: 0.5,
+        base_seconds=1.0,
+        cap_seconds=4.0,
+        max_attempts=3,
+    )
+    first = policy.unexpected_loss("host", enabled=True, error="tab lost")
+    assert first["delaySeconds"] == 1.0
+    assert policy.ready("host") is False
+    now[0] = 11.0
+    assert policy.ready("host") is True
+    assert policy.unexpected_loss("host", enabled=True, error="retry failed")[
+        "delaySeconds"
+    ] == 2.0
+    assert policy.unexpected_loss("host", enabled=True, error="retry failed")[
+        "delaySeconds"
+    ] == 4.0
+    assert policy.unexpected_loss("host", enabled=True, error="retry failed")[
+        "state"
+    ] == "exhausted"
+
+    policy.suppress("companion")
+    suppressed = policy.unexpected_loss(
+        "companion", enabled=True, error="unexpected close"
+    )
+    assert suppressed["state"] == "suppressed"
+    assert suppressed["nextAttemptAt"] is None
+    policy.clear("companion")
+    assert policy.unexpected_loss(
+        "companion", enabled=False, error="unexpected close"
+    )["state"] == "disabled"
 
 
 def test_cli_exposes_single_profile_account_options(monkeypatch, tmp_path, capsys) -> None:

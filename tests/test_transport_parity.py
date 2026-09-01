@@ -170,7 +170,6 @@ def test_legacy_root_and_versioned_aliases_are_not_mounted(client) -> None:
         "/health",
         "/ready",
         "/v1/status",
-        "/ws_collab/v1/status",
         "/ws",
         "/admin",
         "/openapi.json",
@@ -186,7 +185,7 @@ def test_websocket_has_one_canonical_path(client, admin_headers) -> None:
     token = admin_headers["Authorization"].split()[1]
     with client.websocket_connect("/ws_collab/ws") as ws:
         assert _ws_login(ws, token)["type"] == "auth_ok"
-    for old_path in ("/ws", "/v1/ws", "/ws_collab/v1/ws"):
+    for old_path in ("/ws", "/v1/ws"):
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect(old_path):
                 pass
@@ -262,7 +261,6 @@ def test_ui_assets_resolve_only_under_admin(client) -> None:
 
 def test_static_fallback_cannot_mask_api_misses_or_traversal(client) -> None:
     assert client.get("/ws_collab/not-a-route", headers=HTML).status_code == 404
-    assert client.get("/ws_collab/v1/status", headers=HTML).status_code == 404
     assert client.get("/ws_collab/admin/../../pyproject.toml").status_code == 404
 
 

@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import multiprocessing
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
 
 from ws_collab.errors import ConflictError, ValidationError
 from ws_collab.meet_bridge import bridge, navigator
+from ws_collab.urls import MEET_BRIDGE_DEVICE_SYNC
 from ws_collab.meet_browser_settings import (
     MeetBrowserSettings,
     companion_click_layers,
@@ -22,6 +25,12 @@ API_BASE = "/ws_collab"
 
 def _write_meet_setting(directory: str, key: str, value: str) -> None:
     MeetBrowserSettings(Path(directory)).set(key, value)
+
+
+def _enable_meeting_autostart(directory: str, profile: str, meeting: str) -> None:
+    MeetBrowserSettings(Path(directory)).update_meeting_routing(
+        Path(profile), meeting, {"autostart": True}
+    )
 
 
 def test_meet_browser_settings_persist_across_instances(tmp_path) -> None:
@@ -74,6 +83,437 @@ def test_meet_browser_settings_concurrent_writers_preserve_independent_keys(
     assert all(persisted[f"thread-{index}"] == str(index) for index in range(12))
     assert all(persisted[f"process-{index}"] == str(index) for index in range(8))
     assert list(tmp_path.glob(".meet_browser_settings.json.*.tmp")) == []
+
+
+def test_meeting_routing_is_atomic_normalized_and_single_autostart(tmp_path) -> None:
+    profile = tmp_path / "profile"
+    store = MeetBrowserSettings(tmp_path)
+    store.update_meeting_routing(
+        profile,
+        "ABC-defg-HIJ",
+        {
+            "autostart": True,
+            "roles": {"host": {"mic": {"label": "Studio Mic"}}},
+        },
+    )
+    second = MeetBrowserSettings(tmp_path).update_meeting_routing(
+        profile, "https://meet.google.com/xyz-abcd-efg", {"autostart": True}
+    )
+
+    policies = MeetBrowserSettings(tmp_path).list_meeting_routing(profile)
+    assert policies["https://meet.google.com/abc-defg-hij"]["autostart"] is False
+    assert policies["https://meet.google.com/xyz-abcd-efg"]["autostart"] is True
+    assert second["autostart_meeting"] == "https://meet.google.com/xyz-abcd-efg"
+    assert policies["https://meet.google.com/abc-defg-hij"]["roles"]["host"]["mic"][
+        "label"
+    ] == "Studio Mic"
+
+
+def test_concurrent_autostart_writers_preserve_invariant(tmp_path) -> None:
+    profile = tmp_path / "profile"
+    context = multiprocessing.get_context("spawn")
+    processes = [
+        context.Process(
+            target=_enable_meeting_autostart,
+            args=(str(tmp_path), str(profile), meeting),
+        )
+        for meeting in ("abc-defg-hij", "xyz-abcd-efg")
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(20)
+        assert process.exitcode == 0
+
+    policies = MeetBrowserSettings(tmp_path).list_meeting_routing(profile)
+    assert sum(policy["autostart"] is True for policy in policies.values()) == 1
+
+
+def test_concurrent_service_role_routing_patches_both_survive(
+    app_context, monkeypatch, tmp_path
+) -> None:
+    service = app_context.service
+    profile = tmp_path / "profile"
+    meeting = "https://meet.google.com/abc-defg-hij"
+    service.meet_browser_settings.set("profile_path", str(profile))
+    barrier = threading.Barrier(2)
+    original = service.meet_browser_settings.update_meeting_routing
+
+    def simultaneous(*args, **kwargs):
+        barrier.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        service.meet_browser_settings, "update_meeting_routing", simultaneous
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(
+                service.set_meet_routing,
+                meeting,
+                {"roles": {role: {"mic": {"label": f"{role} mic"}}}},
+            )
+            for role in ("host", "companion")
+        ]
+        for future in futures:
+            future.result(timeout=10)
+
+    roles = service.meet_browser_settings.get_meeting_routing(profile, meeting)["roles"]
+    assert roles["host"]["mic"]["label"] == "host mic"
+    assert roles["companion"]["mic"]["label"] == "companion mic"
+
+
+def test_concurrent_meeting_role_account_patches_both_survive(
+    app_context, monkeypatch, tmp_path
+) -> None:
+    service = app_context.service
+    profile = tmp_path / "profile"
+    meeting = "https://meet.google.com/abc-defg-hij"
+    service.meet_browser_settings.set("profile_path", str(profile))
+    monkeypatch.setattr(
+        service,
+        "list_meet_sso_accounts",
+        lambda: {
+            "accounts": [
+                {"id": "sso_host", "email": "host@example.test"},
+                {"id": "sso_companion", "email": "companion@example.test"},
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "get_meet_role_assignments",
+        lambda meeting_url="": {"meeting_url": meeting_url},
+    )
+    barrier = threading.Barrier(2)
+    original = service.meet_browser_settings.update_meeting_role_accounts
+
+    def simultaneous(*args, **kwargs):
+        barrier.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        service.meet_browser_settings, "update_meeting_role_accounts", simultaneous
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(
+                service.set_meet_role_assignments,
+                {role: account},
+                meeting,
+            )
+            for role, account in (
+                ("host", "sso_host"),
+                ("companion", "sso_companion"),
+            )
+        ]
+        for future in futures:
+            future.result(timeout=10)
+
+    maps = service.meet_browser_settings.get_profile_state(profile)[
+        "meeting_role_account_maps"
+    ]
+    assert maps[meeting] == {
+        "host": "sso_host",
+        "companion": "sso_companion",
+    }
+
+
+def test_meeting_routing_rest_syncs_only_exact_eligible_live_devices(
+    client, admin_headers, app_context, monkeypatch, tmp_path
+) -> None:
+    service = app_context.service
+    meeting = "https://meet.google.com/abc-defg-hij"
+    service.meet_browser_settings.set("profile_path", str(tmp_path / "profile"))
+    monkeypatch.setattr(
+        service.devices,
+        "list",
+        lambda: [
+            {"name": "Desk Microphone", "classes": ["physical"]},
+            {"name": "Desk Speakers", "classes": ["physical"]},
+        ],
+    )
+    monkeypatch.setattr(
+        service,
+        "_meet_bridge_health",
+        lambda timeout=0.5: {
+            "meetingUrl": meeting,
+            "clients": [
+                {
+                    "role": "host",
+                    "state": "in-call",
+                    "inCall": True,
+                    "audioDevices": {
+                        "ok": True,
+                        "devices": [
+                            {
+                                "kind": "audioinput",
+                                "label": "Desk Microphone",
+                                "deviceId": "rotating-mic-id",
+                                "available": True,
+                            },
+                            {
+                                "kind": "audiooutput",
+                                "label": "Desk Speakers",
+                                "deviceId": "rotating-speaker-id",
+                                "available": True,
+                            },
+                        ],
+                    },
+                }
+            ],
+        },
+    )
+    calls = []
+
+    def bridge_call(payload, timeout=2.0, *, path):
+        calls.append((payload, path))
+        return {
+            "ok": True,
+            "verified": True,
+            "deviceSync": {"verified": True, "state": "synced"},
+        }
+
+    monkeypatch.setattr(service, "_meet_bridge_speech", bridge_call)
+    saved = client.post(
+        f"{API_BASE}/meet/routing",
+        headers=admin_headers,
+        json={
+            "meeting_url": meeting,
+            "roles": {
+                "host": {
+                    "mic": {"label": "Desk Microphone", "deviceId": "old-id"},
+                    "speakers": {"label": "Desk Speakers", "deviceId": "old-id"},
+                }
+            },
+            "autostart": True,
+            "reconnect_after_disconnect": True,
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["policy"]["autostart"] is True
+
+    synced = client.post(
+        f"{API_BASE}/meet/routing/sync",
+        headers=admin_headers,
+        json={"meeting_url": meeting, "role": "host"},
+    )
+    assert synced.status_code == 200
+    assert calls[0][0]["mic"]["deviceId"] == "rotating-mic-id"
+    assert calls[0][0]["speakers"]["deviceId"] == "rotating-speaker-id"
+    assert calls[0][1].endswith("/device-sync")
+
+
+def test_device_sync_service_http_sends_worker_bearer_and_worker_enforces_it(
+    service, monkeypatch
+) -> None:
+    expected = service._meet_bridge_worker_credential()
+    seen_authorization = []
+
+    class WorkerHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen_authorization.append(self.headers.get("authorization"))
+            auth_error = bridge.bridge_worker_request_error(self.headers, expected)
+            if auth_error:
+                status, error = auth_error
+                payload = {"ok": False, "error": error}
+            else:
+                status = 200
+                payload = {"ok": True, "deviceSync": {"verified": True}}
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return
+
+    def invoke() -> dict | None:
+        server = HTTPServer(("127.0.0.1", 0), WorkerHandler)
+        server.timeout = 10.0
+        thread = threading.Thread(target=server.handle_request, daemon=True)
+        thread.start()
+        origin = f"http://127.0.0.1:{server.server_address[1]}"
+        monkeypatch.setattr(
+            "ws_collab.service.meet_bridge_url",
+            lambda path, _origin=None: f"{origin}{path}",
+        )
+        try:
+            return service._meet_bridge_speech(
+                {
+                    "meeting_url": "https://meet.google.com/abc-defg-hij",
+                    "role": "host",
+                },
+                timeout=10.0,
+                path=MEET_BRIDGE_DEVICE_SYNC,
+            )
+        finally:
+            thread.join(10)
+            server.server_close()
+
+    accepted = invoke()
+    monkeypatch.setattr(
+        service, "_meet_bridge_worker_credential", lambda: "incorrect-worker-token"
+    )
+    rejected = invoke()
+
+    assert accepted["ok"] is True
+    assert rejected is not None, seen_authorization
+    assert rejected["ok"] is False
+    assert "invalid bridge worker credential" in rejected["error"]
+    assert seen_authorization == [
+        f"Bearer {expected}",
+        "Bearer incorrect-worker-token",
+    ]
+
+
+def test_device_sync_merges_other_role_edits_and_conflicts_on_same_role(
+    client, admin_headers, app_context, monkeypatch, tmp_path
+) -> None:
+    service = app_context.service
+    meeting = "https://meet.google.com/abc-defg-hij"
+    service.meet_browser_settings.set("profile_path", str(tmp_path / "profile"))
+    monkeypatch.setattr(
+        service.devices,
+        "list",
+        lambda: [
+            {"name": "Desk Microphone", "classes": ["physical"]},
+            {"name": "Desk Speakers", "classes": ["physical"]},
+        ],
+    )
+    monkeypatch.setattr(
+        service,
+        "_meet_bridge_health",
+        lambda timeout=0.5: {
+            "meetingUrl": meeting,
+            "clients": [
+                {
+                    "role": "host",
+                    "state": "in-call",
+                    "inCall": True,
+                    "audioDevices": {
+                        "ok": True,
+                        "devices": [
+                            {
+                                "kind": "audioinput",
+                                "label": "Desk Microphone",
+                                "deviceId": "live-mic",
+                                "available": True,
+                            },
+                            {
+                                "kind": "audiooutput",
+                                "label": "Desk Speakers",
+                                "deviceId": "live-speakers",
+                                "available": True,
+                            },
+                        ],
+                    },
+                }
+            ],
+        },
+    )
+    service.set_meet_routing(
+        meeting,
+        {
+            "roles": {
+                "host": {
+                    "mic": {"label": "Desk Microphone"},
+                    "speakers": {"label": "Desk Speakers"},
+                },
+                "companion": {
+                    "mic": {"label": "Old Companion Mic"},
+                    "speakers": {"label": "Old Companion Speakers"},
+                },
+            }
+        },
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def bridge_call(_payload, timeout=2.0, *, path):
+        assert path == MEET_BRIDGE_DEVICE_SYNC
+        started.set()
+        assert release.wait(5)
+        return {"ok": True, "deviceSync": {"verified": True}}
+
+    monkeypatch.setattr(service, "_meet_bridge_speech", bridge_call)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(
+            client.post,
+            f"{API_BASE}/meet/routing/sync",
+            headers=admin_headers,
+            json={"meeting_url": meeting, "role": "host"},
+        )
+        assert started.wait(5)
+        service.set_meet_routing(
+            meeting,
+            {
+                "roles": {
+                    "companion": {
+                        "mic": {"label": "New Companion Mic"},
+                        "speakers": {"label": "New Companion Speakers"},
+                    }
+                },
+                "autostart": True,
+                "reconnect_after_disconnect": True,
+            },
+        )
+        release.set()
+        synced = pending.result(5)
+    assert synced.status_code == 200
+    policy = service.get_meet_routing(meeting)["policy"]
+    assert policy["roles"]["companion"]["mic"]["label"] == "New Companion Mic"
+    assert policy["roles"]["host"]["mic"]["deviceId"] == "live-mic"
+    assert policy["autostart"] is True
+    assert policy["reconnect_after_disconnect"] is True
+
+    started = threading.Event()
+    release = threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(
+            client.post,
+            f"{API_BASE}/meet/routing/sync",
+            headers=admin_headers,
+            json={"meeting_url": meeting, "role": "host"},
+        )
+        assert started.wait(5)
+        service.set_meet_routing(
+            meeting,
+            {
+                "roles": {
+                    "host": {
+                        "mic": {"label": "Replacement Microphone"},
+                        "speakers": {"label": "Replacement Speakers"},
+                    }
+                }
+            },
+        )
+        release.set()
+        conflicted = pending.result(5)
+    assert conflicted.status_code == 409
+    assert "changed while synchronization was in progress" in conflicted.text
+    policy = service.get_meet_routing(meeting)["policy"]
+    assert policy["roles"]["host"]["mic"]["label"] == "Replacement Microphone"
+    assert policy["roles"]["host"]["mic"]["deviceId"] is None
+    assert policy["roles"]["host"]["speakers"]["label"] == "Replacement Speakers"
+    assert policy["roles"]["host"]["speakers"]["deviceId"] is None
+
+
+def test_meeting_routing_rejects_unavailable_adapter(
+    client, admin_headers, app_context, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        app_context.service, "_meet_bridge_health", lambda timeout=0.5: None
+    )
+    response = client.post(
+        f"{API_BASE}/meet/routing",
+        headers=admin_headers,
+        json={"meeting_url": "abc-defg-hij", "room_adapter": {"kind": "discord"}},
+    )
+    assert response.status_code == 409
+    assert "not configured" in response.text
 
 
 def test_runtime_companion_layers_expire_without_settings_leakage() -> None:
@@ -1313,6 +1753,7 @@ def test_prune_is_normalized_idempotent_and_direct_helper_is_writer_free(
     store = MeetBrowserSettings(state_dir)
     store.set("profile_path", str(profile))
     store.set_profile_state(profile, known_meeting_urls=[keep, old])
+    store.update_meeting_routing(profile, old, {"autostart": True})
 
     first = prune_meeting_channels(
         state_dir, ["BGB-XQTS-XJT"], active_meeting_url=keep
@@ -1326,6 +1767,7 @@ def test_prune_is_normalized_idempotent_and_direct_helper_is_writer_free(
     assert second["forgotten"] == []
     assert second["alreadyForgotten"] == [old]
     assert first["historyPreserved"] is True
+    assert old not in MeetBrowserSettings(state_dir).list_meeting_routing(profile)
     assert not (state_dir / "events").exists()
 
 
@@ -1460,6 +1902,7 @@ def test_start_meet_bridge_uses_persisted_runtime_role_bindings(
     service, monkeypatch, tmp_path
 ) -> None:
     captured = {}
+    assignment_scopes = []
 
     class Process:
         pid = 4242
@@ -1471,16 +1914,22 @@ def test_start_meet_bridge_uses_persisted_runtime_role_bindings(
 
     monkeypatch.setattr(service, "_meet_bridge_health", lambda timeout=0.75: None)
     monkeypatch.setattr(service, "_meet_bridge_port_open", lambda: False)
-    monkeypatch.setattr(
-        service,
-        "get_meet_role_assignments",
-        lambda meeting_url="": {
+    service.meet_browser_settings.update_meeting_routing(
+        service._meet_profile_path(),
+        "https://meet.google.com/xyz-abcd-efg",
+        {"autostart": True},
+    )
+
+    def assignments(meeting_url=""):
+        assignment_scopes.append(meeting_url)
+        return {
             "role_assignments": [
                 {"role": "host", "account_id": "sso_1", "authuser": 0, "email": "one@example.test"},
                 {"role": "companion", "account_id": "sso_1", "authuser": 0, "email": "one@example.test"},
             ]
-        },
-    )
+        }
+
+    monkeypatch.setattr(service, "get_meet_role_assignments", assignments)
     monkeypatch.setattr("ws_collab.service.subprocess.Popen", fake_popen)
 
     started = service.start_meet_bridge("https://meet.google.com/abc-defg-hij")
@@ -1492,12 +1941,87 @@ def test_start_meet_bridge_uses_persisted_runtime_role_bindings(
     assert captured["argv"].count("host=0") == 1
     assert captured["argv"].count("companion=0") == 1
     assert "https://meet.google.com/abc-defg-hij" in captured["argv"]
+    assert "https://meet.google.com/xyz-abcd-efg" not in captured["argv"]
+    assert assignment_scopes == ["https://meet.google.com/abc-defg-hij"]
     assert "WS_COLLAB_TOKEN" not in " ".join(captured["argv"])
     assert captured["kwargs"]["env"]["PYTHONUNBUFFERED"] == "1"
     assert captured["kwargs"]["env"]["WS_COLLAB_STATE_DIR"] == str(
         service.config.state_dir.resolve()
     )
     assert captured["kwargs"]["env"]["WS_COLLAB_TOKEN"] in service.config.tokens
+
+
+def test_start_meet_bridge_scopes_roles_to_non_tombstoned_autostart_meeting(
+    service, monkeypatch, tmp_path
+) -> None:
+    captured = {}
+
+    class Process:
+        pid = 4244
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        return Process()
+
+    profile = tmp_path / "profile"
+    tombstoned = "https://meet.google.com/abc-defg-hij"
+    autostart = "https://meet.google.com/xyz-abcd-efg"
+    accounts = {
+        "sso_1": {"email": "global-host@example.test", "authuser": 0},
+        "sso_2": {"email": "global-companion@example.test", "authuser": 1},
+        "sso_3": {"email": "scoped-host@example.test", "authuser": 2},
+        "sso_4": {"email": "scoped-companion@example.test", "authuser": 3},
+    }
+    service.meet_browser_settings.set("profile_path", str(profile))
+    service.meet_browser_settings.set_profile_state(
+        profile,
+        accounts=accounts,
+        role_account_map={"host": "sso_1", "companion": "sso_2"},
+        meeting_role_account_maps={
+            autostart: {"host": "sso_3", "companion": "sso_4"}
+        },
+        meeting_routing={
+            tombstoned: {"autostart": True},
+            autostart: {"autostart": True},
+        },
+        forgotten_meeting_urls=[tombstoned],
+    )
+    selected = []
+    original_assignments = service.get_meet_role_assignments
+
+    def tracked_assignments(meeting_url=""):
+        result = original_assignments(meeting_url)
+        selected.append(
+            (
+                meeting_url,
+                {
+                    row["role"]: row["account_id"]
+                    for row in result["role_assignments"]
+                },
+            )
+        )
+        return result
+
+    monkeypatch.setattr(service, "get_meet_role_assignments", tracked_assignments)
+    monkeypatch.setattr(service, "_meet_bridge_health", lambda timeout=0.75: None)
+    monkeypatch.setattr(service, "_meet_bridge_port_open", lambda: False)
+    monkeypatch.setattr("ws_collab.service.subprocess.Popen", fake_popen)
+
+    started_result = service.start_meet_bridge()
+
+    assert started_result["meeting_url"] == autostart
+    assert selected[0] == (
+        autostart,
+        {"host": "sso_3", "companion": "sso_4", "guest": None},
+    )
+    argv = captured["argv"]
+    assert argv[argv.index("--meet") + 1] == autostart
+    assert "host=2" in argv
+    assert "host=scoped-host@example.test" in argv
+    assert "companion=3" in argv
+    assert "companion=scoped-companion@example.test" in argv
+    assert "global-host@example.test" not in argv
+    assert tombstoned not in argv
 
 
 def test_persisted_legacy_click_command_is_accepted_by_bridge_startup(
@@ -1645,6 +2169,83 @@ def test_server_managed_bridge_routes_use_authenticated_api(
     assert health.json()["meetingUrl"].endswith("abc-defg-hij")
     assert command.status_code == 200
     assert command.json()["verdict"] == "accepted /new"
+
+
+def test_role_media_mute_uses_typed_worker_payload(service, monkeypatch) -> None:
+    from ws_collab.urls import MEET_BRIDGE_MEDIA_MUTE
+
+    calls = []
+    monkeypatch.setattr(
+        service,
+        "_meet_bridge_speech",
+        lambda payload, timeout=2.0, *, path: calls.append(
+            (payload, timeout, path)
+        )
+        or {"ok": True},
+    )
+
+    result = service.set_meet_media_mute(
+        "COMPANION",
+        "speakers",
+        True,
+        "https://meet.google.com/abc-defg-hij?authuser=1",
+    )
+
+    assert result == {"ok": True}
+    assert calls == [
+        (
+            {
+                "role": "companion",
+                "target": "speakers",
+                "muted": True,
+                "meeting_url": "https://meet.google.com/abc-defg-hij",
+            },
+            3.0,
+            MEET_BRIDGE_MEDIA_MUTE,
+        )
+    ]
+    with pytest.raises(ValidationError, match="role"):
+        service.set_meet_media_mute("guest", "mic", True)
+    with pytest.raises(ValidationError, match="target"):
+        service.set_meet_media_mute("host", "capture", True)
+    with pytest.raises(ValidationError, match="boolean"):
+        service.set_meet_media_mute("host", "mic", "true")
+
+
+def test_role_media_mute_rest_auth_and_error_handling(
+    client, admin_headers, viewer_headers, app_context, monkeypatch
+) -> None:
+    calls = []
+
+    def media_mute(role, target, muted, meeting_url=""):
+        calls.append((role, target, muted, meeting_url))
+        if role == "companion":
+            raise ConflictError("companion microphone is manually unavailable")
+        return {"ok": True, "role": role, "target": target, "muted": muted}
+
+    monkeypatch.setattr(app_context.service, "set_meet_media_mute", media_mute)
+    url = f"{API_BASE}/meet/bridge/media-mute"
+    payload = {
+        "meeting_url": "https://meet.google.com/abc-defg-hij",
+        "role": "host",
+        "target": "mic",
+        "muted": True,
+    }
+
+    assert client.post(url, headers=viewer_headers, json=payload).status_code == 403
+    response = client.post(url, headers=admin_headers, json=payload)
+    assert response.status_code == 200
+    assert response.json()["muted"] is True
+    failed = client.post(
+        url,
+        headers=admin_headers,
+        json={**payload, "role": "companion"},
+    )
+    assert failed.status_code == 409
+    assert calls == [
+        ("host", "mic", True, payload["meeting_url"]),
+        ("companion", "mic", True, payload["meeting_url"]),
+    ]
 
 
 def test_live_account_reconciliation_keeps_stable_sso_ids(service, tmp_path) -> None:

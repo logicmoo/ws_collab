@@ -19,6 +19,7 @@ from ws_collab.meet_bridge.bridge import (
     companion_click_trigger_decision,
     disconnect_companion_audio_wiring,
     saved_companion_wiring_config,
+    scoped_companion_wiring,
     wire_companion_audio,
 )
 from ws_collab.meet_bridge.scripts_js import (
@@ -212,7 +213,7 @@ class _Mailbox:
         self.events = events
         self.healthy = healthy
 
-    def start_companion_wiring_capture(self, device_id):
+    def start_companion_wiring_capture(self, device_id, meeting_url=""):
         self.events.append("capture")
         return {
             "listening": True,
@@ -383,12 +384,22 @@ def test_bridge_wiring_worker_auth_origin_and_saved_config_boundary() -> None:
     ) is None
 
     class SavedMailbox:
-        def companion_cable_wiring(self):
+        def __init__(self):
+            self.meeting_url = None
+
+        def companion_cable_wiring(self, meeting_url=""):
+            self.meeting_url = meeting_url
             return {"config": _config(), "validation": {"valid": True, "errors": []}}
 
+    mailbox = SavedMailbox()
     assert saved_companion_wiring_config(
-        SavedMailbox(), {"meeting_url": "https://meet.google.com/abc-defg-hij"}
+        mailbox, {"meeting_url": "https://meet.google.com/abc-defg-hij?authuser=1"}
     ) == _config()
+    assert mailbox.meeting_url == "https://meet.google.com/abc-defg-hij"
+    assert scoped_companion_wiring(
+        mailbox, "https://meet.google.com/ABC-defg-HIJ?authuser=2"
+    )["config"] == _config()
+    assert mailbox.meeting_url == "https://meet.google.com/abc-defg-hij"
     with pytest.raises(ValueError, match="save device selections through the main server"):
         saved_companion_wiring_config(SavedMailbox(), {"config": _config()})
     assert secret not in str(
@@ -481,6 +492,94 @@ def test_wiring_rest_is_narrow_authenticated_and_save_does_not_apply(
     )
     assert wired.status_code == 200
     assert called[0][1]["path"] == "/ws_collab/meet-bridge/wire-companion-audio"
+
+
+def test_runtime_wiring_and_receive_capture_are_isolated_by_meeting(
+    client, admin_headers, worker_headers, app_context, monkeypatch
+) -> None:
+    rows = []
+    for offset, cable in enumerate(("A", "B", "C", "D")):
+        rows.extend(
+            [
+                {
+                    "id": f"out-{cable}",
+                    "name": f"Cable {cable} Input (Virtual)",
+                    "host_api": "Windows WASAPI",
+                    "backend_index": offset * 2,
+                    "supports_input": False,
+                    "supports_output": True,
+                    "classes": ["virtual"],
+                },
+                {
+                    "id": f"in-{cable}",
+                    "name": f"Cable {cable} Output (Virtual)",
+                    "host_api": "Windows WASAPI",
+                    "backend_index": offset * 2 + 1,
+                    "supports_input": True,
+                    "supports_output": False,
+                    "classes": ["virtual"],
+                },
+            ]
+        )
+    monkeypatch.setattr(app_context.service.devices, "list", lambda: rows)
+    first = "https://meet.google.com/abc-defg-hij"
+    second = "https://meet.google.com/xyz-abcd-efg"
+    first_body = {
+        "meeting_url": first,
+        "receive_playback_sink": "out-A",
+        "receive_capture_input": "in-A",
+        "transmit_tts_output": "out-B",
+        "transmit_companion_mic": "in-B",
+    }
+    second_body = {
+        "meeting_url": second,
+        "receive_playback_sink": "out-C",
+        "receive_capture_input": "in-C",
+        "transmit_tts_output": "out-D",
+        "transmit_companion_mic": "in-D",
+    }
+    assert client.post(
+        "/ws_collab/meet/companion-cable-wiring",
+        headers=admin_headers,
+        json=first_body,
+    ).status_code == 200
+    assert client.post(
+        "/ws_collab/meet/companion-cable-wiring",
+        headers=admin_headers,
+        json=second_body,
+    ).status_code == 200
+
+    first_runtime = client.get(
+        "/ws_collab/meet/companion-cable-wiring/runtime",
+        headers=worker_headers,
+        params={"meeting_url": first},
+    ).json()
+    second_runtime = client.get(
+        "/ws_collab/meet/companion-cable-wiring/runtime",
+        headers=worker_headers,
+        params={"meeting_url": second},
+    ).json()
+    assert first_runtime["config"]["receive_capture_input"]["serverDeviceId"] == "in-A"
+    assert second_runtime["config"]["receive_capture_input"]["serverDeviceId"] == "in-C"
+    assert first_runtime["config"] != second_runtime["config"]
+
+    wrong = client.post(
+        "/ws_collab/meet/companion-cable-wiring/capture/start",
+        headers=worker_headers,
+        json={"meeting_url": first, "device_id": "in-C"},
+    )
+    assert wrong.status_code == 400
+    capture = client.post(
+        "/ws_collab/meet/companion-cable-wiring/capture/start",
+        headers=worker_headers,
+        json={"meeting_url": first, "device_id": "in-A"},
+    )
+    assert capture.status_code == 200
+    assert capture.json()["device_id"] == "in-A"
+    client.post(
+        "/ws_collab/meet/companion-cable-wiring/capture/stop",
+        headers=worker_headers,
+    )
 
 
 def test_silences_ui_exposes_directional_four_endpoint_controls() -> None:

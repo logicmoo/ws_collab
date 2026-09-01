@@ -94,8 +94,6 @@ def test_lifecycle_routes_are_post_only_and_old_aliases_are_absent(
         "/restart",
         "/ws_collab/shutdown",
         "/ws_collab/restart",
-        "/ws_collab/v1/admin/shutdown",
-        "/ws_collab/v1/admin/restart",
     )
     assert all(client.post(path, headers=admin_headers).status_code == 404 for path in old_paths)
 

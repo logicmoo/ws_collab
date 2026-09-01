@@ -119,6 +119,76 @@ def test_meet_admin_confirms_and_calls_durable_channel_delete() -> None:
     assert 'actionButton("Clear displayed data", "mini", clearAllMeetSections)' in source
 
 
+def test_meet_media_controls_are_explicit_and_not_capture_controls() -> None:
+    source = _source()
+    rows = source.split("function meetUsRows", 1)[1].split(
+        "function readOnlyCheck", 1
+    )[0]
+
+    assert 'muted ? `Unmute ${noun}` : `Mute ${noun}`' in rows
+    assert '"micMuted"' in rows
+    assert '"speakersMuted"' in rows
+    assert 'target === "mic" ? "mic" : "speakers"' in rows
+    assert 'button.setAttribute("aria-pressed"' in rows
+    assert 'mediaCell(host, "host", "mic")' in rows
+    assert 'mediaCell(companion, "companion", "speakers")' in rows
+    actions = rows.split("const actionsFor", 1)[1].split("const ssoLink", 1)[0]
+    assert "Mute" not in actions
+    assert "Sync devices" in actions
+    assert "Foreground" in actions
+    assert "Disconnect" in actions
+    assert "toggleMeetCapture" not in source
+    media_request = source.split("async function postMeetMediaMute", 1)[1].split(
+        "async function postMeetSso", 1
+    )[0]
+    assert "/audio/capture/" not in media_request
+    assert "postMeetCommand(" not in media_request
+    assert "body: { meeting_url: meetingUrl, role, target, muted }" in source
+
+
+def test_meet_media_controls_are_absent_for_unavailable_rows() -> None:
+    source = _source()
+    rows = source.split("function meetUsRows", 1)[1].split(
+        "function readOnlyCheck", 1
+    )[0]
+
+    assert 'if (!client || client.state !== "in-call") return wrap;' in rows
+    assert 'unavailable.disabled = true' in rows
+    assert '["GUEST_CLIENT", ssoLink(ssoVal)' in rows
+    assert '"Guest/client connectors are not implemented."' in rows
+
+
+def test_meet_routing_controls_are_scoped_accessible_and_truthful() -> None:
+    source = _source()
+
+    assert 'table(["Who", "SSO", "State", "Mic", "Speakers", "Actions"]' in source
+    assert 'table(["Who", "SSO", "State", "Meeting"' not in source
+    assert '"HOST I/O room"' in source
+    assert '"Autostart"' in source
+    assert '"Reconnect after unexpected disconnect"' in source
+    assert "adapter.available" in source
+    assert '" — not configured"' in source
+    assert 'select.setAttribute("aria-label", `${role} ${target' in source
+    assert '"Pending — Sync required"' in source
+    assert '`${API_BASE}/meet/routing/sync`' in source
+    assert 'actionButton("Copy meeting"' in source
+
+
+def test_async_routing_sync_preserves_newer_same_meeting_edits() -> None:
+    source = _source()
+    sync = source.split("async function syncMeetingDevices", 1)[1].split(
+        "async function postMeetSso", 1
+    )[0]
+
+    assert "roleRevisions" in source
+    assert "routeState.roleRevisions[role] =" in source
+    assert "const submittedRevision =" in sync
+    assert "const submittedSnapshot =" in sync
+    assert "(routeState.roleRevisions[role] || 0) === submittedRevision" in sync
+    assert "JSON.stringify(routeState.drafts[role] || {}) === submittedSnapshot" in sync
+    assert "Saved/synced previous selection; newer edits pending" in sync
+
+
 def test_meet_admin_reconciles_delete_without_resurrecting_defaults() -> None:
     source = _source()
     delete_source = source.split("async function forgetMeetChannel", 1)[1].split(
@@ -151,3 +221,44 @@ def test_companion_interjector_renders_source_and_absence_safe_metrics() -> None
     assert 'silencesMetric("Last trigger reason"' in source
     assert 'silencesMetric("Status / eligibility"' in source
     assert "runtime && runtime.clicksSent" in source
+
+
+def test_companion_wiring_target_switch_invalidates_and_reloads_safely() -> None:
+    source = _source()
+    handler = source.split(
+        '$("meet-companion-target").onchange = () => {', 1
+    )[1].split("syncCompanionTargetOptions();", 1)[0]
+    loader = source.split(
+        "async function loadCompanionCableWiring()", 1
+    )[1].split("async function saveCompanionCableWiring()", 1)[0]
+    saver = source.split(
+        "async function saveCompanionCableWiring()", 1
+    )[1].split("async function applyCompanionCableWiring()", 1)[0]
+
+    assert "companionFormIsDirty() || wiringDirty" in handler
+    assert "Discard unsaved Silence and cable wiring changes" in handler
+    assert "invalidateCompanionCableWiring();" in handler
+    assert "loadCompanionCableWiring();" in handler
+    assert "payload = null" in loader
+    assert "status.replaceChildren()" in loader
+    assert "requestGeneration += 1" in loader
+    assert "generation !== state.companionCableWiring.requestGeneration" in loader
+    assert "meetingUrl !== companionMeetingKey(state.meetCompanion.meetingUrl)" in loader
+    assert "generation !== state.companionCableWiring.requestGeneration" in saver
+    assert "const wiringDirty = state.companionCableWiring.dirty;" in source
+    assert "Discard unsaved cable wiring changes and switch to the bridge's current room?" in source
+
+
+def test_async_cable_save_preserves_newer_same_target_edits() -> None:
+    source = _source()
+    saver = source.split(
+        "async function saveCompanionCableWiring()", 1
+    )[1].split("async function applyCompanionCableWiring()", 1)[0]
+
+    assert "draftRevision" in source
+    assert "state.companionCableWiring.draftRevision += 1" in source
+    assert "const submittedRevision =" in saver
+    assert "const submittedSnapshot =" in saver
+    assert "submittedRevision === state.companionCableWiring.draftRevision" in saver
+    assert "submittedSnapshot === JSON.stringify(companionCableDraftSnapshot())" in saver
+    assert "Saved previous selection; newer edits pending." in saver

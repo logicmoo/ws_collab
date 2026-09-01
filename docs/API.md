@@ -16,7 +16,7 @@ mounted at multiple paths.
 | OpenAPI UI / ReDoc / schema | `/ws_collab/openapi/docs`, `/ws_collab/openapi/redoc`, `/ws_collab/openapi.json` |
 | Internal Meet bridge loopback API (port 48699) | `/ws_collab/meet-bridge/*` |
 
-Root aliases, `/v1/*`, and `/ws_collab/v1/*` are intentionally not mounted and
+Root aliases and `/v1/*` are intentionally not mounted and
 return 404. Fetch
 the machine-readable categorized inventory from
 `GET /ws_collab/endpoints`; its `rest.endpoints` list is generated from
@@ -159,6 +159,9 @@ Generic form: `POST /ws_collab/events` with `{"stream", "type", "data",
 | POST | `/ws_collab/meet/companion-cable-wiring` | operator |
 | POST | `/ws_collab/meet/companion-cable-wiring/wire` | operator |
 | POST | `/ws_collab/meet/companion-cable-wiring/disconnect` | operator |
+| GET | `/ws_collab/meet/routing?meeting_url=<room>` | viewer |
+| POST | `/ws_collab/meet/routing` | operator |
+| POST | `/ws_collab/meet/routing/sync` | operator |
 | GET | `/ws_collab/meet/channels` | viewer |
 | POST | `/ws_collab/meet/channels/forget` | operator |
 | POST | `/ws_collab/meet/channels/prune` | operator |
@@ -167,9 +170,12 @@ The POST route ingests redacted intent/outcome records from browser worker
 processes. Both phases share a `nav_id`; GET returns the durable `events` page
 and a newest-first `records` view merged by that identifier.
 
-Companion cable wiring persists four exact machine endpoints in
-`sound_settings.json`: RECEIVE browser playback/server capture and a different
-TRANSMIT TTS playback/companion mic pair. Saving never applies or unmutes it.
+Companion cable wiring persists four exact machine endpoints: RECEIVE browser
+playback/server capture and a different TRANSMIT TTS playback/companion mic
+pair. Supplying `meeting_url` stores a meeting override in
+`meet_browser_settings.json`; otherwise the old `sound_settings.json` value is
+the explicit global default. Reads report `scope: meeting|global-default`.
+Saving never applies or unmutes it.
 `/wire` is the narrow authenticated proxy to the bridge's idempotent atomic
 operation; `/disconnect` immediately mutes remote media and stops its capture.
 The bridge accepts these operations only from the main server with its worker
@@ -189,7 +195,27 @@ active Meet profile. Passive event, admin-state, browser-history, tab, and live
 status discovery cannot restore a tombstoned channel. An explicit `/join`
 clears its tombstone. `channels/prune` requires a non-empty `keep` URL array and
 refuses to exclude the active meeting. Both operations remove channel-scoped
-role/Silence settings and test leases, but preserve transcript/event history.
+role/Silence/routing settings and test leases, but preserve transcript/event
+history. A forgotten meeting therefore cannot remain eligible for autostart or
+reconnect.
+
+Meeting routing policies are versioned and keyed by normalized Meet URL in the
+active browser profile. They contain `room_adapter`, per-role `mic` and
+`speakers` descriptors (`label`, normalized label, and last device ID),
+`autostart`, `reconnect_after_disconnect`, and an optional meeting-scoped
+companion wiring override. Updating one policy is lock-protected and atomically
+replaces the settings file. Enabling `autostart` clears it on every other
+meeting in the same transaction. The adapter registry currently exposes only
+`physical_computer` as available; Discord, Zoom, and plain audio-call entries
+are capability records marked unavailable rather than integrations.
+
+`POST /meet/routing/sync` accepts `meeting_url` and `role` (`host` or
+`companion`). It re-resolves exact normalized browser labels, rejects blank,
+ambiguous, default, unavailable, mismatched, or ineligible devices, applies
+both devices to that role's current controlled Meet tab, and succeeds only
+after the mic and speaker report verified state. Companion sync additionally
+validates/applies both distinct cable pairs and starts the RECEIVE server
+capture feeding secondary Silence/STT.
 
 ### Workers
 | Method | Path | Role |
@@ -350,7 +376,17 @@ loopback API. `POST /meet/bridge/command` starts the worker automatically for
 | GET | `/ws_collab/meet/bridge/status` | viewer |
 | GET | `/ws_collab/meet/bridge/captions?since=<epoch>` | viewer |
 | POST | `/ws_collab/meet/bridge/command` | operator |
+| POST | `/ws_collab/meet/bridge/media-mute` | operator |
+| POST | `/ws_collab/meet/routing/sync` | operator |
 | POST | `/ws_collab/meet/bridge/start` | operator |
+
+`media-mute` accepts
+`{"meeting_url":"https://meet.google.com/…","role":"host|companion","target":"mic|speakers","muted":true|false}`.
+It controls the selected Meet tab, not WS_COLLAB's physical capture service.
+The main-service routing sync is the supported device-selection operation. Its
+authenticated internal worker leg is
+`/ws_collab/meet-bridge/device-sync`; browsers cannot call that loopback
+mutation directly.
 
 ## WebSocket protocol
 

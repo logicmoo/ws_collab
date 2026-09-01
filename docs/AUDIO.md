@@ -76,6 +76,23 @@ Refresh at startup, on demand (`POST /ws_collab/audio/devices/refresh`), or
 after hot-plug; the generation counter increments each time. If the active input
 disappears, capture recovers to the default input and emits an event.
 
+### Google Meet role device routing
+
+Meet browser devices are separate from server PortAudio devices and are
+reported per controlled HOST/COMPANION tab. A meeting policy stores stable
+labels plus the last Chromium device IDs. Sync always re-enumerates and resolves
+one exact normalized label; it never silently uses `default`, an ambiguous
+label, or a stale ID.
+
+Physical-computer HOST routing accepts only candidates correlated to enumerated
+physical hardware. COMPANION routing is stricter: Meet input is the TRANSMIT
+cable recording endpoint and Meet output is the RECEIVE cable playback
+endpoint. Its meeting-scoped four-endpoint wiring validates paired RECEIVE and
+TRANSMIT halves as distinct, starts RECEIVE secondary capture into Silence and
+non-Meet STT, and verifies the browser sink, outbound track, capture, and
+serialized TTS output before unmuting. A global cable policy remains an
+explicit fallback for meetings without an override.
+
 ## Routing matrix
 
 Each `(source, engine)` pair routes to one device with its own gain, VAD, noise

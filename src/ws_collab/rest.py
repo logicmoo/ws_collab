@@ -980,12 +980,62 @@ def create_rest_router(
     @router.get(f"{mount}/meet/companion-cable-wiring")
     async def companion_cable_wiring(request: Request) -> dict[str, Any]:
         await _require(request, "viewer")
-        return guarded(service.get_companion_cable_wiring)
+        return guarded(
+            service.get_companion_cable_wiring,
+            request.query_params.get("meeting_url", ""),
+        )
+
+    @router.get(
+        f"{mount}/meet/routing",
+        summary="Read one durable meeting routing policy and live device capabilities",
+    )
+    async def meet_routing(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(
+            service.get_meet_routing,
+            request.query_params.get("meeting_url", ""),
+        )
+
+    @router.post(
+        f"{mount}/meet/routing",
+        summary="Update one meeting routing policy atomically",
+    )
+    async def set_meet_routing(
+        request: Request, body: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(
+            service.set_meet_routing,
+            body.get("meeting_url", body.get("meetingUrl", "")),
+            {
+                key: value
+                for key, value in body.items()
+                if key not in {"meeting_url", "meetingUrl"}
+            },
+        )
+
+    @router.post(
+        f"{mount}/meet/routing/sync",
+        summary="Synchronize one live controlled Meet role to its selected devices",
+    )
+    async def sync_meet_routing(
+        request: Request, body: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return await guarded_thread(
+            service.sync_meet_routing_devices,
+            body.get("meeting_url", body.get("meetingUrl", "")),
+            body.get("role", ""),
+        )
 
     @router.get(f"{mount}/meet/companion-cable-wiring/runtime")
     async def companion_cable_wiring_runtime(request: Request) -> dict[str, Any]:
         await _require(request, "worker")
-        return guarded(service.get_companion_cable_wiring, runtime_only=True)
+        return guarded(
+            service.get_companion_cable_wiring,
+            request.query_params.get("meeting_url", ""),
+            runtime_only=True,
+        )
 
     @router.post(f"{mount}/meet/companion-cable-wiring/capture/start")
     async def companion_cable_wiring_capture_start(
@@ -995,6 +1045,7 @@ def create_rest_router(
         return guarded(
             service.start_companion_wiring_capture,
             body.get("device_id", body.get("deviceId", "")),
+            body.get("meeting_url", body.get("meetingUrl", "")),
         )
 
     @router.post(f"{mount}/meet/companion-cable-wiring/capture/stop")
@@ -1007,7 +1058,13 @@ def create_rest_router(
         request: Request, body: dict[str, Any] = Body(...)
     ) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
-        return guarded(service.save_companion_cable_wiring, body)
+        meeting_url = body.get("meeting_url", body.get("meetingUrl", ""))
+        config = {
+            key: value
+            for key, value in body.items()
+            if key not in {"meeting_url", "meetingUrl"}
+        }
+        return guarded(service.save_companion_cable_wiring, config, meeting_url)
 
     @router.post(f"{mount}/meet/companion-cable-wiring/wire")
     async def wire_companion_audio(
@@ -1314,6 +1371,20 @@ def create_rest_router(
     ) -> dict[str, Any]:
         await _require(request, "operator", mutating=True)
         return await guarded_thread(service.meet_bridge_command, body.get("command", ""))
+
+    @router.post(f"{mount}/meet/bridge/media-mute")
+    async def meet_bridge_media_mute(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return await guarded_thread(
+            service.set_meet_media_mute,
+            body.get("role", ""),
+            body.get("target", ""),
+            body.get("muted"),
+            body.get("meeting_url", ""),
+        )
 
     @router.post(f"{mount}/meet/sso/open")
     async def meet_sso_open(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:

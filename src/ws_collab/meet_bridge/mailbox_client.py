@@ -155,11 +155,13 @@ class MailboxClient:
     def stop_secondary_capture(self) -> dict[str, Any]:
         return self._call("/audio/secondary-capture/stop", method="POST")
 
-    def start_companion_wiring_capture(self, device_id: str) -> dict[str, Any]:
+    def start_companion_wiring_capture(
+        self, device_id: str, meeting_url: str = ""
+    ) -> dict[str, Any]:
         return self._call(
             "/meet/companion-cable-wiring/capture/start",
             method="POST",
-            body={"device_id": device_id},
+            body={"device_id": device_id, "meeting_url": meeting_url},
         )
 
     def stop_companion_wiring_capture(self) -> dict[str, Any]:
@@ -167,10 +169,15 @@ class MailboxClient:
             "/meet/companion-cable-wiring/capture/stop", method="POST"
         )
 
-    def companion_cable_wiring(self) -> dict[str, Any]:
+    def companion_cable_wiring(self, meeting_url: str = "") -> dict[str, Any]:
         """Fetch the machine wiring config for bounded post-join auto-wire."""
 
-        return self._call("/meet/companion-cable-wiring/runtime")
+        query = (
+            f"?meeting_url={urllib.parse.quote(meeting_url, safe='')}"
+            if meeting_url
+            else ""
+        )
+        return self._call(f"/meet/companion-cable-wiring/runtime{query}")
 
     def ingest_companion_browser_audio(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Push muted companion remote-media PCM into shared secondary capture."""
