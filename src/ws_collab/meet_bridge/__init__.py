@@ -1,12 +1,9 @@
 """Google Meet caption bridge, native to ws_collab.
 
-Uses Google Meet's own live-caption model as a speech recognizer: a real
-Chrome tab is driven over the DevTools Protocol (CDP), Meet's live-caption DOM
-region is polled, and finished caption lines are relayed both into ws_collab's
-own mailbox (for chat visibility) and exposed over a small local HTTP API
-(``/ws_collab/meet-bridge/{health,captions,command}``) that
-:mod:`ws_collab.drivers.stt.
-google_meet.driver` already knows how to consume as an STT engine.
+Drives a real Chrome tab over the DevTools Protocol (CDP), polls Meet's
+live-caption DOM region, and relays finished caption lines into ws_collab's
+durable conversation context. Meet captions are a meeting/chat resource, not a
+local microphone STT engine.
 
 This subpackage is a from-scratch reimplementation of the design that used to
 live as a standalone script (``scripts/meet_caption_bridge.py``) in the outer

@@ -137,16 +137,23 @@ class _StreamState:
 
     def _rebuild_idempotency_window(self) -> None:
         self.idempotency.clear()
-        if not self.active_path.is_file():
-            return
-        for _start, end, line in _iter_complete_lines(self.active_path, 0):
-            try:
-                record = json.loads(line)
-            except (ValueError, json.JSONDecodeError):
+        for source in self._ordered_sources():
+            path = Path(source["path"])
+            if not path.is_file():
                 continue
-            key = record.get("idempotency_key")
-            if key:
-                self.idempotency[key] = {"id": record.get("id"), "seq": record.get("seq"), "offset": end}
+            for _start, end, line in _iter_complete_lines(path, 0):
+                try:
+                    record = json.loads(line)
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                key = record.get("idempotency_key")
+                if key:
+                    self.idempotency[key] = {
+                        "id": record.get("id"),
+                        "seq": record.get("seq"),
+                        "offset": end,
+                        "gen": source["gen"],
+                    }
 
     # ------------------------------------------------------------------- append
     def _repair_torn_final_line(self) -> None:
@@ -179,7 +186,12 @@ class _StreamState:
             if event.idempotency_key and event.idempotency_key in self.idempotency:
                 existing = self.idempotency[event.idempotency_key]
                 cursor = encode_cursor(
-                    {"s": self.name, "seq": existing["seq"], "off": existing.get("offset", 0), "gen": self.gen}
+                    {
+                        "s": self.name,
+                        "seq": existing["seq"],
+                        "off": existing.get("offset", 0),
+                        "gen": existing.get("gen", self.gen),
+                    }
                 )
                 dup = Event.from_dict({**event.to_dict(), "id": existing["id"], "seq": existing["seq"]})
                 return AppendResult(event=dup, duplicate=True, cursor=cursor)
@@ -199,6 +211,7 @@ class _StreamState:
                     "id": event.id,
                     "seq": event.seq,
                     "offset": end_offset,
+                    "gen": self.gen,
                 }
             self._write_state()
             cursor = encode_cursor({"s": self.name, "seq": event.seq, "off": end_offset, "gen": self.gen})
@@ -229,11 +242,16 @@ class _StreamState:
         self.active_path.write_text("", encoding="utf-8")
         self._apply_retention()
         self._write_state()
-        self.idempotency.clear()
 
     def _apply_retention(self) -> None:
         while len(self.segments) > self.retention_max_files:
             oldest = self.segments.pop(0)
+            removed_gen = int(oldest["gen"])
+            self.idempotency = {
+                key: value
+                for key, value in self.idempotency.items()
+                if int(value.get("gen", self.gen)) != removed_gen
+            }
             try:
                 Path(oldest["path"]).unlink(missing_ok=True)
             except OSError:

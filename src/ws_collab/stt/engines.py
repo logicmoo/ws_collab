@@ -18,6 +18,8 @@ from ..config import Config
 from ..drivers import DriverUnavailable, SttDriverSpec, discover_stt_drivers
 from .base import Hypothesis, PartialCallback, SttAdapter
 
+_RETIRED_MEET_ALIASES = {"google_meet", "google-meet", "meet", "gmeet"}
+
 
 def _match(name: str, specs: list[SttDriverSpec]) -> SttDriverSpec | None:
     lowered = name.lower()
@@ -38,6 +40,13 @@ def build_engines(config: Config) -> tuple[list[SttAdapter], list[str]]:
 
     engines: list[SttAdapter] = []
     for name in config.stt_engines:
+        alias = str(name).split(":", 1)[0].strip().lower()
+        if alias in _RETIRED_MEET_ALIASES:
+            warnings.append(
+                f"retired STT engine {name!r} skipped: Meet captions are a chat "
+                "resource, not an STT engine"
+            )
+            continue
         spec = _match(name, specs) or deterministic
         if spec is None:
             warnings.append(f"no driver matched STT engine {name!r} and no deterministic driver is available")

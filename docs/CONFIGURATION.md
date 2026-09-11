@@ -81,6 +81,9 @@ See [AUDIO.md](AUDIO.md) for the full treatment.
 | `WS_COLLAB_STT_CONCURRENCY` | `3` | Bounded concurrency |
 | `WS_COLLAB_STT_ALLOW_REMOTE` | `0` | Required before any audio leaves the device |
 | `WS_COLLAB_VOSK_MODEL` | _(auto-discovered)_ | Vosk model directory |
+| `WS_COLLAB_CAPTIONER_CDP_PORT` | `9224` | Dedicated Chrome Captions profile CDP port |
+| `WS_COLLAB_CAPTIONER_FLOOR_HANGOVER_MS` | `350` | Clear time required after local mic speech before conversational output |
+| `WS_COLLAB_CAPTIONER_FLOOR_STALE_MS` | `15000` | Missing VAD transition timeout; expiry becomes unknown/fail-open |
 | `WS_COLLAB_DISAMBIGUATOR` | `deterministic` | `deterministic` or `llm` |
 | `WS_COLLAB_DISAMBIGUATOR_ALLOW_REMOTE` | `0` | Required for a remote LLM resolver |
 | `WS_COLLAB_DISAMBIGUATOR_LLM_ENDPOINT` | — | Strict-schema resolver endpoint |

@@ -262,7 +262,9 @@ class BrowserBackend(Protocol):
 
     name: str
 
-    def open_tab(self, endpoint: str, url: str) -> tuple[BrowserTarget | None, str | None, str]: ...
+    def open_tab(
+        self, endpoint: str, url: str, *, background: bool = False
+    ) -> tuple[BrowserTarget | None, str | None, str]: ...
     def list_tabs(self, endpoint: str) -> list[BrowserTarget]: ...
     def attach(self, target: BrowserTarget) -> Any: ...
     def navigate(self, page: Any, url: str) -> Any: ...
@@ -296,10 +298,42 @@ class CdpBrowserBackend:
         self._open_tab_func = open_tab
         self._popen = popen
 
-    def open_tab(self, endpoint: str, url: str) -> tuple[BrowserTarget | None, str | None, str]:
+    def open_tab(
+        self, endpoint: str, url: str, *, background: bool = False
+    ) -> tuple[BrowserTarget | None, str | None, str]:
         if self._open_tab_func is not None:
             raw = self._open_tab_func(endpoint, url)
             return (BrowserTarget.from_legacy(raw) if isinstance(raw, dict) else None), None, "open-tab"
+        if background:
+            browser = None
+            try:
+                version = self._http_json(f"{endpoint}/json/version")
+                websocket_url = str(version.get("webSocketDebuggerUrl") or "")
+                if not websocket_url:
+                    raise RuntimeError("browser DevTools websocket is unavailable")
+                browser = self.attach(
+                    BrowserTarget("browser", endpoint, websocket_url, type="browser")
+                )
+                created = browser.call(
+                    "Target.createTarget", {"url": url, "background": True}
+                )
+                target_id = str((created or {}).get("targetId") or "")
+                for target in self.list_tabs(endpoint):
+                    if target.id == target_id:
+                        return target, None, "open-background-tab"
+                if target_id:
+                    return (
+                        BrowserTarget(target_id, url, "", type="page"),
+                        None,
+                        "open-background-tab",
+                    )
+                raise RuntimeError("Chrome did not return a target id")
+            except Exception:
+                # Older CDP implementations may not support a background target.
+                pass
+            finally:
+                if browser is not None:
+                    self.close_connection(browser)
         try:
             raw = self._http_json(f"{endpoint}/json/new?{url}", method="PUT")
             target = BrowserTarget.from_legacy(raw) if isinstance(raw, dict) else None
@@ -375,12 +409,15 @@ class InMemoryBrowserBackend:
             error, self.fail_next = self.fail_next, None
             raise error
 
-    def open_tab(self, endpoint: str, url: str) -> tuple[BrowserTarget | None, str | None, str]:
+    def open_tab(
+        self, endpoint: str, url: str, *, background: bool = False
+    ) -> tuple[BrowserTarget | None, str | None, str]:
         self._fail()
         target = BrowserTarget(uuid.uuid4().hex, url, "memory://page")
         self.targets[target.id] = target
-        self.actions.append(("open", url))
-        return target, None, "open-tab"
+        action = "open-background-tab" if background else "open-tab"
+        self.actions.append(("open-background" if background else "open", url))
+        return target, None, action
 
     def list_tabs(self, endpoint: str) -> list[BrowserTarget]:
         return list(self.targets.values())
@@ -1157,9 +1194,15 @@ def _open_url_raw(
     target: str,
     *,
     backend: BrowserBackend,
+    background: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None, str]:
     try:
-        info, error, action = backend.open_tab(cdp_endpoint, target)
+        if background:
+            info, error, action = backend.open_tab(
+                cdp_endpoint, target, background=True
+            )
+        else:
+            info, error, action = backend.open_tab(cdp_endpoint, target)
         return (info.to_legacy() if info is not None else None), error, action
     except Exception as error:
         return None, str(error), "open-tab"
@@ -1183,6 +1226,7 @@ def open_url(
     backend: BrowserBackend | None = None,
     consent_operation_id: str | None = None,
     allow_operation_scope: bool = False,
+    background: bool = False,
 ) -> dict[str, Any] | None:
     selected = backend or get_browser_backend()
     if not log_nav_intent:
@@ -1194,7 +1238,9 @@ def open_url(
             origin=origin, consent_operation_id=consent_operation_id,
             allow_operation_scope=allow_operation_scope,
         )
-        info, error, action = _open_url_raw(cdp_endpoint, target, backend=selected)
+        info, error, action = _open_url_raw(
+            cdp_endpoint, target, backend=selected, background=background
+        )
         setattr(open_url, "_last_error", error)
         setattr(open_url, "_last_action", action)
         setattr(open_url, "_last_error", error)
@@ -1224,7 +1270,9 @@ def open_url(
         origin=origin, consent_operation_id=consent_operation_id,
         allow_operation_scope=allow_operation_scope,
     )
-    info, error, action = _open_url_raw(cdp_endpoint, target, backend=selected)
+    info, error, action = _open_url_raw(
+        cdp_endpoint, target, backend=selected, background=background
+    )
     if info and info.get("webSocketDebuggerUrl"):
         page = selected.attach(BrowserTarget.from_legacy(info))
         try:

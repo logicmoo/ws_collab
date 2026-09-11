@@ -58,6 +58,25 @@ def test_unknown_engine_name_still_yields_a_working_engine(tmp_path) -> None:
     assert engines, "an unknown engine must degrade, not disappear"
 
 
+@pytest.mark.parametrize("retired", ["google_meet", "meet", "gmeet"])
+def test_retired_meet_alias_is_never_assembled_as_stt_engine(
+    tmp_path, retired: str
+) -> None:
+    from conftest import make_config
+
+    config = make_config(
+        tmp_path,
+        WS_COLLAB_STT_ENGINES=f"fallback_alpha,{retired},fallback_beta",
+    )
+    engines, warnings = build_engines(config)
+    assert retired not in {engine.name for engine in engines}
+    assert [engine.name for engine in engines] == ["fallback_alpha", "fallback_beta"]
+    assert any(
+        retired in warning and "chat resource, not an STT engine" in warning
+        for warning in warnings
+    )
+
+
 def test_missing_optional_model_degrades_with_a_warning(tmp_path) -> None:
     """A driver whose library is absent falls back and says so."""
 

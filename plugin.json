@@ -1,13 +1,13 @@
 {
   "id": "ws_collab",
   "label": "WS_COLLAB",
-  "description": "Coordination, audio, transcription, and administration infrastructure for Codex/Copilot workers over durable JSONL event streams with HTTP/HTTPS/WS/WSS parity.",
+  "description": "Coordination, audio, local STT, backend-selected browser caption instances, durable Chrome/Meet caption-source policy, and administration over durable JSONL event streams.",
   "summary": "Run the WS_COLLAB server, review its transports, and open its administration console.",
   "version": "1.0.0",
   "entrypoint": "plugin.py",
   "scan": "startup",
   "routePrefix": "/ws_collab",
-  "configPage": "http://127.0.0.1:5173/ws_collab/admin",
+  "configPage": "http://127.0.0.1:8802/ws_collab/#chrome-captions",
   "mailboxEndpoint": {
     "path": "/ws_collab/mailbox/mailboxes",
     "protocol": "ws_collab",
@@ -29,7 +29,8 @@
     "WS_COLLAB_AUDIO_ENABLED": "1",
     "WS_COLLAB_AUTH_DISABLED": "1",
     "WS_COLLAB_REQUIRE_AUTH": "0",
-    "WS_COLLAB_STT_ENGINES": "whisper:tiny.en,whisper:base.en,vosk,google_meet"
+    "WS_COLLAB_STT_ENGINES": "whisper:tiny.en,whisper:base.en,vosk",
+    "WS_COLLAB_CAPTIONER_CDP_PORT": "9224"
   },
   "plugin-install": {
     "requires": [],
@@ -112,9 +113,23 @@
       "capability": "viewer",
       "description": "Bidirectional event transport with subscriptions, publication, cursors, and liveness; message-specific roles are enforced."
     },
+    "captionSources": {
+      "method": "GET/POST",
+      "path": "/ws_collab/caption-sources",
+      "auth": "bearer-or-session",
+      "capability": "viewer/operator",
+      "description": "Lists the durable Chrome/Meet caption-source policy; explicit per-source enable, disable, and make-primary actions are operator-only."
+    },
+    "captionerInstances": {
+      "method": "GET/POST",
+      "path": "/ws_collab/captioner/instances",
+      "auth": "bearer-or-session",
+      "capability": "viewer/operator",
+      "description": "Lists recent browser captioner tab instances; operator-only per-instance enable, disable, and pinned selection actions control backend microphone authority."
+    },
     "config": {
       "method": "GET",
-      "path": "/ws_collab/admin/",
+      "path": "/ws_collab/",
       "auth": "loopback-policy",
       "description": "Operations workbench served through the workbench proxy (same page as configPage)."
     },
@@ -163,7 +178,7 @@
         "id": "admin",
         "label": "WS_COLLAB Admin",
         "kind": "admin",
-        "descriptor": "http://127.0.0.1:5173/ws_collab/admin",
+        "descriptor": "http://127.0.0.1:8802/ws_collab/#chrome-captions",
         "glyph": "⌁",
         "group": "PLUGINS"
       }

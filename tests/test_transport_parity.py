@@ -103,6 +103,7 @@ def test_endpoint_map_describes_both_transports(client, admin_headers) -> None:
         "admin_ui",
         "openapi",
         "internal_meet_bridge",
+        "internal_browser_captioner",
     }
     assert all(
         path.startswith("/ws_collab/meet-bridge/")
@@ -135,7 +136,7 @@ def test_endpoint_map_matches_the_actual_rest_route_set(client, admin_headers) -
     body = client.get(f"{API_BASE}/endpoints", headers=admin_headers).json()
     advertised = {
         (endpoint["path"], tuple(endpoint["methods"]))
-        for category in ("rest", "admin-control")
+        for category in ("rest", "admin-control", "internal_browser_captioner")
         for endpoint in body["categories"][category]["endpoints"]
     }
     actual: set[tuple[str, tuple[str, ...]]] = set()

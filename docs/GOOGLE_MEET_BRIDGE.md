@@ -1,11 +1,16 @@
 # Google Meet bridge
 
-`ws_collab.meet_bridge` uses **Google Meet's own live captions** as a speech
-recognizer -- far better than a local STT model for a room with real
-participants. It drives a real Chrome tab over the DevTools Protocol (CDP; no
+`ws_collab.meet_bridge` preserves **Google Meet's own live captions** as a
+meeting transcript/chat context resource. It is not a local captioner and is
+not advertised as an STT driver. It drives a real Chrome tab over the DevTools
+Protocol (CDP; no
 Playwright/Selenium), and has two jobs:
 
-1. **Servant meeting (always-on STT)** -- run with no arguments and it
+The bridge is manual-start and is not part of WS_COLLAB's current autostart set.
+Start it only with the operator **Start bridge**, Join/Rejoin, `/join`, `/new`,
+or the bridge CLI. Per-meeting routing cannot bootstrap a stopped bridge.
+
+1. **Servant meeting context** -- run with no arguments and it
    creates an instant meeting, joins it unattended (room mic ON, camera OFF,
    captions ON), and transcribes whatever the microphone hears. You never
    need to join this meeting; it is simply the recognizer. The bridge answers
@@ -205,9 +210,33 @@ That alternative is not enabled by default because Google Meet's CSP blocks
 localhost `connect-src`; it would require `Page.setBypassCSP` before injecting
 the page WebSocket client.
 
-Each finalized caption is pushed into `/ws_collab/stt/ingest` with engine
-`google_meet`, so the STT page and durable transcript stream identify Meet as
-the source. Browser Web Speech remains a separate optional microphone test.
+Each finalized caption is pushed into the typed
+`/ws_collab/meet/captions/ingest` route and stored as durable conversation
+context with `google_meet_caption` provenance. It never participates in local
+STT voting, disambiguation, capture health, or `HEARD_SPEECH`. Always-on
+microphone captioning belongs exclusively to `/ws_collab/captioner/`.
+The bridge writes finals to a persistent ordered retry outbox before delivery;
+the typed route is idempotent, and `conversation` is not also sent through the
+generic mailbox path. Explicit additional recipients still receive forwarded
+caption messages.
+
+The admin **Chrome Captions** page appears immediately before **Google Meet**.
+Its browser uses a separate `chrome_captioner` user-data directory and CDP port,
+never this bridge's SSO profile, cookies, account registry, or auth URLs. The
+operator can hide the Meet page and suppress new typed Meet conversation
+publication without stopping this bridge or deleting its raw caption history or
+configuration. Suppressed deliveries are successful ACKs, so the bridge removes
+them from its retry outbox. When Chrome Captions preference is enabled, only
+exact or conservative containment matches against recent Chrome finals are
+suppressed; unrelated Meet text remains conversation context.
+
+Companion speech and automatic debate backchannels consult the captioner's
+source-scoped `local_microphone` floor both before queueing and immediately
+before playback. Browser RMS speech onset also cancels cancellable active
+companion output. A 350ms clear hangover prevents end-of-utterance overlap;
+stale/missing VAD becomes unknown and does not permanently lock output. This
+does not disable debate speech globally and floor release never creates a
+backchannel.
 
 ### Repeatable turn-taking trials
 
@@ -264,12 +293,17 @@ choices must correlate to enumerated physical hardware. COMPANION choices must
 equal the TRANSMIT recording and RECEIVE playback endpoints from its valid,
 distinct two-cable policy.
 
-The meeting header owns `Autostart` and `Reconnect after unexpected
-disconnect`. At most one meeting can autostart. Explicit `--meet` or `--new`
-wins over that policy; tombstoned meetings are excluded. Unexpected tab loss
-uses bounded exponential backoff with jitter and surfaced state/last error.
-An operator Disconnect suppresses reconnect for that role until Join/Rejoin,
-Sync, or a new bridge start clears it.
+`default_on_bridge_start` may select one default meeting only after an operator
+explicitly starts the bridge without `--meet` or `--new`. Legacy stored
+`autostart` values are preserved and interpreted as this default; they never
+start the bridge or open Meet during WS_COLLAB service startup. The Meet card
+does not expose an Autostart control while driver autostart remains
+uncentralized. Explicit `--meet` or `--new` wins over the default, and tombstoned
+meetings are excluded. `Reconnect after unexpected disconnect` applies only
+inside an already explicitly started bridge. Unexpected tab loss uses bounded
+exponential backoff with jitter and surfaced state/last error. An operator
+Disconnect suppresses reconnect for that role until Join/Rejoin, Sync, or a new
+bridge start clears it.
 
 #### Feedback-safe two-cable wiring
 
@@ -334,10 +368,9 @@ capture intact and is respected by cable-wiring verification.
 Health also reports role-scoped browser device candidates, whether labels are
 permission-restricted, the last verified sync result, and reconnect state.
 
-`ws_collab.drivers.stt.google_meet` polls the internal
-`/ws_collab/meet-bridge/captions` route for whatever wall-clock
-window an `AudioSegment` covers and resolves it through the normal
-disambiguator/timeline pipeline, exactly like a native engine. The admin
+The retired `ws_collab.drivers.stt.google_meet` compatibility module is disabled
+from driver discovery. The internal `/ws_collab/meet-bridge/captions` route
+continues to support diagnostics and the Meet transcript UI. The admin
 UI's **Google Meet** page (deep ops view: meeting-level URL/copy/routing policy,
 plus HOST+COMPANION connector rows without a redundant Meeting column,
 per-meeting captions/debug) and **Meet Bridge** page (a simpler live

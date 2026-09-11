@@ -209,6 +209,43 @@ def test_cancelled_speech_is_not_played(engine) -> None:
     assert not [p for p in engine.published if p["type"] == "TTS_STARTED"]
 
 
+def test_local_mic_floor_blocks_enqueue_and_preplay_race_then_resumes(engine) -> None:
+    floor = {"blocked": True, "reason": "local-mic-floor-active"}
+    engine._playback_guard = lambda _item: dict(floor)
+    blocked = engine.speak("debater", "not over the user", voice_id="fake:aria")
+    assert blocked["blocked"] is True
+    assert blocked["deferred"] is True
+    assert blocked["id"] is None
+    assert engine.state()["queue"] == []
+
+    floor["blocked"] = False
+    queued = engine.speak("debater", "wait for the opening", voice_id="fake:aria")
+    assert queued["blocked"] is False
+    floor["blocked"] = True
+    assert asyncio.run(engine.process_next()) is False
+    assert engine.state()["queue"][0]["id"] == queued["id"]
+    assert not [p for p in engine.published if p["type"] == "TTS_STARTED"]
+
+    floor["blocked"] = False
+    assert asyncio.run(engine.process_next()) is True
+    assert [p for p in engine.published if p["type"] == "TTS_STARTED"]
+
+
+def test_floor_guard_does_not_block_user_requested_preview_audio(engine) -> None:
+    engine._playback_guard = lambda _item: {
+        "blocked": True,
+        "reason": "local-mic-floor-active",
+    }
+    preview = engine.speak(
+        "preview",
+        "requested preview",
+        voice_id="fake:aria",
+        artifact_source="voice-preview",
+    )
+    assert preview["blocked"] is False
+    assert asyncio.run(engine.process_next()) is True
+
+
 def test_muted_agent_is_not_spoken(engine) -> None:
     async def scenario():
         engine.mute("agent-1")

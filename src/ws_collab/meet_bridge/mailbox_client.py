@@ -22,8 +22,8 @@ Two honest simplifications versus the original in-process mailbox client:
   tracks "highest message id seen" purely in memory for the lifetime of one
   bridge process, which is sufficient for a live control channel (/join,
   /new, /say) -- those are one-off commands, not a transcript of record.
-  Finalized captions are pushed into ws_collab's STT ingest route as
-  ``google_meet`` and resolved through the normal durable transcript pipeline.
+  Finalized captions are pushed into ws_collab's typed meeting-caption route and
+  retained as conversation context, separate from microphone STT.
 """
 
 from __future__ import annotations
@@ -82,7 +82,13 @@ class MailboxClient:
         try:
             return self._call(
                 "/mailbox/send", method="POST",
-                body={"to": to, "text": line, "sender": sender, "source_kind": "system"},
+                body={
+                    "to": to,
+                    "text": line,
+                    "sender": sender,
+                    "source_kind": "system",
+                    "idempotency_key": (metadata or {}).get("idempotencyKey"),
+                },
             )
         except urllib.error.URLError as error:
             raise ConnectionError(f"ws_collab mailbox send failed ({self.base_url}): {error}") from error
@@ -136,6 +142,33 @@ class MailboxClient:
             },
         )
 
+    def ingest_meeting_caption(
+        self,
+        text: str,
+        *,
+        correlation_id: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Push one Meet caption into the dedicated conversation resource."""
+
+        return self._call(
+            "/meet/captions/ingest",
+            method="POST",
+            body={
+                "text": text,
+                "correlation_id": correlation_id,
+                "speaker": metadata.get("speaker"),
+                "role": metadata.get("role"),
+                "meeting_url": metadata.get("meetingUrl"),
+                "key": metadata.get("key"),
+                "revision": metadata.get("revision"),
+                "final": bool(metadata.get("final")),
+                "replaces": metadata.get("replaces"),
+                "duplicate_of": metadata.get("duplicateOf"),
+                "idempotency_key": metadata.get("idempotencyKey"),
+            },
+        )
+
     def list_audio_devices(self) -> dict[str, Any]:
         """Return ws_collab's audio device catalog."""
         return self._call("/audio/devices")
@@ -167,6 +200,20 @@ class MailboxClient:
     def stop_companion_wiring_capture(self) -> dict[str, Any]:
         return self._call(
             "/meet/companion-cable-wiring/capture/stop", method="POST"
+        )
+
+    def local_mic_floor(self) -> dict[str, Any]:
+        """Read the metadata-only local microphone floor; transport loss fails open."""
+
+        try:
+            payload = self._call("/captioner/status")
+        except urllib.error.URLError:
+            return {"available": False, "state": "unknown", "blocked": False}
+        floor = payload.get("local_mic_floor")
+        return (
+            dict(floor)
+            if isinstance(floor, dict)
+            else {"available": False, "state": "unknown", "blocked": False}
         )
 
     def companion_cable_wiring(self, meeting_url: str = "") -> dict[str, Any]:

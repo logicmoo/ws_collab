@@ -27,9 +27,9 @@ def _write_meet_setting(directory: str, key: str, value: str) -> None:
     MeetBrowserSettings(Path(directory)).set(key, value)
 
 
-def _enable_meeting_autostart(directory: str, profile: str, meeting: str) -> None:
+def _enable_meeting_bridge_start_default(directory: str, profile: str, meeting: str) -> None:
     MeetBrowserSettings(Path(directory)).update_meeting_routing(
-        Path(profile), meeting, {"autostart": True}
+        Path(profile), meeting, {"default_on_bridge_start": True}
     )
 
 
@@ -85,36 +85,66 @@ def test_meet_browser_settings_concurrent_writers_preserve_independent_keys(
     assert list(tmp_path.glob(".meet_browser_settings.json.*.tmp")) == []
 
 
-def test_meeting_routing_is_atomic_normalized_and_single_autostart(tmp_path) -> None:
+def test_meeting_routing_is_atomic_normalized_and_single_bridge_start_default(tmp_path) -> None:
     profile = tmp_path / "profile"
     store = MeetBrowserSettings(tmp_path)
     store.update_meeting_routing(
         profile,
         "ABC-defg-HIJ",
         {
-            "autostart": True,
+            "default_on_bridge_start": True,
             "roles": {"host": {"mic": {"label": "Studio Mic"}}},
         },
     )
     second = MeetBrowserSettings(tmp_path).update_meeting_routing(
-        profile, "https://meet.google.com/xyz-abcd-efg", {"autostart": True}
+        profile,
+        "https://meet.google.com/xyz-abcd-efg",
+        {"default_on_bridge_start": True},
     )
 
     policies = MeetBrowserSettings(tmp_path).list_meeting_routing(profile)
-    assert policies["https://meet.google.com/abc-defg-hij"]["autostart"] is False
-    assert policies["https://meet.google.com/xyz-abcd-efg"]["autostart"] is True
-    assert second["autostart_meeting"] == "https://meet.google.com/xyz-abcd-efg"
+    assert policies["https://meet.google.com/abc-defg-hij"]["default_on_bridge_start"] is False
+    assert policies["https://meet.google.com/xyz-abcd-efg"]["default_on_bridge_start"] is True
+    assert (
+        second["default_on_bridge_start_meeting"]
+        == "https://meet.google.com/xyz-abcd-efg"
+    )
     assert policies["https://meet.google.com/abc-defg-hij"]["roles"]["host"]["mic"][
         "label"
     ] == "Studio Mic"
 
 
-def test_concurrent_autostart_writers_preserve_invariant(tmp_path) -> None:
+def test_legacy_autostart_is_preserved_as_explicit_bridge_start_default(tmp_path) -> None:
+    profile = tmp_path / "profile"
+    meeting = "https://meet.google.com/abc-defg-hij"
+    store = MeetBrowserSettings(tmp_path)
+    store.set_profile_state(
+        profile,
+        meeting_routing={meeting: {"autostart": True}},
+    )
+
+    policy = store.get_meeting_routing(profile, meeting)
+    store.update_meeting_routing(
+        profile, meeting, {"reconnect_after_disconnect": True}
+    )
+    updated = store.get_meeting_routing(profile, meeting)
+    persisted = json.loads(store.path.read_text(encoding="utf-8"))
+
+    assert policy["default_on_bridge_start"] is True
+    assert updated["default_on_bridge_start"] is True
+    assert "autostart" not in policy
+    assert (
+        persisted["profiles"][str(profile)]["meeting_routing"][meeting]["autostart"]
+        is True
+    )
+
+
+def test_concurrent_bridge_start_default_writers_preserve_invariant(tmp_path) -> None:
     profile = tmp_path / "profile"
     context = multiprocessing.get_context("spawn")
     processes = [
         context.Process(
-            target=_enable_meeting_autostart,
+            target=_enable_meeting_bridge_start_default,
             args=(str(tmp_path), str(profile), meeting),
         )
         for meeting in ("abc-defg-hij", "xyz-abcd-efg")
@@ -126,7 +156,13 @@ def test_concurrent_autostart_writers_preserve_invariant(tmp_path) -> None:
         assert process.exitcode == 0
 
     policies = MeetBrowserSettings(tmp_path).list_meeting_routing(profile)
-    assert sum(policy["autostart"] is True for policy in policies.values()) == 1
+    assert (
+        sum(
+            policy["default_on_bridge_start"] is True
+            for policy in policies.values()
+        )
+        == 1
+    )
 
 
 def test_concurrent_service_role_routing_patches_both_survive(
@@ -286,12 +322,12 @@ def test_meeting_routing_rest_syncs_only_exact_eligible_live_devices(
                     "speakers": {"label": "Desk Speakers", "deviceId": "old-id"},
                 }
             },
-            "autostart": True,
+            "default_on_bridge_start": True,
             "reconnect_after_disconnect": True,
         },
     )
     assert saved.status_code == 200
-    assert saved.json()["policy"]["autostart"] is True
+    assert saved.json()["policy"]["default_on_bridge_start"] is True
 
     synced = client.post(
         f"{API_BASE}/meet/routing/sync",
@@ -456,7 +492,7 @@ def test_device_sync_merges_other_role_edits_and_conflicts_on_same_role(
                         "speakers": {"label": "New Companion Speakers"},
                     }
                 },
-                "autostart": True,
+                "default_on_bridge_start": True,
                 "reconnect_after_disconnect": True,
             },
         )
@@ -466,7 +502,7 @@ def test_device_sync_merges_other_role_edits_and_conflicts_on_same_role(
     policy = service.get_meet_routing(meeting)["policy"]
     assert policy["roles"]["companion"]["mic"]["label"] == "New Companion Mic"
     assert policy["roles"]["host"]["mic"]["deviceId"] == "live-mic"
-    assert policy["autostart"] is True
+    assert policy["default_on_bridge_start"] is True
     assert policy["reconnect_after_disconnect"] is True
 
     started = threading.Event()
@@ -1753,7 +1789,7 @@ def test_prune_is_normalized_idempotent_and_direct_helper_is_writer_free(
     store = MeetBrowserSettings(state_dir)
     store.set("profile_path", str(profile))
     store.set_profile_state(profile, known_meeting_urls=[keep, old])
-    store.update_meeting_routing(profile, old, {"autostart": True})
+    store.update_meeting_routing(profile, old, {"default_on_bridge_start": True})
 
     first = prune_meeting_channels(
         state_dir, ["BGB-XQTS-XJT"], active_meeting_url=keep
@@ -1917,7 +1953,7 @@ def test_start_meet_bridge_uses_persisted_runtime_role_bindings(
     service.meet_browser_settings.update_meeting_routing(
         service._meet_profile_path(),
         "https://meet.google.com/xyz-abcd-efg",
-        {"autostart": True},
+        {"default_on_bridge_start": True},
     )
 
     def assignments(meeting_url=""):
@@ -1951,7 +1987,7 @@ def test_start_meet_bridge_uses_persisted_runtime_role_bindings(
     assert captured["kwargs"]["env"]["WS_COLLAB_TOKEN"] in service.config.tokens
 
 
-def test_start_meet_bridge_scopes_roles_to_non_tombstoned_autostart_meeting(
+def test_start_meet_bridge_scopes_roles_to_non_tombstoned_default_meeting(
     service, monkeypatch, tmp_path
 ) -> None:
     captured = {}
@@ -1965,7 +2001,7 @@ def test_start_meet_bridge_scopes_roles_to_non_tombstoned_autostart_meeting(
 
     profile = tmp_path / "profile"
     tombstoned = "https://meet.google.com/abc-defg-hij"
-    autostart = "https://meet.google.com/xyz-abcd-efg"
+    default_meeting = "https://meet.google.com/xyz-abcd-efg"
     accounts = {
         "sso_1": {"email": "global-host@example.test", "authuser": 0},
         "sso_2": {"email": "global-companion@example.test", "authuser": 1},
@@ -1978,11 +2014,11 @@ def test_start_meet_bridge_scopes_roles_to_non_tombstoned_autostart_meeting(
         accounts=accounts,
         role_account_map={"host": "sso_1", "companion": "sso_2"},
         meeting_role_account_maps={
-            autostart: {"host": "sso_3", "companion": "sso_4"}
+            default_meeting: {"host": "sso_3", "companion": "sso_4"}
         },
         meeting_routing={
-            tombstoned: {"autostart": True},
-            autostart: {"autostart": True},
+            tombstoned: {"default_on_bridge_start": True},
+            default_meeting: {"default_on_bridge_start": True},
         },
         forgotten_meeting_urls=[tombstoned],
     )
@@ -2009,13 +2045,13 @@ def test_start_meet_bridge_scopes_roles_to_non_tombstoned_autostart_meeting(
 
     started_result = service.start_meet_bridge()
 
-    assert started_result["meeting_url"] == autostart
+    assert started_result["meeting_url"] == default_meeting
     assert selected[0] == (
-        autostart,
+        default_meeting,
         {"host": "sso_3", "companion": "sso_4", "guest": None},
     )
     argv = captured["argv"]
-    assert argv[argv.index("--meet") + 1] == autostart
+    assert argv[argv.index("--meet") + 1] == default_meeting
     assert "host=2" in argv
     assert "host=scoped-host@example.test" in argv
     assert "companion=3" in argv

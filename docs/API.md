@@ -12,7 +12,9 @@ mounted at multiple paths.
 | --- | --- |
 | REST (discovery, auth, events, mailbox, workers, audio, STT/TTS, Meet, cursors, prompt, diagnostics) | `/ws_collab/*` |
 | Full-parity WebSocket | `/ws_collab/ws` |
-| Admin UI, assets, and operator lifecycle controls | `/ws_collab/admin/*` |
+| Admin SPA and assets (canonical) | `/ws_collab/` |
+| Admin SPA compatibility alias and operator lifecycle controls | `/ws_collab/admin/*` |
+| Dedicated browser captioner page and scoped internal delivery | `/ws_collab/captioner/*` |
 | OpenAPI UI / ReDoc / schema | `/ws_collab/openapi/docs`, `/ws_collab/openapi/redoc`, `/ws_collab/openapi.json` |
 | Internal Meet bridge loopback API (port 48699) | `/ws_collab/meet-bridge/*` |
 
@@ -196,16 +198,18 @@ status discovery cannot restore a tombstoned channel. An explicit `/join`
 clears its tombstone. `channels/prune` requires a non-empty `keep` URL array and
 refuses to exclude the active meeting. Both operations remove channel-scoped
 role/Silence/routing settings and test leases, but preserve transcript/event
-history. A forgotten meeting therefore cannot remain eligible for autostart or
-reconnect.
+history. A forgotten meeting therefore cannot remain eligible as the default
+for an explicit bridge start or for reconnect.
 
 Meeting routing policies are versioned and keyed by normalized Meet URL in the
 active browser profile. They contain `room_adapter`, per-role `mic` and
 `speakers` descriptors (`label`, normalized label, and last device ID),
-`autostart`, `reconnect_after_disconnect`, and an optional meeting-scoped
+`default_on_bridge_start`, `reconnect_after_disconnect`, and an optional meeting-scoped
 companion wiring override. Updating one policy is lock-protected and atomically
-replaces the settings file. Enabling `autostart` clears it on every other
-meeting in the same transaction. The adapter registry currently exposes only
+replaces the settings file. Enabling `default_on_bridge_start` clears it on every other
+meeting in the same transaction. Legacy stored `autostart` values are preserved
+and treated only as this explicit-start default; no routing policy starts the
+Meet bridge during service startup. The adapter registry currently exposes only
 `physical_computer` as available; Discord, Zoom, and plain audio-call entries
 are capability records marked unavailable rather than integrations.
 
@@ -245,6 +249,85 @@ capture feeding secondary Silence/STT.
 | GET | `/ws_collab/stt/transcripts` | viewer |
 | POST | `/ws_collab/stt/ingest` | worker |
 | GET | `/ws_collab/transcripts` | viewer |
+
+The push-driven `browser_captioner` is distinct from audio-segment STT engines:
+
+| Method | Path | Authentication |
+| --- | --- | --- |
+| GET | `/ws_collab/captioner/` | strict loopback only (unaffected by `admin_remote`) |
+| GET/POST | `/ws_collab/captioner/config` | viewer / operator |
+| GET | `/ws_collab/captioner/status` | viewer |
+| GET | `/ws_collab/caption-sources` | viewer |
+| POST | `/ws_collab/caption-sources/{browser_captioner,google_meet}/{enable,disable,make-primary}` | operator |
+| GET | `/ws_collab/captioner/instances` | viewer |
+| POST | `/ws_collab/captioner/instances/{instance_id}/{enable,disable,make-primary}` | operator |
+| POST | `/ws_collab/captioner/{open,focus,pause,resume}` | operator |
+| POST | `/ws_collab/captioner/{ingest,heartbeat,control}` | loopback + same-origin + scoped per-process token |
+| POST | `/ws_collab/captioner/vad-transition` | loopback + same-origin + scoped token + current lease-owner token |
+
+The scoped token is embedded only in the no-store, loopback-only HTML bootstrap,
+never in a URL, and is not a general worker bearer. Internal calls additionally
+require a loopback peer, exact same-origin Host/Origin, and JSON content type.
+Each page heartbeat binds its local-storage session UUID, per-load tab UUID, and
+server boot ID. The bounded registry automatically keeps a fresh healthy
+selection, preferring an already-selected instance and then listening candidates
+by first-seen/ID order. Operator selection is pinned while fresh, even if
+degraded, and becomes automatic only after the 15-second stale timeout.
+Per-instance Disable survives heartbeat refresh for that tab instance but not a
+tab reload (which creates a new instance UUID). Only a selected, enabled, fresh
+instance receives microphone authority and a VAD owner token; Web Locks remain
+an additional same-origin guard.
+Ingest accepts one envelope or at most 50 `items`; each includes `session_id`,
+the per-tab `instance_id`,
+monotonic `seq`, `utterance_id`, `revision`, text, final flag, confidence,
+language, and timestamps. Responses identify each acknowledged envelope in
+`results` and retain `acked_seqs` plus `highest_contiguous` for compatibility.
+Finalization is durably retried and its resolved/heard outputs are idempotent.
+Final envelopes may include up to 128 strictly validated `pauses` entries:
+`duration_ms` (20ms through 24h), RFC3339 `start_at`/`end_at`,
+`source: "browser_rms_vad"`, `after_char` within final text, and alignment
+`interim_prefix`, `between_utterances`, or `approximate_text_position`.
+`silence_before_ms` remains as compatibility metadata for the last
+between-utterance pause. Heartbeats expose only bounded VAD scalars (RMS, adaptive
+noise floor/threshold, state, current silence, frame interval, and error), never
+PCM. Chrome recognition may be cloud-backed; the separate pause VAD is local.
+Heartbeat input metadata is strictly limited to `input_scope: microphone`, a
+bounded track label, optional short device fingerprint, actual echo/noise/AGC
+booleans, channel count, and sample rate. Raw browser `deviceId` and PCM are
+rejected.
+
+`vad-transition` has an independent 8KiB body limit and accepts exactly one
+ordered metadata event: `speech_start`, `speech_end`, or recovery `state_sync`,
+with RFC3339 time, positive epoch/sequence, `source: browser_rms_vad`,
+`source_id: local_microphone`, and `input_scope: microphone`. The heartbeat
+issues an ephemeral token only to the current browser lease owner. Duplicate
+transitions are idempotent, older sequence/epoch transitions are rejected as
+stale, old/future wall times are rejected, and the normal captioner rate limiter
+still applies. Status and health expose clear/speech/hangover/unknown floor
+state; unknown is fail-open.
+The backend-authoritative source policy contains `browser_captioner` and
+`google_meet`, an enabled flag for each, and zero or one primary source. Exactly
+one enabled source is primary whenever any source is enabled. Disabling the
+primary chooses the deterministic `browser_captioner`, then `google_meet`,
+fallback. The old `prefer_over_google_meet`, `disable_google_meet`, and
+captioner `enabled` booleans are migrated and mirrored for compatibility.
+`disable_other_stts` remains a separate audio-STT policy. The scoped
+captioner-page token cannot change source or instance policy. Config/status also identify the dedicated
+`chrome_captioner` profile and CDP endpoint; that profile is isolated from every
+Meet SSO profile and has no inherited Google login.
+
+With Chrome primary, a finalized typed Meet caption that exactly matches or
+safely contains/is contained by a recent Chrome final is acknowledged but not
+published to `conversation`. With Meet primary, Chrome batches are acknowledged
+as suppressed before canonical STT/floor publication; final raw delivery remains
+in the bounded durable captioner state and audit stores a text hash, reason, and
+identity rather than text. With Meet disabled, all typed Meet captions are
+similarly acknowledged and suppressed. Both cases write idempotent, text-free
+`MEET_CAPTION_SUPPRESSED` audit metadata. With other STTs disabled, captured
+audio/VAD continues but configured audio engines and disambiguation are bypassed
+and a text-free `STT_SEGMENT_SKIPPED` diagnostic is emitted. Manual
+`/stt/ingest` remains available unless its `engine` names a configured audio
+engine.
 
 `stt/ingest` is the bridge for an **external recognizer** (for example a desktop
 app's dictation engine). The transcript is recorded as a hypothesis and, when
@@ -379,6 +462,12 @@ loopback API. `POST /meet/bridge/command` starts the worker automatically for
 | POST | `/ws_collab/meet/bridge/media-mute` | operator |
 | POST | `/ws_collab/meet/routing/sync` | operator |
 | POST | `/ws_collab/meet/bridge/start` | operator |
+| POST | `/ws_collab/meet/captions/ingest` | worker |
+
+The typed Meet caption route publishes durable `google_meet_caption`
+conversation context with speaker, role, meeting URL/key, final/replacement, and
+duplicate metadata. It does not create STT hypotheses, invoke disambiguation, or
+emit `HEARD_SPEECH`.
 
 `media-mute` accepts
 `{"meeting_url":"https://meet.google.com/…","role":"host|companion","target":"mic|speakers","muted":true|false}`.

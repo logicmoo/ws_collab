@@ -12,7 +12,10 @@ bounded long polling.
 from __future__ import annotations
 
 import asyncio
+import hmac
+import html
 import inspect
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -20,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.background import BackgroundTask
 
 from .context import AppContext
@@ -29,6 +32,7 @@ from .security import Principal, Session
 from .urls import DEFAULT_ROUTE_PREFIX, admin_base, normalize_route_prefix, rest_base
 
 _ADMIN_DIR = Path(__file__).resolve().parent / "admin"
+_CAPTIONER_DIR = Path(__file__).resolve().parent / "captioner"
 _SESSION_COOKIE = "ws_collab_session"
 _CSRF_HEADER = "x-ws-collab-csrf"
 
@@ -96,7 +100,14 @@ def _serve_admin_asset(request: Request, relative: str) -> Response:
     if not path.is_file():
         raise HTTPException(status_code=404, detail={"code": "not_found", "message": relative})
     media_type = _EXTRA_MEDIA_TYPES.get(path.suffix.lower())
-    return FileResponse(path, media_type=media_type)
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "no-store" if path.name == "index.html" else "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 _PUBLIC_PURPOSES = {
@@ -175,12 +186,29 @@ def _finalize_route_metadata(router: APIRouter, mount: str) -> None:
         source = inspect.getsource(route.endpoint)
         roles = re.findall(r'_require\(request,\s*"([^"]+)"', source)
         capability = roles[0] if roles else "public"
+        relative = path.removeprefix(mount) or "/"
+        captioner_internal = relative in {
+            "/captioner/ingest",
+            "/captioner/heartbeat",
+            "/captioner/vad-transition",
+            "/captioner/control",
+        }
         route.openapi_extra = {
             **(route.openapi_extra or {}),
-            "x-ws-collab-auth": "none" if capability == "public" else "bearer-or-session",
-            "x-ws-collab-capability": capability,
-            "x-ws-collab-visibility": "public",
+            "x-ws-collab-auth": (
+                "captioner-token" if captioner_internal
+                else ("none" if capability == "public" else "bearer-or-session")
+            ),
+            "x-ws-collab-capability": (
+                "internal-captioner" if captioner_internal else capability
+            ),
+            "x-ws-collab-visibility": (
+                "internal-worker" if captioner_internal else "public"
+            ),
             "x-ws-collab-category": (
+                "Internal browser captioner"
+                if captioner_internal
+                else
                 "admin-control"
                 if path in {f"{mount}/admin/shutdown", f"{mount}/admin/restart"}
                 else "REST"
@@ -240,6 +268,7 @@ def create_rest_router(
     router = APIRouter(tags=["ws_collab"], include_in_schema=in_schema)
     service = ctx.service
     security = ctx.security
+    service.set_captioner_route_prefix(prefix)
 
     # ---------------------------------------------------------------- auth core
     def _authenticate(request: Request) -> Auth:
@@ -268,6 +297,82 @@ def create_rest_router(
             return auth
         except WsCollabError as error:
             raise HTTPException(status_code=error.http_status, detail=error.to_dict()["error"])
+
+    def _captioner_page_allowed(request: Request) -> None:
+        if not security.is_loopback_client(_client_ip(request)):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "forbidden", "message": "captioner is loopback-only"},
+            )
+        port = int(ctx.config.http_port)
+        allowed_hosts = {
+            f"127.0.0.1:{port}",
+            f"localhost:{port}",
+            f"[::1]:{port}",
+        }
+        host = request.headers.get("host", "").strip().lower()
+        if host not in allowed_hosts:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_host", "message": "captioner Host is not allowed"},
+            )
+
+    async def _captioner_json(
+        request: Request, *, max_bytes: int = 128 * 1024
+    ) -> dict[str, Any]:
+        await ctx.ensure_started()
+        _captioner_page_allowed(request)
+        supplied = request.headers.get("x-ws-collab-captioner-token") or ""
+        if not hmac.compare_digest(supplied, service.captioner_secret):
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "captioner_auth", "message": "invalid captioner token"},
+            )
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise HTTPException(
+                status_code=415,
+                detail={"code": "content_type", "message": "application/json required"},
+            )
+        origin = request.headers.get("origin")
+        expected_origin = f"{request.url.scheme}://{request.headers.get('host', '')}"
+        if not origin or origin != expected_origin:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "origin", "message": "same-origin captioner request required"},
+            )
+        try:
+            declared = int(request.headers.get("content-length") or 0)
+        except ValueError:
+            declared = 0
+        if declared > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail={"code": "payload_too_large", "message": "captioner payload too large"},
+            )
+        raw = await request.body()
+        if len(raw) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail={"code": "payload_too_large", "message": "captioner payload too large"},
+            )
+        try:
+            body = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_json", "message": "valid JSON object required"},
+            ) from error
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_json", "message": "JSON object required"},
+            )
+        try:
+            security.rate_limit(f"captioner:{_client_ip(request) or 'unknown'}")
+        except WsCollabError as error:
+            raise HTTPException(status_code=error.http_status, detail=error.to_dict()["error"])
+        return body
 
     def _source(auth: Auth, body: dict[str, Any]) -> tuple[str, str]:
         source_id = body.get("source_id") or auth.principal.label
@@ -321,6 +426,184 @@ def create_rest_router(
     async def capabilities() -> dict[str, Any]:
         await ctx.ensure_started()
         return service.capabilities(route_prefix=prefix)
+
+    # ------------------------------------------------------ browser captioner
+    @router.get(f"{mount}/captioner/", include_in_schema=False)
+    async def captioner_page(request: Request) -> Response:
+        await ctx.ensure_started()
+        _captioner_page_allowed(request)
+        template = (_CAPTIONER_DIR / "index.html").read_text(encoding="utf-8")
+        config = service.captioner_config()
+        replacements = {
+            "__TOKEN__": service.captioner_secret,
+            "__BOOT_ID__": service.boot_id,
+            "__LANGUAGE__": str(config["language"]),
+            "__ENABLED__": str(bool(config["enabled"])).lower(),
+            "__PAUSED__": str(bool(config["paused"])).lower(),
+            "__SEND_INTERIMS__": str(bool(config["send_interims"])).lower(),
+        }
+        for marker, value in replacements.items():
+            template = template.replace(marker, html.escape(value, quote=True))
+        return HTMLResponse(
+            template,
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": (
+                    "default-src 'none'; script-src 'self'; style-src 'self'; "
+                    "connect-src 'self'; img-src 'self' data:; base-uri 'none'; "
+                    "form-action 'none'; frame-ancestors 'none'"
+                ),
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @router.get(f"{mount}/captioner/captioner.js", include_in_schema=False)
+    async def captioner_script(request: Request) -> Response:
+        _captioner_page_allowed(request)
+        return FileResponse(
+            _CAPTIONER_DIR / "captioner.js",
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @router.get(f"{mount}/captioner/captioner_runtime.js", include_in_schema=False)
+    async def captioner_runtime_script(request: Request) -> Response:
+        _captioner_page_allowed(request)
+        return FileResponse(
+            _CAPTIONER_DIR / "captioner_runtime.js",
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @router.get(f"{mount}/captioner/transcript_runtime.js", include_in_schema=False)
+    async def captioner_transcript_runtime_script(request: Request) -> Response:
+        _captioner_page_allowed(request)
+        return FileResponse(
+            _ADMIN_DIR / "transcript_runtime.js",
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @router.get(f"{mount}/captioner/captioner.css", include_in_schema=False)
+    async def captioner_style(request: Request) -> Response:
+        _captioner_page_allowed(request)
+        return FileResponse(
+            _CAPTIONER_DIR / "captioner.css",
+            media_type="text/css",
+            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @router.post(f"{mount}/captioner/ingest")
+    async def captioner_ingest(request: Request) -> dict[str, Any]:
+        """Internal, scoped-token transcript delivery from the captioner page."""
+
+        body = await _captioner_json(request)
+        return guarded(service.ingest_captioner, body)
+
+    @router.post(f"{mount}/captioner/heartbeat")
+    async def captioner_heartbeat(request: Request) -> dict[str, Any]:
+        """Internal, scoped-token health update from the captioner page."""
+
+        body = await _captioner_json(request)
+        return guarded(service.captioner_heartbeat, body)
+
+    @router.post(f"{mount}/captioner/vad-transition")
+    async def captioner_vad_transition(request: Request) -> dict[str, Any]:
+        """Internal metadata-only local microphone floor transition."""
+
+        body = await _captioner_json(request, max_bytes=8 * 1024)
+        return guarded(service.captioner_vad_transition, body)
+
+    @router.post(f"{mount}/captioner/control")
+    async def captioner_page_control(request: Request) -> dict[str, Any]:
+        """Internal, scoped-token pause/resume/config control from the page."""
+
+        body = await _captioner_json(request)
+        return guarded(service.captioner_control, body)
+
+    @router.get(f"{mount}/captioner/config")
+    async def captioner_config(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return service.captioner_config()
+
+    @router.post(f"{mount}/captioner/config")
+    async def captioner_config_update(
+        request: Request, body: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.set_captioner_config, body)
+
+    @router.get(f"{mount}/captioner/status")
+    async def captioner_status(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return service.captioner_status()
+
+    @router.get(f"{mount}/caption-sources")
+    async def caption_sources(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return service.caption_source_policy()
+
+    @router.post(f"{mount}/caption-sources/{{source_id}}/{{action}}")
+    async def caption_source_action(
+        request: Request,
+        source_id: str,
+        action: str,
+        body: dict[str, Any] = Body(default={}),
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        if body:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "validation_error",
+                    "message": "caption source actions do not accept fields",
+                },
+            )
+        return guarded(service.caption_source_action, source_id, action)
+
+    @router.get(f"{mount}/captioner/instances")
+    async def captioner_instances(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return service.captioner_instances()
+
+    @router.post(f"{mount}/captioner/instances/{{instance_id}}/{{action}}")
+    async def captioner_instance_action(
+        request: Request,
+        instance_id: str,
+        action: str,
+        body: dict[str, Any] = Body(default={}),
+    ) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        if body:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "validation_error",
+                    "message": "captioner instance actions do not accept fields",
+                },
+            )
+        return guarded(service.captioner_instance_action, instance_id, action)
+
+    @router.post(f"{mount}/captioner/pause")
+    async def captioner_pause(request: Request) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return service.pause_captioner()
+
+    @router.post(f"{mount}/captioner/resume")
+    async def captioner_resume(request: Request) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return service.resume_captioner()
+
+    @router.post(f"{mount}/captioner/open")
+    async def captioner_open(request: Request) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return await guarded_thread(service.open_captioner, foreground=False)
+
+    @router.post(f"{mount}/captioner/focus")
+    async def captioner_focus(request: Request) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return await guarded_thread(service.open_captioner, foreground=True)
 
     # ------------------------------------------------------------ admin control
     def _lifecycle_response(action: str) -> Response:
@@ -848,6 +1131,15 @@ def create_rest_router(
             resolve=bool(body.get("resolve", True)),
             audio_meta=body.get("audio_meta"),
         )
+
+    @router.post(f"{mount}/meet/captions/ingest")
+    async def meeting_caption_ingest(
+        request: Request, body: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        """Ingest Meet captions as durable conversation context, not microphone STT."""
+
+        await _require(request, "worker", mutating=True)
+        return guarded(service.ingest_meeting_caption, body)
 
     @router.get(f"{mount}/transcripts")
     async def translated_audio(request: Request, after: str | None = Query(None), limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
@@ -1537,7 +1829,7 @@ def create_rest_router(
         index = _ADMIN_DIR / "index.html"
         if not index.is_file():
             raise HTTPException(status_code=404, detail={"code": "not_found", "message": "admin bundle missing"})
-        return FileResponse(index)
+        return FileResponse(index, headers={"Cache-Control": "no-store"})
 
     @router.get(f"{admin}/{{asset:path}}", include_in_schema=False)
     async def admin_asset(request: Request, asset: str) -> Response:
@@ -1580,7 +1872,7 @@ def create_static_router(
         # API, transport, docs, and admin misses must remain 404 rather than
         # falling through to an SPA or an asset with the same basename.
         top = asset.split("/", 1)[0]
-        if top in {"v1", "ws", "openapi", "admin", "meet-bridge"}:
+        if top in {"v1", "ws", "openapi", "admin", "captioner", "meet-bridge"}:
             raise HTTPException(
                 status_code=404,
                 detail={"code": "not_found", "message": asset},
@@ -1610,6 +1902,15 @@ def create_static_router(
                 detail={"code": "forbidden", "message": "admin is loopback-only"},
             )
         media_type = _EXTRA_MEDIA_TYPES.get(candidate.suffix.lower())
-        return FileResponse(candidate, media_type=media_type)
+        return FileResponse(
+            candidate,
+            media_type=media_type,
+            headers={
+                "Cache-Control": (
+                    "no-store" if candidate.name == "index.html" else "no-cache"
+                ),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     return router

@@ -32,6 +32,7 @@ PublishFn = Callable[..., dict[str, Any]]
 RoutePlayFn = Callable[["TtsItem"], Awaitable[float]]
 RouteStatusFn = Callable[[], dict[str, Any]]
 RouteCancelFn = Callable[[str], None]
+PlaybackGuardFn = Callable[["TtsItem"], dict[str, Any]]
 
 
 @dataclass(order=True)
@@ -133,6 +134,7 @@ class TtsEngine:
         route_play: RoutePlayFn | None = None,
         route_status: RouteStatusFn | None = None,
         route_cancel: RouteCancelFn | None = None,
+        playback_guard: PlaybackGuardFn | None = None,
     ):
         self.config = config
         self._publish = publish
@@ -153,6 +155,7 @@ class TtsEngine:
         self._route_play = route_play
         self._route_status = route_status
         self._route_cancel = route_cancel
+        self._playback_guard = playback_guard
         # Per-agent "last actually spoken" record (text + when playback
         # STARTED, not just enqueue time) -- separate from `_recent`, which
         # is only a short dedupe window and gets pruned within seconds.
@@ -211,28 +214,39 @@ class TtsEngine:
             from ..errors import PayloadTooLargeError
 
             raise PayloadTooLargeError("tts text too long")
+        candidate = TtsItem(
+            priority=priority,
+            agent_id=agent_id,
+            text=text,
+            voice_id=voice_id,
+            requested_voice_id=requested_voice_id or voice_id,
+            rate=rate,
+            pitch=pitch,
+            volume=volume,
+            device=device,
+            destination=destination,
+            meeting_url=meeting_url,
+            artifact_source=artifact_source,
+            correlation_id=correlation_id,
+            interrupt=interrupt,
+            requires_floor=bool(wait_for_floor),
+            floor_test_profile=str(floor_test_profile or ""),
+            floor_role=str(floor_role or ""),
+        )
+        guard = self._guard(candidate)
+        if guard.get("blocked"):
+            return {
+                "duplicate": False,
+                "id": None,
+                "blocked": True,
+                "deferred": True,
+                "reason": guard.get("reason") or "local-mic-floor-active",
+                "floor": guard,
+            }
         with self._lock:
             if dedupe and self._is_duplicate(agent_id, text):
                 return {"duplicate": True, "id": None}
-            item = TtsItem(
-                priority=priority,
-                agent_id=agent_id,
-                text=text,
-                voice_id=voice_id,
-                requested_voice_id=requested_voice_id or voice_id,
-                rate=rate,
-                pitch=pitch,
-                volume=volume,
-                device=device,
-                destination=destination,
-                meeting_url=meeting_url,
-                artifact_source=artifact_source,
-                correlation_id=correlation_id,
-                interrupt=interrupt,
-                requires_floor=bool(wait_for_floor),
-                floor_test_profile=str(floor_test_profile or ""),
-                floor_role=str(floor_role or ""),
-            )
+            item = candidate
             floor_consumed = False
             if item.requires_floor and item.meeting_url:
                 floor_key = (item.meeting_url, item.floor_test_profile)
@@ -254,7 +268,22 @@ class TtsEngine:
             "queue_position": queue_position,
             "waiting_for_floor": item.requires_floor,
             "floor_consumed": floor_consumed,
+            "blocked": False,
         }
+
+    @staticmethod
+    def _is_conversational(item: TtsItem) -> bool:
+        return item.artifact_source in {
+            "virtual-agent-tts",
+            "companion-interjector",
+            "proactive-system-tts",
+        }
+
+    def _guard(self, item: TtsItem) -> dict[str, Any]:
+        if not self._is_conversational(item) or self._playback_guard is None:
+            return {"blocked": False}
+        result = self._playback_guard(item)
+        return dict(result) if isinstance(result, dict) else {"blocked": bool(result)}
 
     def _dedupe_key(self, agent_id: str, text: str) -> str:
         return f"{agent_id}\x1f{normalize_text(text)}"
@@ -303,6 +332,21 @@ class TtsEngine:
                     item.cancelled = True
                     count += 1
         return count
+
+    def cancel_current_conversational(self) -> dict[str, Any]:
+        with self._lock:
+            item = self._current
+            if item is None or item.cancelled or not self._is_conversational(item):
+                return {"cancelled": False, "utterance_id": None}
+            item.cancelled = True
+            if item.destination == "companion" and self._route_cancel is not None:
+                self._route_cancel(item.id)
+            return {
+                "cancelled": True,
+                "utterance_id": item.id,
+                "destination": item.destination,
+                "artifact_source": item.artifact_source,
+            }
 
     def pause(self, agent_id: str | None = None) -> None:
         with self._lock:
@@ -500,6 +544,8 @@ class TtsEngine:
                     continue
                 if item.agent_id in self._paused_agents:
                     continue
+                if self._guard(item).get("blocked"):
+                    continue
                 if item.requires_floor:
                     grant = self._floor_open.get(str(item.meeting_url or ""))
                     if not grant or not self._floor_matches(item, grant):
@@ -518,7 +564,19 @@ class TtsEngine:
             return False
         with self._lock:
             self._current = item
-            self._last_spoken[item.agent_id] = {"text": item.text, "voice_id": item.voice_id, "at": time.time()}
+        guard = self._guard(item)
+        if guard.get("blocked"):
+            with self._lock:
+                self._current = None
+                self._pending.append(item)
+                self._pending.sort()
+            return False
+        with self._lock:
+            self._last_spoken[item.agent_id] = {
+                "text": item.text,
+                "voice_id": item.voice_id,
+                "at": time.time(),
+            }
         self._publish(
             stream=STREAM_TTS, type=TTS_STARTED,
             data={**item.public(), "backend": self._backend.name},

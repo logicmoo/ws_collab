@@ -296,19 +296,19 @@ def test_speaker_routing_drift_and_tab_loss_invalidate_synced_status() -> None:
     assert holder["role_device_sync"]["host"]["error"] == "tab is not attached"
 
 
-def test_startup_policy_precedence_and_tombstones() -> None:
+def test_bridge_start_default_precedence_and_tombstones() -> None:
     policies = {
-        "https://meet.google.com/xyz-abcd-efg": {"autostart": True},
-        "https://meet.google.com/abc-defg-hij": {"autostart": True},
+        "https://meet.google.com/xyz-abcd-efg": {"default_on_bridge_start": True},
+        "https://meet.google.com/abc-defg-hij": {"default_on_bridge_start": True},
     }
-    assert bridge.select_startup_meeting("explicit-room", False, policies) == "explicit-room"
-    assert bridge.select_startup_meeting(None, True, policies) is None
+    assert bridge.select_bridge_start_meeting("explicit-room", False, policies) == "explicit-room"
+    assert bridge.select_bridge_start_meeting(None, True, policies) is None
     assert (
-        bridge.select_startup_meeting(None, False, policies)
+        bridge.select_bridge_start_meeting(None, False, policies)
         == "https://meet.google.com/abc-defg-hij"
     )
     assert (
-        bridge.select_startup_meeting(
+        bridge.select_bridge_start_meeting(
             None,
             False,
             policies,
@@ -317,7 +317,7 @@ def test_startup_policy_precedence_and_tombstones() -> None:
         == "https://meet.google.com/xyz-abcd-efg"
     )
     assert (
-        bridge.select_startup_meeting(None, False, policies, set(policies)) is None
+        bridge.select_bridge_start_meeting(None, False, policies, set(policies)) is None
     )
 
 
@@ -623,7 +623,7 @@ def test_companion_heard_stt_status_payload() -> None:
     assert payload["enabled"] is True
     assert payload["sourceKind"] == "companion_heard"
     assert payload["captureListening"] is True
-    assert payload["engineScope"] == "server secondary capture excludes google_meet and feeds non-Meet STT engines"
+    assert payload["engineScope"] == "server secondary capture feeds configured audio STT engines; Meet caption text is separate context"
 
 
 def test_companion_click_trigger_waits_for_caption_stasis() -> None:
@@ -759,6 +759,49 @@ def test_backchannel_dispatch_queues_phrase_through_shared_audio_arbiter() -> No
     assert audio.submission["metadata"]["phrase"] == "uhuh"
     assert holder["companion_click_fired_silence_event"] == "row:1"
     assert holder["companion_click_eligibility"] == "queued"
+
+
+def test_backchannel_dispatch_respects_local_mic_floor_and_resumes() -> None:
+    class Audio:
+        submission = None
+
+        def status(self):
+            return {"companionReady": True, "queued": 0, "speaking": False}
+
+        def submit(self, **kwargs):
+            self.submission = kwargs
+            return {"accepted": True, "id": "backchannel-1"}
+
+    holder = {"companion_click_action": "say:hmm", "companion_click_mode": "reactive"}
+    audio = Audio()
+    decision = {
+        "due": True,
+        "trigger": "caption-stasis",
+        "mode": "on_silence",
+        "eventKey": "row:floor",
+    }
+    floor = {"blocked": True, "state": "speech"}
+    blocked = bridge.queue_companion_interjection(
+        holder,
+        audio,
+        decision,
+        meeting_url="https://meet.google.com/abc-defg-hij",
+        floor_guard=lambda: dict(floor),
+    )
+    assert blocked["accepted"] is False
+    assert blocked["reason"] == "local-mic-floor-active"
+    assert audio.submission is None
+
+    floor.update(blocked=False, state="clear")
+    resumed = bridge.queue_companion_interjection(
+        holder,
+        audio,
+        decision,
+        meeting_url="https://meet.google.com/abc-defg-hij",
+        floor_guard=lambda: dict(floor),
+    )
+    assert resumed["accepted"] is True
+    assert audio.submission["kind"] == "interject"
 
 
 @pytest.mark.parametrize(

@@ -10,6 +10,7 @@ idempotency, filters, validation, auditing, and worker/routing/prompt logic.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
 import os
 import shutil
@@ -38,6 +39,20 @@ from .companion_wiring import (
 )
 from .admin_ui_state import AdminUIState
 from .classify import SourceClassifier
+from .captioner import (
+    CAPTIONER_CLOUD_DISCLOSURE,
+    CAPTIONER_DISPLAY_NAME,
+    CAPTIONER_ID,
+    CAPTIONER_MODEL,
+    CAPTIONER_PROFILE_DISCLOSURE,
+    CAPTIONER_PROVENANCE,
+    BrowserCaptioner,
+    CaptionSourcePolicy,
+    CaptionerSupervisor,
+    LocalMicFloor,
+    RECENT_FINAL_LIMIT,
+    RECENT_FINAL_WINDOW_SECONDS,
+)
 from .config import Config, ECHO_POLICIES
 from .cursors import CursorManager
 from .disambiguator import build_disambiguator
@@ -124,7 +139,7 @@ from .meet_bridge import navigator
 from .meet_browser_settings import (
     MeetBrowserSettings,
     normalize_meeting_url,
-    select_startup_meeting,
+    select_bridge_start_meeting,
 )
 
 
@@ -274,6 +289,7 @@ class WsCollabService:
         # assets instead of leaving stale HTML/JS running against the new server.
         self.boot_id = uuid.uuid4().hex
         self._meet_bridge_process_secret = secrets.token_urlsafe(32)
+        self.captioner_secret = secrets.token_urlsafe(48)
         self.broker = Broker()
 
         # Audit sink used by every subsystem so security-relevant changes are durable.
@@ -308,6 +324,43 @@ class WsCollabService:
         self.classifier = SourceClassifier(config.echo_policy)
         self.disambiguator = build_disambiguator(config)
         self.stt_engines, self.stt_warnings = build_engines(config)
+        self.captioner = BrowserCaptioner(
+            config.state_dir,
+            boot_id=self.boot_id,
+            publish_item=self._publish_captioner_item,
+            require_registration=True,
+            suppress_item=self._audit_suppressed_captioner_item,
+        )
+        self.caption_sources = CaptionSourcePolicy(config.state_dir)
+        self._sync_caption_source_legacy()
+        self.local_mic_floor = LocalMicFloor(
+            hangover_seconds=config.captioner_floor_hangover_ms / 1000.0,
+            stale_seconds=config.captioner_floor_stale_ms / 1000.0,
+        )
+        captioner_url = (
+            f"http://127.0.0.1:{config.http_port}"
+            f"{normalize_route_prefix(DEFAULT_ROUTE_PREFIX)}/captioner/"
+        )
+        self._recent_captioner_finals: deque[dict[str, Any]] = deque(
+            maxlen=RECENT_FINAL_LIMIT
+        )
+        self._meet_caption_suppression_counts = {
+            "preferred_browser_captioner": 0,
+            "google_meet_disabled": 0,
+            "primary_google_meet": 0,
+            "instance_policy": 0,
+        }
+        self.captioner_supervisor = CaptionerSupervisor(
+            self.captioner,
+            page_url=captioner_url,
+            cdp_endpoint=f"http://127.0.0.1:{config.captioner_cdp_port}",
+            profile=self._captioner_profile_path(),
+            browser_path=self._captioner_browser_path,
+            navigator_module=navigator,
+            cdp_available=lambda: cdp_alive(
+                f"http://127.0.0.1:{config.captioner_cdp_port}"
+            ),
+        )
         self._companion_tts_status_cache: dict[str, Any] = {
             "destination": "companion",
             "companionReady": False,
@@ -319,6 +372,7 @@ class WsCollabService:
             route_play=self._play_tts_route,
             route_status=self._companion_tts_status,
             route_cancel=self._cancel_companion_tts,
+            playback_guard=lambda _item: self.local_mic_floor_guard(),
         )
         self._meeting_floor_lock = threading.RLock()
         self._meeting_floor_status: dict[str, dict[str, Any]] = {}
@@ -337,8 +391,10 @@ class WsCollabService:
             self.classifier.echo_policy = saved_echo_policy
         self.prompt = PromptManager(config, self.publish, read_history=self._prompt_history_events)
         self.accuracy = accuracy_metrics.AccuracyAccumulator()
+        self.captioner.recover_pending()
 
         self._monitor_task: asyncio.Task | None = None
+        self._captioner_task: asyncio.Task | None = None
         self._warnings = list(config.warnings) + list(self.stt_warnings)
 
         # Client-created ("dynamic") mailboxes the server hosts, restored from a
@@ -506,6 +562,28 @@ class WsCollabService:
 
     def _meet_profile_path(self) -> Path:
         return Path(str(self.meet_browser_settings.get("profile_path") or DEFAULT_PROFILE)).expanduser()
+
+    def _captioner_profile_path(self) -> Path:
+        resolved = (Path(self.config.state_dir) / "chrome_captioner").resolve()
+        if resolved == self._meet_profile_path().resolve():
+            raise ValidationError(
+                "captioner profile must be distinct from the Google Meet profile"
+            )
+        return resolved
+
+    def _captioner_browser_path(self) -> str:
+        try:
+            return find_browser(None)
+        except SystemExit as error:
+            raise RuntimeError(str(error)) from error
+
+    def set_captioner_route_prefix(self, route_prefix: str) -> None:
+        """Keep the supervisor URL aligned with the router's mounted prefix."""
+
+        self.captioner_supervisor.page_url = (
+            f"http://127.0.0.1:{self.config.http_port}"
+            f"{normalize_route_prefix(route_prefix)}/captioner/"
+        )
 
     def _meet_profile_state(self, profile_path: Path | None = None) -> dict[str, Any]:
         return self.meet_browser_settings.get_profile_state(profile_path or self._meet_profile_path())
@@ -1693,6 +1771,15 @@ class WsCollabService:
             raise ConflictError("Continue is not the active silence action")
         if effective.get("mode") != "reactive":
             raise ConflictError("Continue cannot use the interval trigger")
+        local_floor = self.local_mic_floor_guard()
+        if local_floor["blocked"]:
+            return {
+                **self.meeting_floor_status(key),
+                "accepted": False,
+                "deferred": True,
+                "reason": local_floor["reason"],
+                "localMicFloor": local_floor,
+            }
         with self._meeting_floor_lock:
             previous = self._meeting_floor_status.get(key, {})
             if previous.get("lastEventKey") == edge:
@@ -2139,11 +2226,11 @@ class WsCollabService:
             "adapters": list(MEET_ROOM_ADAPTERS),
             "roleStates": role_states,
             "activeMeeting": active,
-            "autostartMeeting": next(
+            "defaultOnBridgeStartMeeting": next(
                 (
                     url
                     for url in sorted(policies)
-                    if policies[url].get("autostart") is True
+                    if policies[url].get("default_on_bridge_start") is True
                 ),
                 None,
             ),
@@ -2157,6 +2244,8 @@ class WsCollabService:
         unknown = set(payload) - {
             "room_adapter",
             "roles",
+            "default_on_bridge_start",
+            # Accepted as a compatibility alias for older API clients.
             "autostart",
             "reconnect_after_disconnect",
         }
@@ -2182,10 +2271,17 @@ class WsCollabService:
                 "kind": kind,
                 "id": str(adapter.get("id") or kind).strip() or kind,
             }
-        if "autostart" in payload:
-            if type(payload["autostart"]) is not bool:
-                raise ValidationError("autostart must be a boolean")
-            patch["autostart"] = payload["autostart"]
+        default_field = (
+            "default_on_bridge_start"
+            if "default_on_bridge_start" in payload
+            else "autostart" if "autostart" in payload else None
+        )
+        if default_field:
+            if type(payload[default_field]) is not bool:
+                raise ValidationError(
+                    "default_on_bridge_start must be a boolean"
+                )
+            patch["default_on_bridge_start"] = payload[default_field]
         if "reconnect_after_disconnect" in payload:
             if type(payload["reconnect_after_disconnect"]) is not bool:
                 raise ValidationError("reconnect_after_disconnect must be a boolean")
@@ -2600,7 +2696,7 @@ class WsCollabService:
                 if (normalized := self._normal_meet_url(value))
             }
             target = (
-                select_startup_meeting(
+                select_bridge_start_meeting(
                     None,
                     False,
                     self.meet_browser_settings.list_meeting_routing(profile_path),
@@ -2830,6 +2926,9 @@ class WsCollabService:
     async def _play_tts_route(self, item: Any) -> float:
         if item.destination != "companion":
             raise RuntimeError(f"unsupported TTS destination: {item.destination}")
+        if self.local_mic_floor_guard()["blocked"]:
+            item.cancelled = True
+            return 0.0
         payload = {
             "destination": "companion",
             "meeting_url": item.meeting_url,
@@ -3946,11 +4045,26 @@ class WsCollabService:
 
     # ------------------------------------------------------------- capabilities
     def health(self) -> dict[str, Any]:
+        floor = self.local_mic_floor.status()
         return {
             "status": "ok",
             "version": __version__,
             "server_time": utc_now_iso(),
             "uptime_seconds": round(time.time() - self.started_at, 1),
+            "local_mic_floor": {
+                key: floor[key]
+                for key in (
+                    "source",
+                    "source_id",
+                    "input_scope",
+                    "available",
+                    "state",
+                    "blocked",
+                    "hangover_ms",
+                    "stale_after_ms",
+                    "age_ms",
+                )
+            },
         }
 
     def capabilities(
@@ -3976,6 +4090,15 @@ class WsCollabService:
                 "conditional_requests": True,
                 "websocket_resume": True,
                 "three_stt_engines": len(self.stt_engines),
+                "stt_engine_policy": {
+                    "disabled_by_chrome_captions_policy": self.captioner.settings.get()[
+                        "disable_other_stts"
+                    ],
+                    "configured_engines": [
+                        engine.name for engine in self.stt_engines
+                    ],
+                },
+                "browser_captioner": self.captioner_config(),
                 "disambiguator": getattr(self.disambiguator, "method_name", "deterministic"),
                 "echo_policy": self.config.echo_policy,
                 "voice_policy": self.config.tts_policy,
@@ -4937,6 +5060,589 @@ class WsCollabService:
         alerts = self.workers.evaluate()
         return {"alerts": alerts, "workers": self.workers.list_workers()}
 
+    # ----------------------------------------------------- browser captioner
+    def _sync_caption_source_legacy(self) -> None:
+        policy = self.caption_sources.get()
+        sources = {row["id"]: row for row in policy["sources"]}
+        self.captioner.settings.update(
+            {
+                "enabled": sources["browser_captioner"]["enabled"],
+                "disable_google_meet": not sources["google_meet"]["enabled"],
+                "prefer_over_google_meet": (
+                    policy["primary_source_id"] == "browser_captioner"
+                ),
+            }
+        )
+
+    def caption_source_policy(self) -> dict[str, Any]:
+        return self.caption_sources.get()
+
+    def caption_source_action(
+        self, source_id: str, action: str
+    ) -> dict[str, Any]:
+        result = self.caption_sources.action(source_id, action)
+        self._sync_caption_source_legacy()
+        self._audit_sink(
+            {
+                "type": "CAPTION_SOURCE_POLICY_CHANGED",
+                "source_id": result["source_id"],
+                "action": result["action"],
+                "changed": result["changed"],
+                "policy": result["policy"],
+            }
+        )
+        return result
+
+    def captioner_instances(self) -> dict[str, Any]:
+        return self.captioner.instances.list()
+
+    def captioner_instance_action(
+        self, instance_id: str, action: str
+    ) -> dict[str, Any]:
+        result = self.captioner.instances.action(instance_id, action)
+        self._audit_sink(
+            {
+                "type": "CAPTIONER_INSTANCE_POLICY_CHANGED",
+                "instance_id": result["instance_id"],
+                "action": result["action"],
+                "changed": result["changed"],
+                "selected_instance_id": result["registry"][
+                    "selected_instance_id"
+                ],
+                "selection_mode": result["registry"]["selection_mode"],
+            }
+        )
+        return result
+
+    def captioner_config(self) -> dict[str, Any]:
+        return {
+            **self.captioner.settings.get(),
+            "id": CAPTIONER_ID,
+            "display_name": CAPTIONER_DISPLAY_NAME,
+            "model": CAPTIONER_MODEL,
+            "push_driven": True,
+            "cloud_processing": True,
+            "privacy_disclosure": CAPTIONER_CLOUD_DISCLOSURE,
+            "profile_disclosure": CAPTIONER_PROFILE_DISCLOSURE,
+            "profile_path": str(self._captioner_profile_path()),
+            "cdp_endpoint": self.captioner_supervisor.cdp_endpoint,
+            "meet_caption_suppressions": dict(self._meet_caption_suppression_counts),
+            "source_priority_summary": self._captioner_source_priority_summary(),
+            "caption_source_policy": self.caption_source_policy(),
+            "instance_registry": self.captioner_instances(),
+        }
+
+    def _captioner_source_priority_summary(self) -> str:
+        settings = self.captioner.settings.get()
+        primary = self.caption_sources.primary()
+        return "; ".join(
+            [
+                (
+                    "Chrome Captions primary: suppress safe recent Meet duplicates"
+                    if primary == "browser_captioner"
+                    else "Google Meet primary: suppress Chrome publication"
+                    if primary == "google_meet"
+                    else "no enabled primary caption source"
+                ),
+                (
+                    "Google Meet publication disabled"
+                    if settings["disable_google_meet"]
+                    else "Google Meet publication enabled"
+                ),
+                (
+                    "other audio STTs bypassed"
+                    if settings["disable_other_stts"]
+                    else "other audio STTs enabled"
+                ),
+            ]
+        )
+
+    def set_captioner_config(self, values: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            key: values[key]
+            for key in (
+                "enabled",
+                "language",
+                "send_interims",
+                "prefer_over_google_meet",
+                "disable_google_meet",
+                "disable_other_stts",
+            )
+            if key in values
+        }
+        unknown = set(values) - {
+            "enabled",
+            "language",
+            "send_interims",
+            "prefer_over_google_meet",
+            "disable_google_meet",
+            "disable_other_stts",
+        }
+        if unknown:
+            raise ValidationError(
+                "unknown captioner config field", details={"fields": sorted(unknown)}
+            )
+        self.caption_sources.apply_legacy(allowed)
+        self._sync_caption_source_legacy()
+        non_policy = {
+            key: value
+            for key, value in allowed.items()
+            if key not in {
+                "enabled",
+                "disable_google_meet",
+                "prefer_over_google_meet",
+            }
+        }
+        if non_policy:
+            self.captioner.settings.update(non_policy)
+        return self.captioner_config()
+
+    def pause_captioner(self) -> dict[str, Any]:
+        self.captioner.settings.update({"paused": True})
+        return self.captioner.status()
+
+    def resume_captioner(self) -> dict[str, Any]:
+        self.captioner.settings.update({"paused": False})
+        return self.captioner.status()
+
+    def captioner_control(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Restricted page-token controls; never grants general worker access."""
+
+        if not isinstance(body, dict):
+            raise ValidationError("captioner control must be an object")
+        allowed = {"action", "session_id", "instance_id", "boot_id", "config"}
+        unknown = set(body) - allowed
+        if unknown:
+            raise ValidationError(
+                "captioner control contains unsupported fields",
+                details={"fields": sorted(unknown)},
+            )
+        if body.get("boot_id") != self.boot_id:
+            raise AuthorizationError("captioner control page boot identity is stale")
+        authority = self.captioner.instances.authority(
+            body.get("instance_id"), body.get("session_id")
+        )
+        if not authority["selected"]:
+            raise AuthorizationError(
+                "only the backend-selected captioner instance may control the page",
+                details={"reason": authority["reason"]},
+            )
+        action = str(body.get("action") or "").strip().lower()
+        if action == "pause":
+            return self.pause_captioner()
+        if action == "resume":
+            return self.resume_captioner()
+        if action == "configure":
+            values = body.get("config")
+            if not isinstance(values, dict):
+                raise ValidationError("captioner control config must be an object")
+            internal_allowed = {"language", "send_interims"}
+            forbidden = set(values) - internal_allowed
+            if forbidden:
+                raise ValidationError(
+                    "captioner page cannot change operator policy settings",
+                    details={"fields": sorted(forbidden)},
+                )
+            return {"config": self.set_captioner_config(values)}
+        raise ValidationError(
+            "unknown captioner control action",
+            details={"allowed": ["pause", "resume", "configure"]},
+        )
+
+    def open_captioner(self, *, foreground: bool = False) -> dict[str, Any]:
+        return self.captioner_supervisor.run_cycle(foreground=foreground, force=True)
+
+    def captioner_status(self) -> dict[str, Any]:
+        return {
+            **self.captioner.status(),
+            "profile_disclosure": CAPTIONER_PROFILE_DISCLOSURE,
+            "meet_caption_suppressions": dict(self._meet_caption_suppression_counts),
+            "recent_browser_finals": len(self._recent_captioner_finals),
+            "local_mic_floor": self.local_mic_floor.status(),
+            "source_priority_summary": self._captioner_source_priority_summary(),
+            "source_lanes": {
+                "local_microphone": {
+                    "implemented": True,
+                    "input_scope": "microphone",
+                    "acquires_local_mic_floor": True,
+                },
+                "browser_tab_audio": {
+                    "implemented": False,
+                    "input_scope": "browser_tab",
+                    "acquires_local_mic_floor": False,
+                },
+            },
+        }
+
+    def ingest_captioner(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self.captioner.ingest(body)
+
+    def captioner_heartbeat(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self.captioner.heartbeat(body)
+
+    def local_mic_floor_guard(self) -> dict[str, Any]:
+        floor = self.local_mic_floor.status()
+        return {
+            **floor,
+            "reason": (
+                "local-mic-floor-active"
+                if floor["state"] == "speech"
+                else "local-mic-floor-hangover"
+                if floor["state"] == "hangover"
+                else None
+            ),
+        }
+
+    def captioner_vad_transition(self, body: dict[str, Any]) -> dict[str, Any]:
+        transition = self.captioner.authenticate_vad_transition(body)
+        result = self.local_mic_floor.apply(transition)
+        cancellation = {
+            "cancelled": False,
+            "utterance_id": None,
+            "backchannel_cancelled": False,
+        }
+        if result.get("accepted") and result.get("acquired"):
+            cancellation.update(self.tts.cancel_current_conversational())
+            companion = self._refresh_companion_tts_status(timeout=0.05)
+            current = companion.get("current") if isinstance(companion, dict) else None
+            if (
+                isinstance(current, dict)
+                and current.get("kind") == "interject"
+                and current.get("id")
+            ):
+                self._cancel_companion_tts(str(current["id"]))
+                cancellation["backchannel_cancelled"] = True
+            self.publish(
+                stream=STREAM_AUDIT,
+                type="LOCAL_MIC_FLOOR_ACQUIRED",
+                data={
+                    "source": transition["source"],
+                    "source_id": transition["source_id"],
+                    "input_scope": transition["input_scope"],
+                    "session_id": transition["session_id"],
+                    "instance_id": transition["instance_id"],
+                    "epoch": transition["epoch"],
+                    "seq": transition["seq"],
+                    "at": transition["at"],
+                    "tts_cancelled": bool(cancellation.get("cancelled")),
+                    "backchannel_cancelled": cancellation["backchannel_cancelled"],
+                    "cancelled_utterance_id": cancellation.get("utterance_id"),
+                },
+                source_id="browser-captioner",
+                source_kind="system",
+                idempotency_key=(
+                    f"local-mic-floor:{transition['session_id']}:"
+                    f"{transition['instance_id']}:{transition['epoch']}:"
+                    f"{transition['seq']}"
+                ),
+            )
+        return {**result, "cancellation": cancellation, "boot_id": self.boot_id}
+
+    def _publish_captioner_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        from .stt.base import normalize_text
+
+        if (
+            not self.caption_sources.enabled("browser_captioner")
+            or self.caption_sources.primary() == "google_meet"
+        ):
+            reason = (
+                "browser_captioner_disabled"
+                if not self.caption_sources.enabled("browser_captioner")
+                else "primary_google_meet"
+            )
+            return self._audit_suppressed_captioner_item(item, reason)
+
+        finalization_key = (
+            f"captioner-final:{item['session_id']}:{item['seq']}:"
+            f"{item['utterance_id']}:{item['revision']}"
+        )
+        correlation_id = (
+            f"browser-captioner:{item['session_id']}:{item['utterance_id']}"
+        )
+        hypothesis = Hypothesis(
+            engine=CAPTIONER_ID,
+            model=CAPTIONER_MODEL,
+            raw_text=item["text"],
+            normalized_text=normalize_text(item["text"]),
+            confidence=item["confidence"],
+            language=item["language"],
+            is_final=item["is_final"],
+        )
+        provenance = {
+            "external": True,
+            "provenance": CAPTIONER_PROVENANCE,
+            "cloud_processing": True,
+            "session_id": item["session_id"],
+            "utterance_id": item["utterance_id"],
+            "caption_seq": item["seq"],
+            "revision": item["revision"],
+            "started_at": item["started_at"],
+            "result_at": item["result_at"],
+            "speech_started_at": item["speech_started_at"],
+            "speech_ended_at": item["speech_ended_at"],
+            "silence_before_ms": item["silence_before_ms"],
+            "pauses": item["pauses"],
+        }
+        published = self.publish(
+            stream=STREAM_STT_TRANSCRIPTS,
+            type=STT_FINAL_RESULT if item["is_final"] else STT_PARTIAL_RESULT,
+            data={**hypothesis.public(), **provenance},
+            source_id=CAPTIONER_ID,
+            source_kind="system",
+            correlation_id=correlation_id,
+            idempotency_key=(
+                f"captioner:{item['session_id']}:{item['seq']}:"
+                f"{item['utterance_id']}:{item['revision']}:{int(item['is_final'])}"
+            ),
+        )
+        if not item["is_final"]:
+            return published
+        segment = AudioSegment(
+            correlation_id=correlation_id,
+            id=str(uuid.uuid5(uuid.NAMESPACE_URL, finalization_key)),
+            reference_text=item["text"],
+            source_kind="client",
+            device_id="browser-microphone",
+            started_at=item["started_at"],
+            route={
+                "source": CAPTIONER_ID,
+                "audio_source": CAPTIONER_PROVENANCE,
+                "external": True,
+                "cloud_processing": True,
+                "session_id": item["session_id"],
+                "utterance_id": item["utterance_id"],
+                "caption_seq": item["seq"],
+                "revision": item["revision"],
+            },
+        )
+        result = self._finalize(
+            segment,
+            [hypothesis],
+            idempotency_prefix=finalization_key,
+        )
+        self._remember_captioner_final(item, correlation_id, hypothesis.normalized_text)
+        return result
+
+    def _audit_suppressed_captioner_item(
+        self, item: dict[str, Any], reason: str
+    ) -> dict[str, Any]:
+        import hashlib
+
+        diagnostic = self.publish(
+            stream=STREAM_AUDIT,
+            type="BROWSER_CAPTION_SUPPRESSED",
+            data={
+                "reason": reason,
+                "source": "browser_captioner",
+                "session_id": item.get("session_id"),
+                "instance_id": item.get("instance_id"),
+                "utterance_id": item.get("utterance_id"),
+                "caption_seq": item.get("seq"),
+                "revision": item.get("revision"),
+                "final": item.get("is_final"),
+                "text_sha256": hashlib.sha256(
+                    str(item.get("text") or "").encode("utf-8")
+                ).hexdigest(),
+            },
+            source_id="caption-policy",
+            source_kind="system",
+            correlation_id=(
+                f"browser-captioner:{item.get('session_id')}:{item.get('utterance_id')}"
+            ),
+            idempotency_key=(
+                f"captioner:{item.get('session_id')}:{item.get('seq')}:"
+                f"{item.get('utterance_id')}:{item.get('revision')}:"
+                f"{int(bool(item.get('is_final')))}:suppressed:{reason}"
+            ),
+        )
+        if not diagnostic["duplicate"] and hasattr(
+            self, "_meet_caption_suppression_counts"
+        ):
+            key = (
+                "primary_google_meet"
+                if reason == "primary_google_meet"
+                else "instance_policy"
+            )
+            self._meet_caption_suppression_counts[key] += 1
+        return {
+            "accepted": True,
+            "acknowledged": True,
+            "suppressed": True,
+            "reason": reason,
+            "duplicate": diagnostic["duplicate"],
+            "id": diagnostic["id"],
+        }
+
+    def _remember_captioner_final(
+        self, item: dict[str, Any], correlation_id: str, normalized_text: str
+    ) -> None:
+        self._recent_captioner_finals.append(
+            {
+                "normalized_text": normalized_text,
+                "received_at": time.time(),
+                "correlation_id": correlation_id,
+                "utterance_id": item["utterance_id"],
+            }
+        )
+
+    @staticmethod
+    def _safe_caption_overlap(left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        shorter, longer = sorted((left, right), key=len)
+        return (
+            len(shorter) >= 16
+            and len(shorter.split()) >= 3
+            and len(shorter) / len(longer) >= 0.65
+            and shorter in longer
+        )
+
+    def _recent_browser_caption_match(
+        self,
+        normalized_text: str,
+        *,
+        window_seconds: float = RECENT_FINAL_WINDOW_SECONDS,
+    ) -> dict[str, Any] | None:
+        cutoff = time.time() - window_seconds
+        while (
+            self._recent_captioner_finals
+            and float(self._recent_captioner_finals[0]["received_at"]) < cutoff
+        ):
+            self._recent_captioner_finals.popleft()
+        for record in reversed(self._recent_captioner_finals):
+            if float(record["received_at"]) < cutoff:
+                continue
+            if self._safe_caption_overlap(
+                normalized_text, str(record["normalized_text"])
+            ):
+                return record
+        return None
+
+    def _suppress_meeting_caption(
+        self,
+        *,
+        reason: str,
+        expected_key: str,
+        metadata: dict[str, Any],
+        correlation_id: str | None,
+        preferred: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        import hashlib
+
+        diagnostic = self.publish(
+            stream=STREAM_AUDIT,
+            type="MEET_CAPTION_SUPPRESSED",
+            data={
+                "reason": reason,
+                "source": "google_meet_caption",
+                "meeting_url": metadata["meeting_url"],
+                "key": metadata["key"],
+                "revision": metadata["revision"],
+                "final": metadata["final"],
+                "speaker": metadata["speaker"],
+                "text_sha256": hashlib.sha256(
+                    str(metadata.pop("_normalized_text")).encode("utf-8")
+                ).hexdigest(),
+                "preferred_correlation_id": (
+                    preferred.get("correlation_id") if preferred else None
+                ),
+                "preferred_utterance_id": (
+                    preferred.get("utterance_id") if preferred else None
+                ),
+            },
+            source_id="caption-policy",
+            source_kind="system",
+            correlation_id=correlation_id,
+            idempotency_key=f"{expected_key}:suppressed:{reason}",
+        )
+        if not diagnostic["duplicate"]:
+            self._meet_caption_suppression_counts[reason] += 1
+        return {
+            "accepted": True,
+            "acknowledged": True,
+            "suppressed": True,
+            "reason": reason,
+            "duplicate": diagnostic["duplicate"],
+            "id": diagnostic["id"],
+        }
+
+    def ingest_meeting_caption(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Persist a Meet caption as conversation context, never microphone STT."""
+
+        from .stt.base import normalize_text
+
+        if not isinstance(body, dict):
+            raise ValidationError("meeting caption must be an object")
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValidationError("meeting caption text is required")
+        if len(text) > 4000:
+            raise ValidationError("meeting caption text exceeds the maximum length")
+        key = str(body.get("key") or "").strip()
+        if not key or len(key) > 256:
+            raise ValidationError("meeting caption key is required and must be bounded")
+        speaker = str(body.get("speaker") or "Unknown").strip()[:200]
+        role = str(body.get("role") or "host").strip()[:40]
+        meeting_url = str(body.get("meeting_url") or "").strip()[:2048]
+        final = body.get("final")
+        if not isinstance(final, bool):
+            raise ValidationError("meeting caption final must be a boolean")
+        revision = str(body.get("revision") or "1").strip()
+        if not revision or len(revision) > 128:
+            raise ValidationError("meeting caption revision is required and must be bounded")
+        metadata = {
+            "source": "google_meet_caption",
+            "provenance": "google_meet_live_captions",
+            "speaker": speaker,
+            "role": role,
+            "meeting_url": meeting_url,
+            "key": key,
+            "revision": revision,
+            "final": final,
+            "replaces": str(body.get("replaces") or "")[:256] or None,
+            "duplicate_of": str(body.get("duplicate_of") or "")[:256] or None,
+        }
+        idempotency_key = str(body.get("idempotency_key") or "").strip()
+        expected_key = f"meet-caption:{meeting_url}:{key}:{revision}:{int(final)}"
+        if idempotency_key and len(idempotency_key) > 1024:
+            raise ValidationError("meeting caption idempotency_key is too long")
+        if idempotency_key and idempotency_key != expected_key:
+            raise ValidationError(
+                "meeting caption idempotency_key must match its canonical caption identity"
+            )
+        correlation_id = str(body.get("correlation_id") or "") or None
+        if not self.caption_sources.enabled("google_meet"):
+            metadata["_normalized_text"] = normalize_text(text)
+            return self._suppress_meeting_caption(
+                reason="google_meet_disabled",
+                expected_key=expected_key,
+                metadata=metadata,
+                correlation_id=correlation_id,
+            )
+        preferred = None
+        if final and self.caption_sources.primary() == "browser_captioner":
+            normalized_text = normalize_text(text)
+            preferred = self._recent_browser_caption_match(normalized_text)
+            if preferred is not None:
+                metadata["_normalized_text"] = normalized_text
+                return self._suppress_meeting_caption(
+                    reason="preferred_browser_captioner",
+                    expected_key=expected_key,
+                    metadata=metadata,
+                    correlation_id=correlation_id,
+                    preferred=preferred,
+                )
+        return self.add_conversation(
+            f"{speaker}: {text.strip()}",
+            source_id="google_meet_caption",
+            source_kind="worker",
+            correlation_id=correlation_id,
+            idempotency_key=expected_key,
+            data=metadata,
+        )
+
     def _announce(self, worker_id: str, message: str) -> None:
         # Route unresponsive-worker announcements through the TTS queue at high priority.
         try:
@@ -4948,11 +5654,17 @@ class WsCollabService:
 
     # -------------------------------------------------------------- speech in
     def _stt_engines_for_segment(self, segment: AudioSegment) -> list[Any]:
-        if (segment.route or {}).get("audio_source") != "companion_heard_meeting_audio":
+        excluded = {
+            str(name).lower().replace("-", "_")
+            for name in ((segment.route or {}).get("exclude_engines") or [])
+        }
+        if not excluded:
             return self.stt_engines
         return [
-            engine for engine in self.stt_engines
-            if not str(getattr(engine, "name", "")).lower().replace("-", "_").startswith("google_meet")
+            engine
+            for engine in self.stt_engines
+            if str(getattr(engine, "name", "")).lower().replace("-", "_")
+            not in excluded
         ]
 
     async def process_segment(self, segment: AudioSegment) -> dict[str, Any]:
@@ -4969,6 +5681,11 @@ class WsCollabService:
             )
 
         engines = self._stt_engines_for_segment(segment)
+        if self.captioner.settings.get()["disable_other_stts"]:
+            return self._record_stt_policy_skip(
+                segment,
+                engines=[str(getattr(engine, "name", "")) for engine in engines],
+            )
         hypotheses = await run_stt(
             engines,
             segment,
@@ -4988,7 +5705,38 @@ class WsCollabService:
 
         return self._finalize(segment, hypotheses)
 
-    def _finalize(self, segment: AudioSegment, hypotheses: list[Hypothesis]) -> dict[str, Any]:
+    def _record_stt_policy_skip(
+        self, segment: AudioSegment, *, engines: list[str]
+    ) -> dict[str, Any]:
+        event = self.publish(
+            stream=STREAM_DIAGNOSTICS,
+            type="STT_SEGMENT_SKIPPED",
+            data={
+                "segment_id": segment.id,
+                "segment_source": (segment.route or {}).get("audio_source"),
+                "reason": "disabled_by_chrome_captions_policy",
+                "configured_engines": engines,
+            },
+            source_id="caption-policy",
+            source_kind="system",
+            correlation_id=segment.correlation_id,
+        )
+        return {
+            "correlation_id": segment.correlation_id,
+            "segment_id": segment.id,
+            "skipped": True,
+            "reason": "disabled_by_chrome_captions_policy",
+            "diagnostic_event_id": event["id"],
+            "hypotheses": [],
+        }
+
+    def _finalize(
+        self,
+        segment: AudioSegment,
+        hypotheses: list[Hypothesis],
+        *,
+        idempotency_prefix: str | None = None,
+    ) -> dict[str, Any]:
         """Resolve hypotheses, classify the source, handle echo, emit HEARD_SPEECH.
 
         Shared by the live capture pipeline and the external-recognizer ingest
@@ -5003,6 +5751,9 @@ class WsCollabService:
             source_id="disambiguator",
             source_kind="system",
             correlation_id=segment.correlation_id,
+            idempotency_key=(
+                f"{idempotency_prefix}:resolved" if idempotency_prefix else None
+            ),
         )
 
         classification = self.classifier.classify(
@@ -5019,6 +5770,11 @@ class WsCollabService:
                 source_id="capture",
                 source_kind="system",
                 correlation_id=segment.correlation_id,
+                idempotency_key=(
+                    f"{idempotency_prefix}:echo-detected"
+                    if idempotency_prefix
+                    else None
+                ),
             )
             if expected:
                 report = accuracy_metrics.evaluate_pipeline(
@@ -5026,17 +5782,27 @@ class WsCollabService:
                     {h.engine: h.raw_text for h in hypotheses if not h.error},
                     resolved.resolved_text,
                 )
-                self.accuracy.add("final", report["final"], example={"expected": expected, "got": resolved.resolved_text})
-                for engine, metrics in report["per_engine"].items():
-                    self.accuracy.add(engine, metrics)
-                self.publish(
+                accuracy_event = self.publish(
                     stream=STREAM_TTS,
                     type=TTS_TRANSCRIPTION_EVALUATED,
                     data={"segment_id": segment.id, "tts_event_id": classification.matched_tts_event_id, **report},
                     source_id="accuracy",
                     source_kind="system",
                     correlation_id=segment.correlation_id,
+                    idempotency_key=(
+                        f"{idempotency_prefix}:accuracy"
+                        if idempotency_prefix
+                        else None
+                    ),
                 )
+                if not accuracy_event["duplicate"]:
+                    self.accuracy.add(
+                        "final",
+                        report["final"],
+                        example={"expected": expected, "got": resolved.resolved_text},
+                    )
+                    for engine, metrics in report["per_engine"].items():
+                        self.accuracy.add(engine, metrics)
             self.publish(
                 stream=STREAM_TRANSLATED_AUDIO,
                 type=TRANSCRIPT_FILTERED,
@@ -5044,6 +5810,11 @@ class WsCollabService:
                 source_id="classifier",
                 source_kind="system",
                 correlation_id=segment.correlation_id,
+                idempotency_key=(
+                    f"{idempotency_prefix}:filtered"
+                    if idempotency_prefix
+                    else None
+                ),
             )
 
         heard = self.publish(
@@ -5057,6 +5828,9 @@ class WsCollabService:
             source_id=(segment.route or {}).get("source") or segment.source_kind,
             source_kind=segment.source_kind if segment.source_kind in {"operator", "agent", "system", "client", "worker", "companion_heard"} else "unknown",
             correlation_id=segment.correlation_id,
+            idempotency_key=(
+                f"{idempotency_prefix}:heard" if idempotency_prefix else None
+            ),
         )
         return {
             "correlation_id": segment.correlation_id,
@@ -5099,6 +5873,20 @@ class WsCollabService:
         if not isinstance(text, str) or not text.strip():
             raise ValidationError("text is required for an external transcript")
         correlation_id = correlation_id or new_event_id()
+        configured_names = {
+            str(getattr(item, "name", "")).lower().replace("-", "_")
+            for item in self.stt_engines
+        }
+        if (
+            self.captioner.settings.get()["disable_other_stts"]
+            and engine.lower().replace("-", "_") in configured_names
+        ):
+            segment = AudioSegment(
+                correlation_id=correlation_id,
+                source_kind=source_kind,
+                device_id=device_id,
+            )
+            return self._record_stt_policy_skip(segment, engines=[engine])
         hypothesis = Hypothesis(
             engine=engine,
             model=f"external:{engine}",
@@ -5444,6 +6232,7 @@ class WsCollabService:
             volume=float(volume) * params.get("volume", 1.0),
             priority=1,
             dedupe=False,
+            artifact_source="voice-preview",
         )
 
     def _play_test_tone(self, device: Any) -> bool:
@@ -5488,6 +6277,7 @@ class WsCollabService:
         result = self.tts.speak(
             "device-test", text or f"Test sound for {device.name}.",
             voice_id=voice_id, device=device_id, priority=1, dedupe=False,
+            artifact_source="device-test",
         )
         return {"device_id": device_id, "device_name": device.name, "method": "tts", "tts": result}
 
@@ -5621,6 +6411,7 @@ class WsCollabService:
             "audio_enabled": cfg.audio_enabled,
             "echo_policy": cfg.echo_policy,
             "stt_engines": cfg.stt_engines,
+            "browser_captioner": self.captioner_config(),
             "tts_policy": cfg.tts_policy,
             "tts_output_destination": cfg.tts_output_destination,
             "companion_audio_queue_max": cfg.companion_audio_queue_max,
@@ -5791,6 +6582,7 @@ class WsCollabService:
             "workers": len(self.workers.list_workers()),
             "capture": self.capture.state(),
             "tts": self.tts.state(),
+            "local_mic_floor": self.local_mic_floor.status(),
             "devices": self.devices.generation,
             "warnings": self._warnings,
         }
@@ -5837,10 +6629,44 @@ class WsCollabService:
 
         # Recognition: degraded when any engine fell back to a double.
         degraded_engines = [w for w in self._warnings if "STT engine" in w]
+        captioner = self.captioner_status()
+        other_stts_disabled = bool(captioner.get("disable_other_stts"))
+        engine_states = {
+            engine.name: {
+                "configured": True,
+                "enabled": not other_stts_disabled,
+                "state": (
+                    "disabled_by_chrome_captions_policy"
+                    if other_stts_disabled
+                    else "enabled"
+                ),
+            }
+            for engine in self.stt_engines
+        }
+        captioner_degraded = (
+            captioner["enabled"]
+            and not captioner["paused"]
+            and captioner.get("health") != "ok"
+        )
         subsystems["stt"] = {
-            "state": "degraded" if degraded_engines else "ok",
+            "state": (
+                "disabled_by_chrome_captions_policy"
+                if other_stts_disabled
+                else "degraded"
+                if degraded_engines or captioner_degraded
+                else "ok"
+            ),
             "engines": [engine.name for engine in self.stt_engines],
-            "detail": degraded_engines or None,
+            "engine_states": engine_states,
+            "disabled_by_chrome_captions_policy": other_stts_disabled,
+            "push_sources": [CAPTIONER_ID],
+            "browser_captioner": captioner,
+            "detail": (
+                ["Configured audio STT engines disabled by Chrome Captions policy"]
+                if other_stts_disabled
+                else degraded_engines
+                or ([f"{CAPTIONER_ID}: {captioner['state']}"] if captioner_degraded else None)
+            ),
         }
 
         subsystems["tts"] = {
@@ -5946,8 +6772,16 @@ class WsCollabService:
         admin_control_entries = [
             item for item in all_route_entries if item.get("category") == "admin-control"
         ]
+        captioner_internal_entries = [
+            item
+            for item in all_route_entries
+            if item.get("category") == "Internal browser captioner"
+        ]
         rest_entries = [
-            item for item in all_route_entries if item.get("category") != "admin-control"
+            item
+            for item in all_route_entries
+            if item.get("category")
+            not in {"admin-control", "Internal browser captioner"}
         ]
         websocket_entry = entry(
             "WebSocket",
@@ -6052,6 +6886,11 @@ class WsCollabService:
                 "base": admin,
                 "endpoints": admin_control_entries,
             },
+            "internal_browser_captioner": {
+                "description": "Loopback-only scoped-token browser caption driver endpoints.",
+                "base": f"{base}/captioner",
+                "endpoints": captioner_internal_entries,
+            },
             "websocket": {
                 "description": "Public WebSocket transport.",
                 "endpoints": [websocket_entry],
@@ -6081,6 +6920,7 @@ class WsCollabService:
             "endpoints": [
                 *rest_entries,
                 *admin_control_entries,
+                *captioner_internal_entries,
                 websocket_entry,
                 *admin_entries,
                 *openapi_entries,
@@ -6102,6 +6942,9 @@ class WsCollabService:
         self._seed_voices()
         self._seed_workers()
         self._monitor_task = asyncio.create_task(self._monitor_loop())
+        self._captioner_task = asyncio.create_task(
+            self.captioner_supervisor.run(), name="browser-captioner-supervisor"
+        )
 
     async def shutdown(self) -> None:
         if self.secondary_capture.state()["listening"]:
@@ -6112,6 +6955,14 @@ class WsCollabService:
                 await self._monitor_task
             except asyncio.CancelledError:
                 pass
+        if self._captioner_task is not None:
+            self._captioner_task.cancel()
+            try:
+                await self._captioner_task
+            except asyncio.CancelledError:
+                pass
+            self._captioner_task = None
+        await asyncio.to_thread(self.captioner_supervisor.shutdown)
         await self.tts.stop()
         process = self._meet_bridge_process
         if process is not None and process.poll() is None:

@@ -164,7 +164,8 @@ def test_meet_routing_controls_are_scoped_accessible_and_truthful() -> None:
     assert 'table(["Who", "SSO", "State", "Mic", "Speakers", "Actions"]' in source
     assert 'table(["Who", "SSO", "State", "Meeting"' not in source
     assert '"HOST I/O room"' in source
-    assert '"Autostart"' in source
+    assert 'check("autostart", "Autostart")' not in source
+    assert "Manual-start resource; not in the current autostart set." in source
     assert '"Reconnect after unexpected disconnect"' in source
     assert "adapter.available" in source
     assert '" — not configured"' in source
@@ -172,6 +173,73 @@ def test_meet_routing_controls_are_scoped_accessible_and_truthful() -> None:
     assert '"Pending — Sync required"' in source
     assert '`${API_BASE}/meet/routing/sync`' in source
     assert 'actionButton("Copy meeting"' in source
+
+
+def test_captioner_copy_states_browser_runtime_requirements() -> None:
+    html = (Path(__file__).parents[1] / "src" / "ws_collab" / "admin" / "index.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Autostarts with WS_COLLAB" in html
+    assert "Browser tab required" in html
+    assert "May run in background/minimized" in html
+    assert "First run requires visible microphone permission" in html
+    assert "Chrome Web Speech may use Google cloud" in html
+    assert "manual-start chat/transcript resource" in html
+    assert "Isolated browser profile: no Google login is used or inherited." in html
+
+
+def test_chrome_captions_has_adjacent_nav_and_visible_source_priority() -> None:
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    source = _source()
+    nav = html.split('<div class="nav-group-title">Audio</div>', 1)[1].split(
+        '<div class="nav-item" data-page="silences"', 1
+    )[0]
+    assert nav.index('data-page="chrome-captions"') < nav.index('data-page="meet"')
+    assert '<span class="nav-label">Chrome Captions</span>' in nav
+    assert '<span class="nav-label">STT Engines</span>' in nav
+    assert '<section class="page" data-page="chrome-captions">' in html
+    chrome_page = html.split(
+        '<section class="page" data-page="chrome-captions">', 1
+    )[1].split('<section class="page" data-page="meet">', 1)[0]
+    assert "Caption source priority" in chrome_page
+    assert 'id="cc-settings-panel"' in chrome_page
+    assert 'id="cc-settings-panel" aria-labelledby="cc-settings-title">' in chrome_page
+    assert "Make Chrome Captions primary" in chrome_page
+    assert "Disable Chrome Captions" in chrome_page
+    assert "Disable Google Meet" in chrome_page
+    assert "Browser captioner instances" in chrome_page
+    assert 'id="cc-settings-cancel"' not in chrome_page
+    assert "Disable other STT(s)" in chrome_page
+    assert "conservative recent Meet duplicates" in chrome_page
+    assert "Separate policy: bypasses server audio STT engines" in chrome_page
+    meet_page = html.split('<section class="page" data-page="meet">', 1)[1]
+    assert "Make Google Meet primary" in meet_page
+    assert "Disable Google Meet" in meet_page
+    assert 'meetNav.hidden = meetDisabled;' not in source
+    assert 'meetPage.hidden = meetDisabled;' not in source
+    assert 'location.hash === "#meet"' not in source
+    assert 'document.querySelector(`.nav-item[data-page="${requested}"]`)' in source
+
+
+def test_captioner_live_events_have_one_dedicated_page_owner() -> None:
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    source = _source()
+    captioner_script = (
+        INDEX_HTML.parent.parent / "captioner" / "captioner.js"
+    ).read_text(encoding="utf-8")
+    assert html.count('id="cc-live-partial"') == 1
+    assert html.count('id="cc-live-log"') == 1
+    assert '$("cc-live-partial").textContent' in source
+    assert "appendChromeTranscriptEvent(event)" in source
+    assert "What has been said so far" in html
+    assert "reconcileChromeTranscript" in source
+    assert "/stt/transcripts?" in source
+    assert "collectFinalPages" in source
+    assert "clearViewCutoff" in source
+    assert "cc-jump-latest" in html
+    assert "SpeechRecognition" not in source
+    assert "new Recognition()" in captioner_script
 
 
 def test_async_routing_sync_preserves_newer_same_meeting_edits() -> None:

@@ -30,7 +30,7 @@ def test_calls_use_bearer_token(monkeypatch) -> None:
     assert captured["timeout"] == 3.0
 
 
-def test_final_caption_is_ingested_as_google_meet(monkeypatch) -> None:
+def test_final_caption_is_ingested_as_meeting_context(monkeypatch) -> None:
     client = MailboxClient(token="worker-token")
     captured = {}
 
@@ -40,19 +40,24 @@ def test_final_caption_is_ingested_as_google_meet(monkeypatch) -> None:
 
     monkeypatch.setattr(client, "_call", call)
 
-    result = client.ingest_transcript(
+    result = client.ingest_meeting_caption(
         "A complete Meet caption.",
         correlation_id="meet-caption:room:key",
-        source_kind="operator",
-        audio_meta={"speaker": "Douglas", "final": True},
+        metadata={
+            "speaker": "Douglas",
+            "role": "host",
+            "meetingUrl": "https://meet.google.com/abc-defg-hij",
+            "key": "host:key",
+            "final": True,
+        },
     )
 
     assert result == {"ok": True}
-    assert captured["path"] == "/stt/ingest"
+    assert captured["path"] == "/meet/captions/ingest"
     assert captured["method"] == "POST"
-    assert captured["body"]["engine"] == "google_meet"
     assert captured["body"]["text"] == "A complete Meet caption."
-    assert captured["body"]["is_final"] is True
+    assert captured["body"]["final"] is True
+    assert captured["body"]["speaker"] == "Douglas"
 
 
 def test_secondary_capture_start_uses_audio_endpoint(monkeypatch) -> None:

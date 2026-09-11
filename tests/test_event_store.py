@@ -77,6 +77,26 @@ def test_idempotency_key_suppresses_a_duplicate_write(store) -> None:
     assert _read_all(store) == [1], "the duplicate must not be stored twice"
 
 
+def test_idempotency_survives_rotation_and_restart(config) -> None:
+    store = make_event_store(
+        config, rotate_max_bytes=1, retention_max_files=5
+    )
+    first = store.append(_event(1, key="durable-key"))
+    assert store.append(_event(1, key="durable-key")).duplicate is True
+    store.close()
+
+    reopened = make_event_store(
+        config, rotate_max_bytes=1, retention_max_files=5
+    )
+    try:
+        duplicate = reopened.append(_event(1, key="durable-key"))
+        assert duplicate.duplicate is True
+        assert duplicate.event.id == first.event.id
+        assert _read_all(reopened) == [1]
+    finally:
+        reopened.close()
+
+
 # ---------------------------------------------------------------- cursor reads
 def test_cursor_pagination_is_bounded_and_resumable(store) -> None:
     for i in range(10):

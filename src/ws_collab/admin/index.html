@@ -93,9 +93,14 @@
     </div>
     <div class="nav-item" data-page="stt" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16"><path d="M8 2a2.5 2.5 0 00-2.5 2.5v4a2.5 2.5 0 005 0v-4A2.5 2.5 0 008 2z"/><path d="M3.5 8v.5a4.5 4.5 0 009 0V8M8 13v1.5"/></svg>
-      <span class="nav-label">STT Test</span>
+      <span class="nav-label">STT Engines</span>
     </div>
-    <div class="nav-item" data-page="meet" tabindex="0">
+    <div class="nav-item" data-page="chrome-captions" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M5 6.5h6M5 9.5h4"/></svg>
+      <span class="nav-label">Chrome Captions</span>
+      <span class="status-dot" id="cc-nav-dot" title="Chrome Captions status"></span>
+    </div>
+    <div class="nav-item" id="meet-nav-item" data-page="meet" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16"><rect x="1" y="4" width="9" height="8" rx="1.5"/><path d="M10 6.5l5-2.5v8l-5-2.5z"/></svg>
       <span class="nav-label">Google Meet</span>
       <span class="status-dot" id="meet-nav-dot" title="Bridge status"></span>
@@ -263,13 +268,113 @@
       </div>
     </section>
 
+    <!-- ------------------------------------------------------ chrome captions -->
+    <section class="page" data-page="chrome-captions">
+      <div class="toolbar">
+        <button class="primary" id="cc-refresh">Refresh</button>
+        <button id="cc-open">Open</button>
+        <button id="cc-focus">Foreground</button>
+        <button id="cc-pause">Pause</button>
+        <button id="cc-resume">Resume</button>
+        <label class="hint" for="cc-language">Language</label>
+        <input id="cc-language" value="en-US" maxlength="35" style="width:90px" />
+        <label class="hint" for="cc-send-interims">
+          <input type="checkbox" id="cc-send-interims" checked /> Send interims
+        </label>
+      </div>
+      <div class="panel-body">
+        <div class="panel">
+          <div class="panel-title">Chrome Captions status</div>
+          <div class="panel-content">
+            <div id="cc-status">Loading Chrome Captions status...</div>
+            <div id="cc-health" class="hint"></div>
+            <div id="cc-vad" class="hint">Local pause detector: waiting for heartbeat</div>
+            <div id="cc-input" class="hint">Input scope: microphone</div>
+            <div id="cc-floor" class="hint">Local microphone floor: unknown</div>
+            <div id="cc-profile" class="hint mono"></div>
+            <div id="cc-suppressions" class="hint"></div>
+            <div id="cc-policy-summary" class="hint"></div>
+            <div class="hint">Autostarts with WS_COLLAB · Browser tab required · May run in background/minimized · First run requires visible microphone permission</div>
+            <div class="hint">Chrome Web Speech may use Google cloud. It is not local or offline recognition. Pause detection separately analyzes microphone RMS in the browser; WS_COLLAB does not transmit or store those samples.</div>
+            <div class="hint"><strong>Input scope: microphone only.</strong> Other tabs are not captured directly. Speaker audio that leaks into the mic cannot be reliably identified; use headphones or separate virtual audio devices. Chrome Web Speech listens to the Chrome/OS default input.</div>
+            <div class="hint"><strong>Isolated browser profile: no Google login is used or inherited.</strong></div>
+          </div>
+        </div>
+        <div class="panel" id="cc-settings-panel" aria-labelledby="cc-settings-title">
+          <div class="panel-title" id="cc-settings-title">Caption source priority</div>
+          <div class="panel-content">
+            <div id="cc-source-policy-status" class="source-policy-status">Loading backend source policy…</div>
+            <div class="toolbar">
+              <button class="primary" id="cc-make-primary">Make Chrome Captions primary</button>
+              <button id="cc-toggle-source">Disable Chrome Captions</button>
+              <button id="cc-toggle-meet">Disable Google Meet</button>
+            </div>
+            <div class="hint">Chrome primary suppresses only conservative recent Meet duplicates. Meet primary suppresses Chrome from canonical publication while both raw source delivery records and suppression audit metadata remain durable.</div>
+            <label for="cc-disable-other-stts"><input type="checkbox" id="cc-disable-other-stts" /> Disable other STT(s)</label>
+            <div class="hint">Separate policy: bypasses server audio STT engines while enabled. It is not part of caption-source primary selection.</div>
+            <div class="toolbar">
+              <button id="cc-settings-save">Save other STT setting</button>
+              <span class="hint" id="cc-settings-status" role="status" aria-live="polite"></span>
+            </div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Browser captioner instances</div>
+          <div class="panel-content">
+            <div class="hint">The backend selects exactly one healthy tab. Pinned selection is retained while fresh; instance Disable lasts for that tab instance and resets when the tab reloads with a new instance ID.</div>
+            <div id="cc-instances">Waiting for browser instance heartbeats…</div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Live interim</div>
+          <div class="panel-content">
+            <div id="cc-live-partial" class="hint" style="min-height:1.4em;font-style:italic">Waiting for a caption...</div>
+          </div>
+        </div>
+        <div class="panel cc-transcript-panel">
+          <div class="panel-title cc-transcript-heading">
+            <span>What has been said so far</span>
+            <span id="cc-transcript-summary" class="hint">Loading finalized Chrome captions…</span>
+          </div>
+          <div class="panel-content">
+            <div class="cc-transcript-tools">
+              <button id="cc-clear-view" type="button">Clear view</button>
+              <button id="cc-jump-latest" type="button">Jump to latest</button>
+              <label class="hint" for="cc-autoscroll">
+                <input id="cc-autoscroll" type="checkbox" checked /> Autoscroll
+              </label>
+              <span id="cc-transcript-truncated" class="hint cc-truncated" hidden></span>
+            </div>
+            <div id="cc-live-log" class="transcript-flow" aria-live="polite">
+              <span class="transcript-empty">No finalized Chrome captions yet.</span>
+            </div>
+            <div class="hint cc-marker-help">
+              Solid blue markers are acoustic pauses measured locally from microphone RMS (position is best-effort because Chrome has no word timestamps); dashed ~ markers are approximate event-time gaps.
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- --------------------------------------------------------- google meet -->
     <section class="page" data-page="meet">
       <div class="toolbar">
         <button class="primary" id="meet-refresh">Refresh</button>
+        <button id="meet-start-bridge">Start bridge</button>
         <span class="mono hint" id="meet-status-line">checking…</span>
       </div>
       <div class="panel-body">
+        <div class="panel" id="meet-source-policy-card">
+          <div class="panel-title">Google Meet caption source</div>
+          <div class="panel-content">
+            <div id="meet-source-policy-status" class="source-policy-status">Loading backend source policy…</div>
+            <div class="toolbar">
+              <button class="primary" id="meet-make-primary">Make Google Meet primary</button>
+              <button id="meet-toggle-source">Disable Google Meet</button>
+            </div>
+            <div class="hint">Disabling is reversible and suppresses new canonical Meet captions without stopping the bridge, deleting meetings, or erasing configuration/history.</div>
+          </div>
+        </div>
         <div class="panel" id="meet-bridge-panel">
           <div class="panel-title">Bridge</div>
           <div class="panel-content" id="meet-bridge-card"></div>
@@ -295,10 +400,11 @@
               Driver and client meetings are shown in one list below. Use the kind filter to hide/show each type while keeping the per-meeting DRIVER/CLIENT badges for context.
             </div>
             <div class="hint" style="margin-bottom:8px">
-              The bridge keeps ONE host+companion pair present in a meeting at a time (the
-              "driver"); this is what the <span class="mono">google_meet</span> STT engine reads
-              from. Moving it to a different meeting leaves the old one — its captions stay
-              below, tagged with the meeting they came from.
+              The bridge keeps one host+companion pair present in a meeting at a time.
+              Meet captions are retained as meeting/chat context and never treated as local
+              microphone STT. Google Meet is a manual-start chat/transcript resource and is
+              not part of the current autostart set. Moving the bridge leaves the prior
+              transcript visible below.
             </div>
             <div class="toolbar">
               <input type="text" id="meet-join-url" placeholder="https://meet.google.com/xxx-yyyy-zzz — join a meeting you're invited to" style="flex:1" />
@@ -605,20 +711,12 @@
       <div class="panel-body"><div id="ac-body"></div></div>
     </section>
 
-    <!-- ---------------------------------------------------------- stt test -->
+    <!-- --------------------------------------------------- speech captioning -->
     <section class="page" data-page="stt">
       <div class="toolbar">
         <button class="primary" id="stt-refresh">Refresh</button>
-        <button id="stt-mic" title="Run a separate browser Web Speech microphone test; this does not use the Google Meet driver">🎤 Start browser Web Speech</button>
-        <select id="stt-mic-mode" title="Whether the recognizer is allowed to stop itself">
-          <option value="continuous" selected>Continuous (never stops itself; auto-restarts)</option>
-          <option value="single">Single utterance (stops itself when done)</option>
-        </select>
-        <label class="hint"><input type="checkbox" id="stt-send-partials" checked /> send partial hypotheses to server too</label>
-        <label class="hint"><input type="checkbox" id="stt-beep-enabled" checked /> 🔔 beep when done talking</label>
-        <span id="stt-speech-state" class="badge"></span>
-        <span class="hint" id="stt-mic-status"></span>
       </div>
+      <div class="hint">The browser_captioner is a push source. Use <a href="#chrome-captions">Chrome Captions</a> for its controls, health, and live output.</div>
       <div class="toolbar">
         <span class="hint">Server-side mic:</span>
         <span id="stt-sensitivity-indicator" class="badge">—</span>
@@ -633,19 +731,10 @@
       </div>
       <div class="panel-body stt-driver-panel">
         <div class="panel">
-          <div class="panel-title">Server STT drivers (server audio → configured drivers such as google_meet → disambiguator)</div>
+          <div class="panel-title">Speech sources (server audio engines and push-driven browser captioner)</div>
           <div class="panel-content">
             <div id="stt-engine-hint" class="hint">Waiting for server capabilities…</div>
             <div id="stt-engine-body"></div>
-          </div>
-        </div>
-      </div>
-      <div class="panel-body">
-        <div class="panel">
-          <div class="panel-title">Browser Web Speech (separate browser mic recognizer → server ingest as web_speech)</div>
-          <div class="panel-content">
-            <div id="stt-live-log"></div>
-            <div id="stt-live-partial" class="hint" style="min-height:1.4em;font-style:italic;margin-top:6px">Click "Start browser Web Speech" and speak…</div>
           </div>
         </div>
       </div>
@@ -738,6 +827,7 @@
 </div>
 
 <script src="silences.js"></script>
+<script src="transcript_runtime.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

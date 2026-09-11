@@ -131,6 +131,93 @@ enumerated at startup.
 | `remote_http` | Explicitly configured remote provider; `remote:https://host/path` |
 | `deterministic` | Hardware-free doubles used as the fallback and by tests |
 
+### Always-on browser captioner
+
+`browser_captioner` (`chrome-web-speech`) is a first-class push source, not a
+drop-in driver and not run once per `AudioSegment`. A supervised same-origin page
+at `/ws_collab/captioner/` exclusively owns microphone recognition, maintains a
+durable browser queue, and posts revisioned interim/final results with ACK-based
+retry. Superseded interims are bounded; unacknowledged finals are never evicted,
+and a full final queue stops recognition until delivery makes room. Web Locks,
+with an expiring local-storage lease fallback, ensure
+only one tab starts recognition; every page instance has a fresh UUID while queue
+sequence allocation remains durable. Finals use a crash-recoverable outbox and
+idempotent resolved/heard event keys so finalization completes exactly once.
+
+Manual Pause is durable and prevents watchdog restart until Resume. Enabled
+defaults to true, language to `en-US`, and interim delivery to true. Status
+reports the tab, recognizer, permission, listening state, heartbeat age, queue,
+last acknowledgement, and last final.
+
+The **Chrome Captions** admin page owns these controls, keeps interim text
+separate, and rebuilds its finalized transcript from the durable STT stream.
+The lease owner first acquires an explicit `getUserMedia` stream, then starts
+Chrome recognition. A local Web Audio analyser feeds 20ms RMS frames to an
+adaptive-noise-floor VAD with hysteresis. It reports every acoustic pause of at
+least 20ms, including multiple pauses inside one Chrome final. PCM/RMS frame
+samples are never posted or stored; only bounded scalar VAD health and validated
+pause metadata leave the page. On pause, restart, ownership loss, or shutdown,
+the page stops all media tracks, closes its `AudioContext`, and resets the VAD
+epoch before reacquiring.
+
+The page requests ideal mono input with echo cancellation and noise suppression
+enabled and auto gain disabled, then reports the bounded actual track label and
+actual `getSettings()` values. Raw `deviceId` is never transmitted. Its input
+scope is microphone only: browser-origin isolation prevents direct observation
+of other tabs, and RMS cannot identify speaker leakage as human vs website
+audio. Chrome Web Speech independently uses the Chrome/OS default input and
+cannot be bound to the `getUserMedia` stream; use headphones or separate virtual
+audio devices when acoustic isolation matters.
+
+Only owner-authenticated, ordered `browser_rms_vad` transitions—not PCM or RMS
+frames—acquire the `local_microphone` floor. Speech onset blocks new
+conversational TTS/backchannels and requests cancellation of cancellable active
+output. Speech end starts the configured 350ms hangover; another onset cancels
+release. Every queued conversational path checks the same guard again
+immediately before playback. A stale lane becomes unavailable/unknown and fails
+open rather than locking speech forever. Releasing the floor never enqueues
+speech. A reserved, unimplemented `browser_tab_audio` lane is explicitly unable
+to acquire this microphone floor.
+
+Small solid blue pause markers use these measured acoustic boundaries; lighter
+dashed markers prefixed with `~` are only approximate gaps of at least 300ms
+between legacy event timestamps. Chrome supplies no word timestamps, so internal
+marker placement uses a captured interim-text prefix and is explicitly
+best-effort; the displayed duration remains acoustically measured. **Clear
+view** is local and non-destructive; refreshing restores durable history.
+Its persistent **Caption source priority** panel stores three strict booleans: prefer it over recent
+duplicate Google Meet finals (default true), suppress new typed Meet caption
+publication (default false), and bypass other configured audio-segment STTs
+(default false). The last policy leaves capture/VAD active, emits an explicit
+text-free skipped diagnostic, and takes effect immediately without restart.
+Manual external ingest remains available unless it claims a configured engine.
+
+This is the only current WS_COLLAB autostart resource. Chrome Web Speech
+requires a live, normal browser page; it cannot run headless or solely in a
+service worker/offscreen document. It uses only the dedicated
+`chrome_captioner` user-data directory and CDP port
+`WS_COLLAB_CAPTIONER_CDP_PORT` (default 9224), never the Meet profile, account
+registry, cookies, or Google auth URLs. **Isolated browser profile: no Google
+login is used or inherited.** If the configured CDP/profile is already
+running, the supervisor opens or reuses exactly one captioner tab in the
+background where the browser API permits. If no configured browser exists, it
+launches a new visible Chrome window so the first microphone permission can be
+granted visibly. Once permission is granted, the tab may stay in the background
+or the window may be minimized, subject to Chrome and OS throttling. Periodic
+supervision does not foreground the tab; **Foreground** is an explicit operator
+action.
+
+On server shutdown the supervisor stops recognition and closes only its captioner
+tabs. A page also releases the microphone itself after a bounded heartbeat/auth
+outage, while allowing a short server-restart grace period.
+
+**Privacy:** Chrome Web Speech may transmit microphone audio to Google/cloud. It
+is not offline/local recognition. The independent RMS pause detector is local,
+and WS_COLLAB does not transmit or store its audio samples. This is a clean-room implementation inspired
+by concepts in
+[`MidCamp/live-captioning` at `893ebc75e9847dbb055963875822cf9b6afb94b8`](https://github.com/MidCamp/live-captioning/tree/893ebc75e9847dbb055963875822cf9b6afb94b8);
+no upstream GPL-3.0 code, assets, or styles were copied.
+
 The default engine set is `whisper:tiny.en, whisper:base.en, vosk` — two Whisper
 sizes plus a materially independent Kaldi-based recognizer, so their errors are
 uncorrelated and the disambiguator has something real to arbitrate.

@@ -196,6 +196,9 @@ class Config:
     stt_timeout_ms: int = 120000
     stt_concurrency: int = 3
     stt_allow_remote: bool = False
+    captioner_cdp_port: int = 9224
+    captioner_floor_hangover_ms: int = 350
+    captioner_floor_stale_ms: int = 15000
 
     # Disambiguator
     disambiguator: str = "deterministic"
@@ -373,6 +376,15 @@ class Config:
         cfg.stt_timeout_ms = _as_int(get("STT_TIMEOUT_MS"), cfg.stt_timeout_ms)
         cfg.stt_concurrency = _as_int(get("STT_CONCURRENCY"), cfg.stt_concurrency)
         cfg.stt_allow_remote = _as_bool(get("STT_ALLOW_REMOTE"), cfg.stt_allow_remote)
+        cfg.captioner_cdp_port = _as_int(
+            get("CAPTIONER_CDP_PORT"), cfg.captioner_cdp_port
+        )
+        cfg.captioner_floor_hangover_ms = _as_int(
+            get("CAPTIONER_FLOOR_HANGOVER_MS"), cfg.captioner_floor_hangover_ms
+        )
+        cfg.captioner_floor_stale_ms = _as_int(
+            get("CAPTIONER_FLOOR_STALE_MS"), cfg.captioner_floor_stale_ms
+        )
 
         cfg.disambiguator = get("DISAMBIGUATOR") or cfg.disambiguator
         cfg.disambiguator_llm_endpoint = get("DISAMBIGUATOR_LLM_ENDPOINT") or ""
@@ -425,6 +437,22 @@ class Config:
             self.warnings.append(
                 "fewer than three STT engines configured; parity of three independent "
                 "hypotheses is not guaranteed"
+            )
+        if not 1 <= self.captioner_cdp_port <= 65535:
+            raise ConfigurationError(
+                "WS_COLLAB_CAPTIONER_CDP_PORT must be between 1 and 65535"
+            )
+        if self.captioner_cdp_port in {self.http_port, self.https_port, 9222, 9223}:
+            raise ConfigurationError(
+                "WS_COLLAB_CAPTIONER_CDP_PORT must not conflict with an HTTP or Meet CDP port"
+            )
+        if not 0 <= self.captioner_floor_hangover_ms <= 10_000:
+            raise ConfigurationError(
+                "WS_COLLAB_CAPTIONER_FLOOR_HANGOVER_MS must be between 0 and 10000"
+            )
+        if not 500 <= self.captioner_floor_stale_ms <= 60_000:
+            raise ConfigurationError(
+                "WS_COLLAB_CAPTIONER_FLOOR_STALE_MS must be between 500 and 60000"
             )
 
         # Authentication policy. Disabled by default so local (loopback) use needs

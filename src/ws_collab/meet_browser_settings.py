@@ -36,13 +36,13 @@ def normalize_meeting_url(value: Any) -> str:
     return f"https://meet.google.com/{match.group(1).lower()}"
 
 
-def select_startup_meeting(
+def select_bridge_start_meeting(
     explicit_meet: str | None,
     create_new: bool,
     policies: dict[str, dict[str, Any]],
     forgotten: set[str] | None = None,
 ) -> str | None:
-    """Apply explicit launch precedence, then the deterministic autostart policy."""
+    """Choose a meeting only after an operator explicitly starts the bridge."""
 
     if explicit_meet or create_new:
         return explicit_meet
@@ -52,9 +52,20 @@ def select_startup_meeting(
         for key, policy in policies.items()
         if key not in tombstones
         and isinstance(policy, dict)
-        and policy.get("autostart") is True
+        and (
+            policy.get("default_on_bridge_start") is True
+            or (
+                "default_on_bridge_start" not in policy
+                and policy.get("autostart") is True
+            )
+        )
     )
     return eligible[0] if eligible else None
+
+
+# Compatibility for callers importing the pre-rename helper. The policy only
+# selects a default after an explicit bridge start; it never starts the bridge.
+select_startup_meeting = select_bridge_start_meeting
 
 
 COMPANION_CLICK_BUILTINS: dict[str, Any] = {
@@ -439,14 +450,14 @@ class MeetBrowserSettings:
     @staticmethod
     def default_meeting_routing(meeting_url: str) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
             "meeting_url": normalize_meeting_url(meeting_url),
             "room_adapter": {
                 "kind": "physical_computer",
                 "id": "physical_computer",
             },
             "roles": {},
-            "autostart": False,
+            "default_on_bridge_start": False,
             "reconnect_after_disconnect": False,
         }
 
@@ -459,7 +470,14 @@ class MeetBrowserSettings:
         saved = policies.get(key, {}) if isinstance(policies, dict) else {}
         result = self.default_meeting_routing(key)
         if isinstance(saved, dict):
-            result.update(json.loads(json.dumps(saved)))
+            saved_copy = json.loads(json.dumps(saved))
+            legacy_default = saved_copy.pop("autostart", None)
+            result.update(saved_copy)
+            if (
+                "default_on_bridge_start" not in saved_copy
+                and isinstance(legacy_default, bool)
+            ):
+                result["default_on_bridge_start"] = legacy_default
         result["meeting_url"] = key
         return result
 
@@ -483,7 +501,7 @@ class MeetBrowserSettings:
         meeting_url: str,
         patch: dict[str, Any],
     ) -> dict[str, Any]:
-        """Atomically update one policy and enforce the single-autostart invariant."""
+        """Atomically update one policy and enforce one bridge-start default."""
 
         if not isinstance(patch, dict):
             raise ValueError("meeting routing patch must be an object")
@@ -506,7 +524,18 @@ class MeetBrowserSettings:
             saved = policies.get(key)
             if isinstance(saved, dict):
                 current.update(saved)
+                if (
+                    "default_on_bridge_start" not in saved
+                    and isinstance(saved.get("autostart"), bool)
+                ):
+                    current["default_on_bridge_start"] = saved["autostart"]
             patch_copy = json.loads(json.dumps(patch))
+            legacy_default = patch_copy.pop("autostart", None)
+            if (
+                "default_on_bridge_start" not in patch_copy
+                and isinstance(legacy_default, bool)
+            ):
+                patch_copy["default_on_bridge_start"] = legacy_default
             role_patch = patch_copy.pop("roles", None)
             current.update(patch_copy)
             if role_patch is not None:
@@ -526,13 +555,13 @@ class MeetBrowserSettings:
                     role_value.update(value)
                     roles[role] = role_value
                 current["roles"] = roles
-            current["version"] = 1
+            current["version"] = 2
             current["meeting_url"] = key
-            if current.get("autostart") is True:
+            if current.get("default_on_bridge_start") is True:
                 for other_key, other in policies.items():
                     if other_key == key or not isinstance(other, dict):
                         continue
-                    other["autostart"] = False
+                    other["default_on_bridge_start"] = False
             policies[key] = current
             state[self._MEETING_ROUTING_KEY] = policies
             known = [
@@ -549,11 +578,11 @@ class MeetBrowserSettings:
         policies = self.list_meeting_routing(profile_key)
         return {
             "policy": policies[key],
-            "autostart_meeting": next(
+            "default_on_bridge_start_meeting": next(
                 (
                     url
                     for url in sorted(policies)
-                    if policies[url].get("autostart") is True
+                    if policies[url].get("default_on_bridge_start") is True
                 ),
                 None,
             ),

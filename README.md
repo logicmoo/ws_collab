@@ -40,6 +40,58 @@ TTS backend downloads models**.
    REST clients   WS clients ─────▶ admin workbench ─────────┘
 ```
 
+**Chrome Captions** is a separate push source, not an
+`AudioSegment` driver. Every loaded page at `/ws_collab/captioner/` registers a
+stable browser-session UUID and a per-load tab UUID. The backend selects exactly
+one fresh, enabled instance; only that page may acquire the Web Lock, microphone,
+RMS VAD, and Chrome Web Speech recognition. It pushes revisioned interim/final captions into
+the same transcript stream. Chrome may send microphone audio to Google/cloud;
+this source is not offline or local recognition. The same page separately uses
+Web Audio to measure 20ms-frame microphone RMS for acoustic pause detection.
+Those VAD samples stay in the browser and are neither transmitted nor stored by
+WS_COLLAB; only bounded pause/transition timestamps and status scalars are sent.
+Authenticated `speech_start`/`speech_end` transitions drive a source-scoped local
+microphone floor. Conversational TTS and companion backchannels re-check that
+floor immediately before playback, cancel cancellable active output on speech
+onset, and wait through a 350ms clear hangover. Missing VAD expires fail-open.
+Floor release never generates speech by itself.
+Google Meet captions remain
+meeting/chat context and do not participate in STT voting or `HEARD_SPEECH`.
+The captioner alone autostarts with WS_COLLAB. It requires a normal browser tab:
+the supervisor uses the dedicated `chrome_captioner` profile and its own CDP
+port (`WS_COLLAB_CAPTIONER_CDP_PORT`, default `9224`). It never reads, copies,
+or inherits a Meet SSO profile and never opens a Google login URL. **Isolated
+browser profile: no Google login is used or inherited.** When that profile is
+already available, the supervisor
+opens/reuses one background tab where CDP supports it; otherwise it launches a
+new visible Chrome window without headless mode. The first microphone permission
+grant must be visible. Afterward the tab may remain backgrounded or the window
+minimized, subject to Chrome/OS throttling. Use **Open** or **Foreground** on the
+dedicated **Chrome Captions** admin page when operator attention is needed.
+
+The canonical admin SPA is `/ws_collab/` (for example,
+`/ws_collab/#chrome-captions`; `/ws_collab/admin/` remains an alias). Its
+always-visible **Caption source priority** actions manage a durable generic
+registry for Chrome Captions and Google Meet. One enabled source is primary.
+Chrome primary suppresses only recent exact or conservative containment
+duplicates from typed Meet conversation publication. Meet primary acknowledges
+Chrome delivery as suppressed before canonical publication while retaining
+bounded raw final delivery state and hash-only audit metadata. Disabling either
+source is reversible and does not stop its bridge/profile or erase history.
+`Disable other STT(s)` remains separate and bypasses configured `AudioSegment` engines while capture/VAD and manual
+external ingest remain available.
+
+Input scope is microphone only. Other tabs are not captured directly, and RMS
+cannot distinguish a person from speaker audio leaking acoustically into the
+mic. Use headphones or separate virtual audio devices. Chrome Web Speech listens
+to the Chrome/OS default input and cannot accept the page's chosen
+`MediaStream`; no misleading microphone picker or source-separation claim is
+provided.
+
+Google Meet is a manual-start chat/transcript resource and is not in the current
+autostart set. Start or join it explicitly through the operator controls,
+`/join`, `/new`, or the bridge CLI.
+
 ## Quick start
 
 ```bash
@@ -101,6 +153,15 @@ credentials and authentication state are excluded.
   `*_disabled` (or delete it) to remove an engine.
 * **No worker keep-alive loops.** Native Codex/Copilot automation is the only
   approved recurring launcher; each activation runs one bounded monitoring cycle.
+
+## Acknowledgement
+
+The browser captioner is a clean-room implementation inspired by platform API
+and architecture concepts in
+[MidCamp/live-captioning at commit 893ebc75e9847dbb055963875822cf9b6afb94b8](https://github.com/MidCamp/live-captioning/tree/893ebc75e9847dbb055963875822cf9b6afb94b8).
+No upstream source code, assets, or styles were copied. The upstream project is
+GPL-3.0; this acknowledgement does not describe this implementation as a Chrome
+extension or as local/offline STT.
 
 ## Running the tests
 

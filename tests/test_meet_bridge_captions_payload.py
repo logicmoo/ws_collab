@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+
 from ws_collab.meet_bridge import cdp
 from ws_collab.meet_bridge.bridge import (
     CaptionEmitter,
+    CaptionRetryQueueFull,
     RecentCaptionDeduplicator,
     apply_caption_payload,
     cached_sso_accounts_status,
@@ -403,15 +407,19 @@ def test_cdp_tab_normalizes_empty_and_binary_frames_without_spurious_errors(monk
 
 
 class _FakeMailbox:
-    def __init__(self) -> None:
+    def __init__(self, failures: int = 0) -> None:
         self.sent: list[tuple[str, str, str, dict]] = []
-        self.ingested: list[tuple[str, str, str, dict]] = []
+        self.ingested: list[tuple[str, str, dict]] = []
+        self.failures = failures
 
     def send(self, recipient: str, line: str, *, sender: str, metadata: dict) -> None:
         self.sent.append((recipient, line, sender, metadata))
 
-    def ingest_transcript(self, text: str, *, correlation_id: str, source_kind: str, audio_meta: dict) -> None:
-        self.ingested.append((text, correlation_id, source_kind, audio_meta))
+    def ingest_meeting_caption(self, text: str, *, correlation_id: str, metadata: dict) -> None:
+        if self.failures:
+            self.failures -= 1
+            raise ConnectionError("server restarting")
+        self.ingested.append((text, correlation_id, metadata))
 
 
 def _emitter(holder: dict, status: dict, captions_log: list[dict], mailbox: _FakeMailbox) -> CaptionEmitter:
@@ -697,11 +705,200 @@ def test_duplicate_caption_from_second_role_skips_mailbox_and_stt_side_effects()
     emitter.emit("host", "row-1", "Alice", "Same sentence.", final=True)
     emitter.emit("companion", "row-1", "Alice", "  same   sentence.  ", final=True)
 
-    assert len(mailbox.sent) == 1
+    assert mailbox.sent == []
     assert len(mailbox.ingested) == 1
     assert [row["role"] for row in captions_log] == ["host", "companion"]
     assert captions_log[0]["duplicateOf"] is None
     assert captions_log[1]["duplicateOf"] == "host:row-1"
+
+
+def test_caption_emitter_uses_typed_conversation_write_and_extra_mailboxes() -> None:
+    holder = {"url": "https://meet.google.com/abc-defg-hij"}
+    status: dict = {}
+    mailbox = _FakeMailbox()
+    emitter = CaptionEmitter(
+        holder=holder,
+        status=status,
+        captions_log=[],
+        captions_index={},
+        captions_lock=threading.Lock(),
+        mailbox=mailbox,
+        recipients=["conversation", "team-notes"],
+        ignore=set(),
+        self_name="Host User",
+        sender_prefix="meet-",
+        printer=lambda _line: None,
+    )
+
+    emitter.emit("host", "row-1", "Alice", "One final.", final=True)
+
+    assert len(mailbox.ingested) == 1
+    assert [row[0] for row in mailbox.sent] == ["team-notes"]
+    metadata = mailbox.sent[0][3]
+    assert metadata["source"] == "google_meet_caption"
+    revision = hashlib.sha256("One final.".encode()).hexdigest()[:16]
+    assert metadata["revision"] == revision
+    assert metadata["idempotencyKey"] == (
+        f"meet-caption:https://meet.google.com/abc-defg-hij:host:row-1:{revision}:1"
+    )
+
+
+def test_caption_ingest_transient_failure_retries_once_in_order(tmp_path) -> None:
+    holder = {"url": "https://meet.google.com/abc-defg-hij"}
+    status: dict = {}
+    mailbox = _FakeMailbox(failures=1)
+    emitter = CaptionEmitter(
+        holder=holder,
+        status=status,
+        captions_log=[],
+        captions_index={},
+        captions_lock=threading.Lock(),
+        mailbox=mailbox,
+        recipients=["conversation"],
+        ignore=set(),
+        self_name="Host User",
+        sender_prefix="meet-",
+        retry_path=tmp_path / "caption-retry.json",
+        printer=lambda _line: None,
+    )
+
+    emitter.emit("host", "row-1", "Alice", "First.", final=True)
+    assert status["captionRetryDepth"] == 1
+    assert mailbox.ingested == []
+    assert emitter.retry_pending() == 1
+    assert [row[0] for row in mailbox.ingested] == ["First."]
+    assert emitter.retry_pending() == 0
+    assert len(mailbox.ingested) == 1
+
+
+def test_intentional_caption_suppression_ack_does_not_retry_or_remove_raw_history(
+    tmp_path,
+) -> None:
+    class SuppressingMailbox(_FakeMailbox):
+        def ingest_meeting_caption(
+            self, text: str, *, correlation_id: str, metadata: dict
+        ) -> dict:
+            super().ingest_meeting_caption(
+                text, correlation_id=correlation_id, metadata=metadata
+            )
+            return {
+                "accepted": True,
+                "acknowledged": True,
+                "suppressed": True,
+                "reason": "google_meet_disabled",
+            }
+
+    captions_log: list[dict] = []
+    status: dict = {}
+    mailbox = SuppressingMailbox()
+    emitter = CaptionEmitter(
+        holder={"url": "https://meet.google.com/abc-defg-hij"},
+        status=status,
+        captions_log=captions_log,
+        captions_index={},
+        captions_lock=threading.Lock(),
+        mailbox=mailbox,
+        recipients=[],
+        ignore=set(),
+        self_name="Host User",
+        sender_prefix="meet-",
+        retry_path=tmp_path / "caption-retry.json",
+        printer=lambda _line: None,
+    )
+    emitter.emit("host", "row-1", "Alice", "Raw history remains.", final=True)
+    assert status["captionRetryDepth"] == 0
+    assert emitter.retry_pending() == 0
+    assert captions_log[0]["text"] == "Raw history remains."
+    assert len(mailbox.ingested) == 1
+
+
+def test_caption_ingest_retry_preserves_final_order(tmp_path) -> None:
+    mailbox = _FakeMailbox(failures=2)
+    emitter = CaptionEmitter(
+        holder={"url": "https://meet.google.com/abc-defg-hij"},
+        status={},
+        captions_log=[],
+        captions_index={},
+        captions_lock=threading.Lock(),
+        mailbox=mailbox,
+        recipients=["conversation"],
+        ignore=set(),
+        self_name="Host User",
+        sender_prefix="meet-",
+        retry_path=tmp_path / "caption-retry.json",
+        printer=lambda _line: None,
+    )
+    emitter.emit("host", "row-1", "Alice", "First.", final=True)
+    emitter.emit("host", "row-2", "Bob", "Second.", final=True)
+
+    assert emitter.retry_pending() == 2
+    assert [row[0] for row in mailbox.ingested] == ["First.", "Second."]
+
+
+def test_caption_ingest_retry_recovers_after_restart_without_duplicates(tmp_path) -> None:
+    retry_path = tmp_path / "caption-retry.json"
+    failed_mailbox = _FakeMailbox(failures=10)
+    first = CaptionEmitter(
+        holder={"url": "https://meet.google.com/abc-defg-hij"},
+        status={},
+        captions_log=[],
+        captions_index={},
+        captions_lock=threading.Lock(),
+        mailbox=failed_mailbox,
+        recipients=["conversation"],
+        ignore=set(),
+        self_name="Host User",
+        sender_prefix="meet-",
+        retry_path=retry_path,
+        printer=lambda _line: None,
+    )
+    first.emit("host", "row-1", "Alice", "Recovered.", final=True)
+
+    recovered_mailbox = _FakeMailbox()
+    second_status: dict = {}
+    second = CaptionEmitter(
+        holder={"url": "https://meet.google.com/abc-defg-hij"},
+        status=second_status,
+        captions_log=[],
+        captions_index={},
+        captions_lock=threading.Lock(),
+        mailbox=recovered_mailbox,
+        recipients=["conversation"],
+        ignore=set(),
+        self_name="Host User",
+        sender_prefix="meet-",
+        retry_path=retry_path,
+        printer=lambda _line: None,
+    )
+    assert second.retry_pending() == 1
+    assert [row[0] for row in recovered_mailbox.ingested] == ["Recovered."]
+    assert second.retry_pending() == 0
+    assert second_status["captionRetryDepth"] == 0
+
+
+def test_caption_retry_capacity_surfaces_backpressure(tmp_path) -> None:
+    status: dict = {}
+    mailbox = _FakeMailbox(failures=10)
+    emitter = CaptionEmitter(
+        holder={"url": "https://meet.google.com/abc-defg-hij"},
+        status=status,
+        captions_log=[],
+        captions_index={},
+        captions_lock=threading.Lock(),
+        mailbox=mailbox,
+        recipients=["conversation"],
+        ignore=set(),
+        self_name="Host User",
+        sender_prefix="meet-",
+        retry_path=tmp_path / "caption-retry.json",
+        retry_max=1,
+        printer=lambda _line: None,
+    )
+    emitter.emit("host", "row-1", "Alice", "First.", final=True)
+    with pytest.raises(CaptionRetryQueueFull):
+        emitter.emit("host", "row-2", "Bob", "Second.", final=True)
+    assert status["captionRetryBackpressure"] is True
+    assert "delivery required" in status["captionRetryError"]
 
 
 def test_companion_caption_read_failure_still_returns_host_payload() -> None:

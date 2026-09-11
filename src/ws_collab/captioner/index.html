@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="ws-captioner-token" content="__TOKEN__">
+  <meta name="ws-captioner-boot" content="__BOOT_ID__">
+  <meta name="ws-captioner-language" content="__LANGUAGE__">
+  <meta name="ws-captioner-enabled" content="__ENABLED__">
+  <meta name="ws-captioner-paused" content="__PAUSED__">
+  <meta name="ws-captioner-send-interims" content="__SEND_INTERIMS__">
+  <title>Always-on Browser Captioner</title>
+  <link rel="stylesheet" href="captioner.css">
+  <script src="captioner_runtime.js" defer></script>
+  <script src="transcript_runtime.js" defer></script>
+  <script src="captioner.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <div id="recording-indicator" class="indicator" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="recording-label">Starting</span>
+      </div>
+      <h1>Always-on Browser Captioner</h1>
+      <p class="subtitle">Dedicated microphone owner for WS_COLLAB</p>
+    </header>
+
+    <section class="notice" aria-label="Privacy disclosure">
+      <strong>Cloud processing notice:</strong>
+      Chrome Web Speech may send microphone audio to Google/cloud services.
+      This is not offline or local speech recognition. Pause detection is separate:
+      microphone RMS is analyzed locally in this page, and WS_COLLAB neither transmits
+      nor stores those audio samples.
+      <br><strong>Input scope: microphone only.</strong> Other tabs are not captured directly. Speaker audio that leaks into the mic cannot be reliably identified; use headphones or separate virtual audio devices. Chrome Web Speech listens to the Chrome/OS default input and cannot be bound to this page's MediaStream.
+    </section>
+
+    <section class="controls">
+      <label for="language">Recognition language</label>
+      <input id="language" type="text" maxlength="35" autocomplete="off">
+      <label class="check"><input id="send-interims" type="checkbox"> Send interim captions</label>
+      <button id="pause" type="button">Pause</button>
+      <button id="resume" type="button">Resume listening</button>
+    </section>
+
+    <section class="status-grid" aria-label="Captioner status">
+      <div><span>Status</span><strong id="status">Starting</strong></div>
+      <div><span>Microphone</span><strong id="mic">Unknown</strong></div>
+      <div><span>Delivery queue</span><strong id="queue-depth">0</strong></div>
+      <div><span>Last acknowledgement</span><strong id="last-ack">Never</strong></div>
+      <div class="vad-card"><span>Acoustic VAD</span><strong id="vad-status">Local pause detector: starting</strong></div>
+      <div><span>Input scope</span><strong id="input-scope">microphone</strong></div>
+      <div><span>Detected input</span><strong id="input-device">Chrome/OS default input</strong></div>
+      <div class="vad-card"><span>Actual input processing</span><strong id="input-processing">Waiting for microphone track</strong></div>
+    </section>
+
+    <section class="current">
+      <h2>Current speech</h2>
+      <p id="interim" aria-live="polite">Waiting for speech...</p>
+    </section>
+
+    <section class="transcript-card">
+      <h2>What has been said this session</h2>
+      <div id="final-log" class="final-log transcript-flow" aria-live="polite">
+        <span class="transcript-empty">No finalized captions this session.</span>
+      </div>
+    </section>
+
+    <p id="error" class="error" role="alert"></p>
+    <footer>
+      Clean-room implementation inspired by architectural concepts in
+      <a href="https://github.com/MidCamp/live-captioning/tree/893ebc75e9847dbb055963875822cf9b6afb94b8">MidCamp/live-captioning at 893ebc75</a>.
+      No upstream source code, assets, or styles were copied.
+    </footer>
+  </main>
+</body>
+</html>

@@ -43,6 +43,40 @@ bridge and renders a rich "Google Meet" ops page (`#meet`) plus a merged
 "SSO / Browser" settings page (`#browser`). The two processes are
 independent — the admin server has never spawned/controlled the bridge.
 
+Current boundary: Meet captions use
+`POST /ws_collab/meet/captions/ingest` as durable conversation/chat context.
+They are not an STT driver and do not emit `HEARD_SPEECH`. Always-on microphone
+captioning belongs to the supervised `/ws_collab/captioner/` Chrome Web Speech
+page; Chrome may send microphone audio to Google/cloud and it is not
+offline/local recognition. Its `chrome_captioner` user-data directory and CDP
+port are dedicated and never reuse/import the Meet SSO profile, cookies, account
+registry, or Google auth flow. The canonical admin SPA is
+`/ws_collab/#chrome-captions` (`/ws_collab/admin/` is an alias). Its source
+actions use the backend's durable generic `browser_captioner` / `google_meet`
+policy: one enabled source is primary, Chrome primary suppresses only safe
+recent Meet duplicates, and Meet primary suppresses Chrome canonical
+publication while acknowledging its queue and retaining bounded diagnostic
+final state. `Disable other STT(s)` is independent. Neither source Disable
+stops the Meet bridge/profile nor removes history/configuration.
+
+Every captioner tab registers its stable browser-session ID plus a per-load
+instance ID. Backend automatic/pinned selection is authoritative; only the
+selected, enabled, fresh instance may acquire microphone/Web Speech/VAD.
+Unselected, disabled, and stale transcript/floor requests are explicitly
+suppressed or rejected. Per-instance Disable is boot/tab-instance scoped and
+operator pins fail over only after the stale timeout.
+
+Browser RMS VAD now also sends metadata-only, ordered transitions through the
+loopback/same-origin captioner channel. The server treats only
+`browser_rms_vad` + `local_microphone` + `input_scope: microphone` as the local
+mic floor: onset blocks/cancels conversational TTS and backchannels, end uses a
+350ms hangover, and stale input becomes unknown/fail-open. Every conversational
+playback path re-checks immediately before audio; floor release never speaks.
+The caption page requests ideal echo/noise suppression and reports bounded
+actual track settings without raw device IDs. It cannot directly hear another
+tab or source-separate speaker leakage; Chrome Web Speech uses the Chrome/OS
+default input.
+
 The two-bot design: a HOST identity (real hardware mic/speakers, never
 automated) and a COMPANION identity (a second signed-in Google account,
 muted+deaf, just to keep Meet from ending a single-participant call) sit in
@@ -186,7 +220,9 @@ you just want what's left.)
 15. **Per-meeting routing and lifecycle policy** — the active browser profile's
     atomic `MeetBrowserSettings` record now stores room-adapter kind/id,
     HOST/COMPANION mic and speaker descriptors, optional companion wiring,
-    single-autostart policy, and reconnect policy. Only the physical-computer
+    one default-on-explicit-bridge-start policy, and reconnect policy. Legacy
+    stored `autostart` values are preserved as that default and never bootstrap
+    the bridge. Only the physical-computer
     adapter is implemented; future kinds are explicit unavailable capability
     records. The meeting header edits policy, connector rows edit devices and
     apply them with verified `Sync devices`, and role-scoped mute buttons remain

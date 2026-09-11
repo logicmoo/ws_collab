@@ -26,6 +26,8 @@ const API_BASE = BASE;
 const ADMIN_UI_STATE_BASE = `${API_BASE}/admin/ui-state`;
 const ROW_H = 22;
 const MAX_BUFFER = 5000;
+const Transcript = window.WsCollabTranscript;
+if (!Transcript) throw new Error("Transcript runtime failed to load");
 
 /* The server owns the blocking Chrome/CDP worker and proxies its API so the
  * workbench never depends on a separately reachable unauthenticated port. */
@@ -111,6 +113,14 @@ const state = {
   restoredPageStates: {},
   pendingPageRestore: {},
   errors: [],
+  captionerConfig: null,
+  captionSourcePolicy: null,
+  chromeTranscript: {
+    rows: [],
+    truncated: false,
+    cutoffSeq: null,
+    loadingGeneration: 0,
+  },
 };
 
 // Stream names are NOT hard-coded here: they are discovered from
@@ -553,6 +563,7 @@ function connectWs() {
       checkBootId(state.caps && state.caps.boot_id);
       adoptStreams(state.caps);
       socket.send(JSON.stringify({ type: "subscribe", streams: STREAMS, cursors: state.cursors }));
+      if (state.page === "chrome-captions") reconcileChromeTranscript();
     } else if (frame.type === "event") {
       const event = frame.event;
       state.cursors[event.stream] = state.cursors[event.stream] || null;
@@ -1367,22 +1378,23 @@ async function showPage(page) {
   await restorePageState(page);
   document.querySelectorAll(".page").forEach((n) => n.classList.toggle("active", n.dataset.page === page));
   document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.page === page));
-  const pageTitles = { browser: "SSO / Browser" };
+  const pageTitles = {
+    browser: "SSO / Browser",
+    stt: "STT Engines",
+    "chrome-captions": "Chrome Captions",
+  };
   $("top-title").textContent = pageTitles[page] || (page.charAt(0).toUpperCase() + page.slice(1));
   // Keep the URL in sync so any page can be deep-linked and reloaded in place.
   if (location.hash.slice(1) !== page) history.replaceState(null, "", `#${page}`);
   const loaders = {
     workers: loadWorkers, alerts: loadAlerts, devices: loadDevices, voices: loadVoices,
     accuracy: loadAccuracy, cursors: loadCursors, prompt: loadPrompt, system: loadSystem,
-    meet: loadMeetWithPolling, silences: loadSilencesWithPolling, stt: loadStt, processes: loadProcesses, browser: loadBrowserSettings,
+    meet: loadMeetWithPolling, silences: loadSilencesWithPolling, stt: loadStt,
+    "chrome-captions": loadChromeCaptions,
+    processes: loadProcesses, browser: loadBrowserSettings,
   };
   if (loaders[page]) {
-    const p = loaders[page]();
-    if (page === "stt" && (window.SpeechRecognition || window.webkitSpeechRecognition)) {
-      if (!sttShouldContinue && !sttRecognizer) {
-        toggleSttMic();
-      }
-    }
+    loaders[page]();
   } else {
     applyControlState(page, state.restoredPageStates[page]);
     state.pendingPageRestore[page] = false;
@@ -2024,6 +2036,24 @@ async function postMeetCommand(command) {
   loadMeet();
 }
 
+async function startMeetBridge() {
+  const resultEl = $("meet-command-result");
+  resultEl.textContent = "Start bridge — sending…";
+  try {
+    const result = await api(`${MEET_BRIDGE_BASE}/start`, {
+      method: "POST",
+      body: {},
+    });
+    resultEl.textContent = result.already_running
+      ? "Start bridge → already running"
+      : "Start bridge → starting";
+    if (result.started) setTimeout(loadMeet, 2000);
+  } catch (error) {
+    resultEl.textContent = `Start bridge → error: ${error.message}`;
+  }
+  loadMeet();
+}
+
 async function postMeetMediaMute(meetingUrl, role, target, muted) {
   const resultEl = $("meet-command-result");
   const label = target === "mic" ? "microphone" : "speakers";
@@ -2262,8 +2292,8 @@ async function loadBrowserSettings(scannedSsoState = null) {
         "div",
         "hint",
         ssoState.ready_for_meet
-          ? `${ssoState.signed_in_count} live Google sessions confirmed. Meet drivers may start after roles are assigned on the Google Meet page.`
-          : `${ssoState.signed_in_count || 0}/2 live Google sessions confirmed. Meet drivers remain blocked.`,
+          ? `${ssoState.signed_in_count} live Google sessions confirmed. Meet browser roles may start after assignment on the Google Meet page.`
+          : `${ssoState.signed_in_count || 0}/2 live Google sessions confirmed. Meet browser roles remain blocked.`,
       ),
       el("div", "hint", "The browser uses one Chrome profile/process. Signed-in Google accounts are tracked by stable local IDs even if Google changes their authuser slots."),
       ssoActions,
@@ -4142,8 +4172,8 @@ function meetRoutingStrip(url, kind, routing) {
   };
   strip.append(
     adapterLabel,
-    check("autostart", "Autostart"),
     check("reconnect_after_disconnect", "Reconnect after unexpected disconnect"),
+    el("span", "hint", "Manual-start resource; not in the current autostart set."),
     el("span", "meet-routing-status", routeState.policyStatus || ""),
   );
   return strip;
@@ -4542,6 +4572,11 @@ function meetPollOnce() {
 
 async function loadMeetWithPolling() {
   if (meetPolling) return;
+  try {
+    await loadCaptionSourcePolicy();
+  } catch (error) {
+    $("meet-source-policy-status").textContent = `Policy unavailable: ${error.message}`;
+  }
   await loadMeetRoleAssignments();
   meetPolling = true;
   meetPollOnce();
@@ -5032,7 +5067,7 @@ async function loadStt() {
       transcriptTable.classList.add("stt-transcript-table");
       p.content.appendChild(transcriptTable);
     } else {
-      p.content.appendChild(el("div", "hint", "No transcripts yet. Ingest text below, or use the mic button to test with real speech recognition."));
+      p.content.appendChild(el("div", "hint", "No transcripts yet. Ingest text below, or open the dedicated browser captioner."));
     }
     body.appendChild(p.root);
   } catch (error) { body.textContent = `error: ${error.message}`; }
@@ -5082,13 +5117,12 @@ function startSttSensitivityPolling() {
 /* ------------------------------------------------------ live per-engine STT */
 // One row per STT engine (as reported live by the server) plus a pinned,
 // highlighted "disambiguator" row for the final resolved result. Populated
-// from /v1/status on page load, then updated live from the WS stt_transcripts
+// from /status on page load, then updated live from the WS stt_transcripts
 // stream in ingest() -- no polling, no page reload needed.
 const sttEngineRows = new Map();
 
 function sttEngineLabel(engine) {
-  if (engine === "google_meet") return "google_meet (Meet driver)";
-  if (engine === "web_speech") return "web_speech (browser)";
+  if (engine === "browser_captioner") return "browser_captioner (push source)";
   if (engine === "external") return "external (legacy/API ingest)";
   if (engine === "manual") return "manual ingest";
   return engine;
@@ -5138,14 +5172,25 @@ function sttEngineRow(engine) {
 
 function primeSttEngineRows() {
   api(`${API_BASE}/status`).then((status) => {
-    let engines = (status.subsystems && status.subsystems.stt && status.subsystems.stt.engines) || [];
+    const sttStatus = (status.subsystems && status.subsystems.stt) || {};
+    let engines = sttStatus.engines || [];
     engines = [...engines].sort((a, b) => a.localeCompare(b));
+    const disabled = sttStatus.disabled_by_chrome_captions_policy === true;
     $("stt-engine-hint").textContent = engines.length
-      ? `Configured server drivers: ${engines.join(", ")}, then disambiguator. google_meet reads the Meet bridge; browser Web Speech is a separate test and appears as web_speech.`
+      ? `Configured audio-segment engines: ${engines.join(", ")}${disabled ? " — disabled by Chrome Captions policy" : ""}, plus the push-driven browser_captioner source. Meet captions remain separate chat context.`
       : "No STT engines configured.";
-    engines.forEach((name) => sttEngineRow(name));
+    engines.forEach((name) => {
+      const row = sttEngineRow(name);
+      if (disabled) {
+        row.tdStatus.replaceChildren(badge("policy disabled", "warn"));
+        row.tdText.textContent = "Disabled by Chrome Captions policy";
+      } else if (row.tdText.textContent === "Disabled by Chrome Captions policy") {
+        row.tdStatus.replaceChildren(badge("enabled", "ok"));
+        row.tdText.textContent = "Waiting for an audio segment…";
+      }
+    });
     sttEngineRow("disambiguator");
-  }).catch(() => { $("stt-engine-hint").textContent = "Could not load engine list from /v1/status."; });
+  }).catch(() => { $("stt-engine-hint").textContent = "Could not load engine list from /status."; });
 }
 
 function handleSttTranscriptEvent(event) {
@@ -5171,6 +5216,14 @@ function handleSttTranscriptEvent(event) {
     ));
     row.tdText.textContent = text;
   }
+  if (engine === "browser_captioner") {
+    if (event.type === "STT_PARTIAL_RESULT" || d.is_final === false) {
+      $("cc-live-partial").textContent = text || "Waiting for a caption...";
+    } else if (event.type === "STT_FINAL_RESULT" && text) {
+      $("cc-live-partial").textContent = "Waiting for a caption...";
+      appendChromeTranscriptEvent(event);
+    }
+  }
 }
 
 async function sttIngest(text, opts = {}) {
@@ -5193,165 +5246,327 @@ async function sttIngest(text, opts = {}) {
   }
 }
 
-let sttHoverPaused = false;
-let sttScrollPaused = false;
+let captionerHoverPaused = false;
+let captionerScrollPaused = false;
 
-function sttLiveLog(text) {
-  const log = $("stt-live-log");
+function visibleChromeTranscriptRows() {
+  return Transcript.rowsAfterCutoff(
+    state.chromeTranscript.rows,
+    state.chromeTranscript.cutoffSeq,
+  );
+}
+
+function chromeTranscriptTimeRange(rows) {
+  const times = rows.map((row) => row.eventAtMs).filter(Number.isFinite);
+  if (!times.length) return "";
+  const format = (value) => new Date(value).toLocaleString();
+  return times.length === 1
+    ? format(times[0])
+    : `${format(Math.min(...times))} – ${format(Math.max(...times))}`;
+}
+
+function renderChromeTranscript({ forceLatest = false } = {}) {
+  const log = $("cc-live-log");
   if (!log) return;
-  const line = el("div", "mono", `${new Date().toLocaleTimeString()}  ${text}`);
-  log.appendChild(line);
-  if (!sttHoverPaused && !sttScrollPaused && !hasSelectionIn("stt-live-log")) {
-    log.scrollTop = log.scrollHeight;
+  const previousScrollTop = log.scrollTop;
+  const autoscroll = $("cc-autoscroll");
+  const shouldFollow = forceLatest || (
+    autoscroll && autoscroll.checked
+    && !captionerHoverPaused && !captionerScrollPaused && !hasSelectionIn("cc-live-log")
+  );
+  const visible = visibleChromeTranscriptRows();
+  Transcript.renderTranscript(document, log, visible);
+  if (!visible.length) {
+    const empty = el("span", "transcript-empty",
+      state.chromeTranscript.rows.length
+        ? "View cleared. New finalized Chrome captions will appear here."
+        : "No finalized Chrome captions yet.");
+    log.appendChild(empty);
+  }
+  const total = state.chromeTranscript.rows.length;
+  const range = chromeTranscriptTimeRange(state.chromeTranscript.rows);
+  $("cc-transcript-summary").textContent =
+    `${state.chromeTranscript.truncated ? `${total}+` : total} committed utterance${total === 1 ? "" : "s"}` +
+    (range ? ` · ${range}` : "");
+  const truncated = $("cc-transcript-truncated");
+  truncated.hidden = !state.chromeTranscript.truncated;
+  truncated.textContent = state.chromeTranscript.truncated
+    ? `Showing a bounded view of ${Transcript.MAX_TRANSCRIPT_EVENTS} finalized captions; durable history continues.`
+    : "";
+  log.scrollTop = shouldFollow ? log.scrollHeight : previousScrollTop;
+}
+
+function appendChromeTranscriptEvent(event) {
+  const before = state.chromeTranscript.rows.length;
+  state.chromeTranscript.rows = Transcript.mergeFinalEvents(
+    state.chromeTranscript.rows,
+    [event],
+  );
+  if (state.chromeTranscript.rows.length !== before) renderChromeTranscript();
+}
+
+async function reconcileChromeTranscript({ resetView = false } = {}) {
+  const generation = ++state.chromeTranscript.loadingGeneration;
+  const pageResult = await Transcript.collectFinalPages(async (cursor, limit) => {
+    const query = new URLSearchParams({
+      source_id: "browser_captioner",
+      type: "STT_FINAL_RESULT",
+      limit: String(limit),
+    });
+    if (cursor) query.set("after", cursor);
+    return api(`${API_BASE}/stt/transcripts?${query}`);
+  });
+  if (generation !== state.chromeTranscript.loadingGeneration) return;
+  state.chromeTranscript.rows = Transcript.mergeFinalEvents(
+    pageResult.events,
+    state.chromeTranscript.rows,
+  );
+  state.chromeTranscript.truncated = pageResult.truncated;
+  if (resetView) state.chromeTranscript.cutoffSeq = null;
+  renderChromeTranscript();
+}
+
+function applyCaptionerPolicy(config) {
+  if (!config) return;
+  state.captionerConfig = config;
+  if (config.caption_source_policy) {
+    applyCaptionSourcePolicy(config.caption_source_policy);
   }
 }
 
-// Two listening modes -- this is an explicit "allowed to stop itself or not"
-// switch, since that's the actual source of confusion: the Web Speech API
-// naturally ends a session after a silence/no-speech timeout even when
-// `continuous` is set, and it does so silently unless we surface it.
-//  - single:     the browser is ALLOWED to stop itself once it thinks you're
-//                done talking (one utterance, no restart).
-//  - continuous: NOT allowed to stop itself -- any end/error auto-restarts
-//                (after a short delay, to dodge a start()-while-stopping
-//                race) until you explicitly click "Stop listening".
-// The speaking / done-talking indicator is shown in both modes.
-let sttRecognizer = null;
-let sttShouldContinue = false;
-let sttRestartTimer = null;
-
-const STT_ERROR_HINTS = {
-  "no-speech": "no speech detected (silence timeout)",
-  "audio-capture": "no microphone found / capture failed",
-  "not-allowed": "microphone permission blocked",
-  network: "network error",
-  aborted: "aborted",
-};
-
-function setSpeechIndicator(text, kind) {
-  const badge = $("stt-speech-state");
-  badge.textContent = text;
-  badge.className = `badge ${kind || ""}`;
+function captionSource(sourceId) {
+  return (state.captionSourcePolicy?.sources || []).find((row) => row.id === sourceId) || null;
 }
 
-// Short synthesized beep (Web Audio API -- no audio file needed) played the
-// moment the recognizer thinks you've stopped talking (onspeechend).
-let sttAudioCtx = null;
-function playBeep() {
+function applyCaptionSourcePolicy(policy) {
+  if (!policy || !Array.isArray(policy.sources)) return;
+  state.captionSourcePolicy = policy;
+  const chrome = captionSource("browser_captioner");
+  const meet = captionSource("google_meet");
+  const primary = policy.primary_source_id
+    ? (captionSource(policy.primary_source_id)?.display_name || policy.primary_source_id)
+    : "None";
+  if ($("cc-source-policy-status")) {
+    $("cc-source-policy-status").textContent =
+      `Chrome Captions ${chrome?.enabled ? "enabled" : "disabled"} · ` +
+      `${chrome?.primary ? "PRIMARY" : "standby source"} · primary: ${primary}`;
+    $("cc-make-primary").disabled = chrome?.primary === true;
+    $("cc-toggle-source").textContent = chrome?.enabled
+      ? "Disable Chrome Captions" : "Enable Chrome Captions";
+    $("cc-toggle-meet").textContent = meet?.enabled
+      ? "Disable Google Meet" : "Enable Google Meet";
+  }
+  if ($("meet-source-policy-status")) {
+    $("meet-source-policy-status").textContent =
+      `Google Meet ${meet?.enabled ? "enabled" : "disabled"} · ` +
+      `${meet?.primary ? "PRIMARY" : "standby source"} · primary: ${primary}`;
+    $("meet-make-primary").disabled = meet?.primary === true;
+    $("meet-toggle-source").textContent = meet?.enabled
+      ? "Disable Google Meet" : "Enable Google Meet";
+  }
+  document.querySelector('.page[data-page="chrome-captions"]')
+    ?.classList.toggle("source-disabled", chrome?.enabled === false);
+  document.querySelector('.page[data-page="meet"]')
+    ?.classList.toggle("source-disabled", meet?.enabled === false);
+}
+
+async function loadCaptionSourcePolicy() {
+  const policy = await api(`${API_BASE}/caption-sources`);
+  applyCaptionSourcePolicy(policy);
+  return policy;
+}
+
+async function captionSourceAction(sourceId, action) {
+  const result = await api(
+    `${API_BASE}/caption-sources/${encodeURIComponent(sourceId)}/${action}`,
+    { method: "POST", body: {} },
+  );
+  applyCaptionSourcePolicy(result.policy);
+  await loadCaptionerStatus();
+  return result;
+}
+
+function renderCaptionerInstances(registry) {
+  const body = $("cc-instances");
+  if (!body || !registry) return;
+  const rows = (registry.instances || []).map((instance) => {
+    const actions = el("div", "instance-actions");
+    const primary = actionButton("Make primary", "mini primary", async () => {
+      await captionerInstanceAction(instance.instance_id, "make-primary");
+    });
+    primary.disabled = instance.selected && registry.selection_mode === "pinned";
+    actions.append(
+      primary,
+      actionButton(instance.enabled ? "Disable" : "Enable", "mini", async () => {
+        await captionerInstanceAction(
+          instance.instance_id,
+          instance.enabled ? "disable" : "enable",
+        );
+      }),
+    );
+    const input = instance.input || {};
+    return [
+      instance.selected
+        ? badge(registry.selection_mode === "pinned" ? "PRIMARY · PINNED" : "PRIMARY · AUTO", "ok")
+        : badge(instance.stale ? "STALE" : "STANDBY", instance.stale ? "warn" : ""),
+      mono(instance.instance_id),
+      mono(instance.session_id),
+      `${instance.state || "unknown"} · ${instance.healthy ? "healthy" : "degraded"}`,
+      `${instance.last_seen_age_seconds ?? "—"}s`,
+      String(instance.queue_depth ?? 0),
+      `${input.input_scope || "microphone"} · ${input.track_label || "default input"}`,
+      actions,
+    ];
+  });
+  body.replaceChildren(
+    rows.length
+      ? table(
+        ["Selection", "Instance", "Session", "State", "Last seen", "Queue", "Mic", "Actions"],
+        rows,
+      )
+      : el("div", "hint", "No recent browser captioner instances."),
+  );
+}
+
+async function captionerInstanceAction(instanceId, action) {
+  const result = await api(
+    `${API_BASE}/captioner/instances/${encodeURIComponent(instanceId)}/${action}`,
+    { method: "POST", body: {} },
+  );
+  renderCaptionerInstances(result.registry);
+  await loadCaptionerStatus();
+}
+
+let chromeCaptionPolling = false;
+let captionerPolicyEditing = false;
+
+function renderChromeCaptionStatus(status) {
+  state.captionerConfig = status;
+  applyCaptionerPolicy(status);
+  $("cc-language").value = status.language || "en-US";
+  $("cc-send-interims").checked = status.send_interims !== false;
+  if (!captionerPolicyEditing) {
+    $("cc-disable-other-stts").checked = status.disable_other_stts === true;
+  }
+  renderCaptionerInstances(status.instance_registry || status.instances);
+  $("cc-pause").disabled = status.paused || !status.enabled;
+  $("cc-resume").disabled = !status.paused;
+  const age = status.heartbeat_age_seconds == null
+    ? "no heartbeat"
+    : `${status.heartbeat_age_seconds}s heartbeat age`;
+  $("cc-status").textContent =
+    `${status.display_name}: ${status.state}; tab ${status.tab_present ? "present" : "not detected"}; ${age}`;
+  $("cc-health").textContent =
+    `health ${status.health || "unknown"} · queue ${status.queue_depth || 0} · ` +
+    `microphone ${status.mic_permission || "unknown"} · restarts ${status.restart_count || 0}` +
+    (status.last_final_at ? ` · last final ${shortTs(status.last_final_at)}` : "") +
+    (status.last_error ? ` · error: ${status.last_error}` : "");
+  const vad = status.vad;
+  $("cc-vad").textContent = vad && vad.available
+    ? `Local pause detector: ${vad.state} · RMS ${Number(vad.rms).toFixed(4)} · ` +
+      `threshold ${Number(vad.threshold).toFixed(4)} · silence ${
+        vad.current_silence_ms == null ? "—" : Transcript.formatDuration(vad.current_silence_ms)
+      }`
+    : `Local pause detector: pause detector unavailable${
+      vad && vad.error ? ` · ${vad.error}` : ""
+    }`;
+  const input = status.input || {};
+  const actual = (value) => value === true ? "on" : value === false ? "off" : "unknown";
+  $("cc-input").textContent =
+    `Input scope: ${input.input_scope || "microphone"} · ` +
+    `device ${input.track_label || "Chrome/OS default input"} · ` +
+    `echo ${actual(input.echo_cancellation)} · noise suppression ${actual(input.noise_suppression)} · ` +
+    `auto gain ${actual(input.auto_gain_control)} · channels ${input.channel_count || "unknown"} · ` +
+    `sample rate ${input.sample_rate ? `${input.sample_rate} Hz` : "unknown"}`;
+  const floor = status.local_mic_floor || {};
+  $("cc-floor").textContent =
+    `Local microphone floor: ${floor.state || "unknown"} · ` +
+    `${floor.blocked ? "conversational output blocked" : "conversational output may speak"} · ` +
+    `hangover ${floor.hangover_ms ?? 350}ms`;
+  $("cc-profile").textContent =
+    `${status.profile_disclosure || "Isolated browser profile"} ${status.profile_path || ""} · ${status.cdp_endpoint || ""}`;
+  const suppressed = status.meet_caption_suppressions || {};
+  $("cc-suppressions").textContent =
+    `Meet captions suppressed: preferred source ${suppressed.preferred_browser_captioner || 0}; ` +
+    `Meet disabled ${suppressed.google_meet_disabled || 0}.`;
+  $("cc-policy-summary").textContent =
+    `Saved policy: ${status.source_priority_summary || "not available"}`;
+  $("cc-nav-dot").className = `status-dot ${status.healthy ? "ok" : "danger"}`;
+}
+
+async function loadCaptionerStatus() {
   try {
-    sttAudioCtx = sttAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
-    if (sttAudioCtx.state === "suspended") sttAudioCtx.resume();
-    const osc = sttAudioCtx.createOscillator();
-    const gain = sttAudioCtx.createGain();
-    osc.type = "sine";
-    osc.frequency.value = 880; // A5 -- short, clearly audible "done" chirp
-    const now = sttAudioCtx.currentTime;
-    gain.gain.setValueAtTime(0.15, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
-    osc.connect(gain).connect(sttAudioCtx.destination);
-    osc.start(now);
-    osc.stop(now + 0.15);
-  } catch (error) { /* no audio output available -- non-fatal */ }
+    const status = await api(`${API_BASE}/captioner/status`);
+    renderChromeCaptionStatus(status);
+  } catch (error) {
+    $("cc-status").textContent = `Chrome Captions status unavailable: ${error.message}`;
+  }
 }
 
-function startSttRecognizer(mode) {
-  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const status = $("stt-mic-status");
-  const recognizer = new Recognition();
-  recognizer.lang = $("stt-lang").value || "en-US";
-  recognizer.continuous = mode !== "single";
-  recognizer.interimResults = true;
-  let lastError = null;
-  recognizer.onstart = () => {
-    lastError = null;
-    status.textContent = mode === "single" ? "🔴 listening for one utterance…" : "🔴 listening (won't stop itself)…";
-    $("stt-mic").textContent = "⏹ Stop browser Web Speech";
-    $("stt-live-partial").textContent = "…";
-    setSpeechIndicator("🗣️ speaking…", "ok");
-  };
-  // The browser's own end-of-utterance detector -- the "thinks I'm done
-  // talking" signal that was asked for. Fires before onend/onerror.
-  recognizer.onspeechstart = () => setSpeechIndicator("🗣️ speaking…", "ok");
-  recognizer.onspeechend = () => {
-    setSpeechIndicator("⏸ done talking (silence detected)", "warn");
-    if ($("stt-beep-enabled").checked) playBeep();
-  };
-  recognizer.onerror = (e) => {
-    lastError = e.error;
-    status.textContent = `⚠ ${STT_ERROR_HINTS[e.error] || e.error}`;
-  };
-  recognizer.onend = () => {
-    sttRecognizer = null;
-    const reason = lastError ? (STT_ERROR_HINTS[lastError] || lastError) : "session ended";
-    if (sttShouldContinue && mode !== "single") {
-      // Continuous mode is not allowed to stop itself: restart after a short
-      // delay (a bare restart from inside onend can throw "already started").
-      status.textContent = `⏹ ${reason} — restarting (continuous mode)…`;
-      setSpeechIndicator("⏸ restarting…", "warn");
-      sttRestartTimer = setTimeout(() => { if (sttShouldContinue) startSttRecognizer(mode); }, 300);
-      return;
-    }
-    sttShouldContinue = false;
-    status.textContent = mode === "single" ? `stopped: ${reason}` : `stopped by user (${reason})`;
-    $("stt-mic").textContent = "🎤 Start browser Web Speech";
-    $("stt-live-partial").textContent = "Click \"Start browser Web Speech\" and speak…";
-    setSpeechIndicator("", "");
-  };
-  recognizer.onresult = (event) => {
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      const result = event.results[i];
-      const transcript = result[0].transcript;
-      const confidence = result[0].confidence || 0.9;
-      if (result.isFinal) {
-        $("stt-live-partial").textContent = "…";
-        sttLiveLog(transcript);
-        $("stt-text").value = transcript;
-        sttIngest(transcript, { engine: "web_speech", is_final: true, confidence });
-      } else {
-        // Interim hypothesis: reflect it live as it changes, word by word.
-        $("stt-live-partial").textContent = transcript;
-        if ($("stt-send-partials").checked) {
-          sttIngest(transcript, {
-            engine: "web_speech",
-            is_final: false,
-            confidence,
-            silent: true,
-          });
-        }
-      }
-    }
-  };
+function pollChromeCaptionStatus() {
+  loadCaptionerStatus().finally(() => {
+    if (state.page === "chrome-captions") setTimeout(pollChromeCaptionStatus, 2000);
+    else chromeCaptionPolling = false;
+  });
+}
+
+async function loadChromeCaptions() {
+  if (!chromeCaptionPolling) {
+    chromeCaptionPolling = true;
+    pollChromeCaptionStatus();
+  }
+  loadCaptionSourcePolicy().catch((error) => {
+    $("cc-source-policy-status").textContent = `Policy unavailable: ${error.message}`;
+  });
   try {
-    recognizer.start();
-    sttRecognizer = recognizer;
-  } catch (err) {
-    // Almost always a start()-while-stopping race; retry shortly rather than
-    // silently doing nothing (which is what looked like "it just stops").
-    status.textContent = `⚠ could not restart (${err.message || err}) — retrying…`;
-    sttRestartTimer = setTimeout(() => { if (sttShouldContinue) startSttRecognizer(mode); }, 300);
+    await reconcileChromeTranscript();
+  } catch (error) {
+    $("cc-settings-status").textContent = `Could not load finalized captions: ${error.message}`;
   }
 }
 
-function toggleSttMic() {
-  const status = $("stt-mic-status");
-  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!Recognition) { status.textContent = "Browser Web Speech API not available (try Chrome/Edge over http://localhost)."; return; }
-  if (sttRecognizer || sttShouldContinue) {
-    // Also covers the ~300ms gap where a restart is pending but no recognizer
-    // instance exists yet -- otherwise "Stop" could appear to do nothing.
-    sttShouldContinue = false;
-    clearTimeout(sttRestartTimer);
-    if (sttRecognizer) sttRecognizer.stop();
-    else {
-      status.textContent = "stopped by user";
-      $("stt-mic").textContent = "🎤 Start browser Web Speech";
-      $("stt-live-partial").textContent = "Click \"Start browser Web Speech\" and speak…";
-      setSpeechIndicator("", "");
-    }
-    return;
+async function captionerAction(action) {
+  try {
+    await api(`${API_BASE}/captioner/${action}`, { method: "POST", body: {} });
+    await loadCaptionerStatus();
+  } catch (error) {
+    pushError(error.message);
   }
-  sttShouldContinue = true;
-  startSttRecognizer($("stt-mic-mode").value || "continuous");
+}
+
+async function saveCaptionerConfig() {
+  try {
+    await api(`${API_BASE}/captioner/config`, {
+      method: "POST",
+      body: {
+        language: $("cc-language").value.trim(),
+        send_interims: $("cc-send-interims").checked,
+      },
+    });
+    await loadCaptionerStatus();
+  } catch (error) {
+    pushError(error.message);
+  }
+}
+
+async function saveCaptionerPolicy() {
+  const status = $("cc-settings-status");
+  status.textContent = "Saving…";
+  try {
+    const config = await api(`${API_BASE}/captioner/config`, {
+      method: "POST",
+      body: {
+        disable_other_stts: $("cc-disable-other-stts").checked,
+      },
+    });
+    applyCaptionerPolicy(config);
+    captionerPolicyEditing = false;
+    status.textContent = "Saved";
+    await loadCaptionerStatus();
+    primeSttEngineRows();
+  } catch (error) {
+    status.textContent = `Error: ${error.message}`;
+  }
 }
 
 /* ---- accuracy */
@@ -5813,15 +6028,6 @@ function wireEvents() {
     }
   });
 
-  const sttLog = $("stt-live-log");
-  if (sttLog) {
-    sttLog.addEventListener("mouseenter", () => { sttHoverPaused = true; });
-    sttLog.addEventListener("mouseleave", () => { sttHoverPaused = false; });
-    sttLog.addEventListener("scroll", () => {
-      sttScrollPaused = sttLog.scrollHeight - sttLog.scrollTop - sttLog.clientHeight >= 40;
-    });
-  }
-
   // transcript controls
   ["tr-search", "tr-finals", "tr-hide-partials", "tr-hide-echo", "tr-hide-routine", "tr-minconf", "tr-cap"]
     .forEach((id) => $(id).addEventListener("input", refreshTranscriptFilter));
@@ -5917,10 +6123,19 @@ function wireEvents() {
     .forEach((btn) => wireCatFilter(btn, loadDevices));
   $("dv-search").addEventListener("input", loadDevices);
   $("meet-refresh").onclick = () => {
+    loadCaptionSourcePolicy();
     loadMeetRoleAssignments();
     loadCompanionInterjectorConfig();
     loadMeet();
   };
+  $("meet-make-primary").onclick = () =>
+    captionSourceAction("google_meet", "make-primary").catch((error) => pushError(error.message));
+  $("meet-toggle-source").onclick = () => {
+    const source = captionSource("google_meet");
+    return captionSourceAction("google_meet", source?.enabled ? "disable" : "enable")
+      .catch((error) => pushError(error.message));
+  };
+  $("meet-start-bridge").onclick = startMeetBridge;
   $("meet-join-btn").onclick = () => {
     const url = $("meet-join-url").value.trim();
     if (!url) { pushError("Enter a meeting URL to join."); return; }
@@ -6049,7 +6264,55 @@ function wireEvents() {
   $("stt-refresh").onclick = loadStt;
   $("stt-send").onclick = () => sttIngest($("stt-text").value);
   $("stt-text").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); sttIngest($("stt-text").value); } });
-  $("stt-mic").onclick = toggleSttMic;
+  $("cc-refresh").onclick = async () => {
+    await Promise.all([loadCaptionerStatus(), reconcileChromeTranscript({ resetView: true })]);
+  };
+  $("cc-open").onclick = () => captionerAction("open");
+  $("cc-focus").onclick = () => captionerAction("focus");
+  $("cc-pause").onclick = () => captionerAction("pause");
+  $("cc-resume").onclick = () => captionerAction("resume");
+  $("cc-language").onchange = saveCaptionerConfig;
+  $("cc-send-interims").onchange = saveCaptionerConfig;
+  $("cc-settings-save").onclick = saveCaptionerPolicy;
+  $("cc-make-primary").onclick = () =>
+    captionSourceAction("browser_captioner", "make-primary")
+      .catch((error) => pushError(error.message));
+  $("cc-toggle-source").onclick = () => {
+    const source = captionSource("browser_captioner");
+    return captionSourceAction(
+      "browser_captioner", source?.enabled ? "disable" : "enable",
+    ).catch((error) => pushError(error.message));
+  };
+  $("cc-toggle-meet").onclick = () => {
+    const source = captionSource("google_meet");
+    return captionSourceAction("google_meet", source?.enabled ? "disable" : "enable")
+      .catch((error) => pushError(error.message));
+  };
+  $("cc-disable-other-stts").onchange = () => {
+    captionerPolicyEditing = true;
+    $("cc-settings-status").textContent = "Unsaved changes";
+  };
+  $("cc-live-log").addEventListener("mouseenter", () => { captionerHoverPaused = true; });
+  $("cc-live-log").addEventListener("mouseleave", () => { captionerHoverPaused = false; });
+  $("cc-live-log").addEventListener("scroll", () => {
+    const log = $("cc-live-log");
+    captionerScrollPaused = log.scrollTop + log.clientHeight < log.scrollHeight - 4;
+  });
+  $("cc-clear-view").onclick = () => {
+    state.chromeTranscript.cutoffSeq = Transcript.clearViewCutoff(state.chromeTranscript.rows);
+    renderChromeTranscript();
+  };
+  $("cc-jump-latest").onclick = () => {
+    $("cc-autoscroll").checked = true;
+    captionerScrollPaused = false;
+    renderChromeTranscript({ forceLatest: true });
+  };
+  $("cc-autoscroll").onchange = () => {
+    if ($("cc-autoscroll").checked) {
+      captionerScrollPaused = false;
+      renderChromeTranscript({ forceLatest: true });
+    }
+  };
   $("stt-echo-policy").onchange = async () => {
     const policy = $("stt-echo-policy").value;
     const status = $("stt-policy-status");
@@ -6127,6 +6390,10 @@ async function boot() {
     state.caps = await api(`${API_BASE}/capabilities`);
     checkBootId(state.caps && state.caps.boot_id);
     adoptStreams(state.caps);
+    applyCaptionerPolicy(
+      (state.config && state.config.browser_captioner)
+      || (state.caps && state.caps.browser_captioner)
+    );
     state.endpoints = await api(`${API_BASE}/endpoints`).catch(() => null);
   } catch (error) {
     if (error.status === 401) { logout(); return; }

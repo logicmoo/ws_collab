@@ -119,7 +119,10 @@ def _discover(kind: str) -> tuple[list[Any], list[str]]:
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8"))
                 if data.get("enabled") is False:
-                    notes.append(f"skipped {kind} driver {name}: driver.json enabled=false")
+                    # google_meet is retained only as a compatibility module for
+                    # caption assembly; it is deliberately not an STT driver.
+                    if not (kind == "stt" and name == "google_meet"):
+                        notes.append(f"skipped {kind} driver {name}: driver.json enabled=false")
                     continue
             except (OSError, json.JSONDecodeError) as error:
                 notes.append(f"invalid driver.json for {kind} driver {name}: {error}")

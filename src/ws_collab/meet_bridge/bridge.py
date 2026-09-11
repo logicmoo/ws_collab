@@ -5,11 +5,9 @@ Local speech recognition is mediocre; Google Meet's caption model is
 excellent. This module turns a Meet tab in a dedicated Chrome into the
 recognizer -- and a mouthpiece:
 
-  IN   Meet live captions  ->  ws_collab mailbox (one message per finished
-       line, sender "meet-<speaker>"), AND exposed at this process's own
-       GET /ws_collab/meet-bridge/captions HTTP endpoint, which ws_collab's `google_meet` STT
-       driver polls and resolves through the normal disambiguator/timeline
-       pipeline.
+  IN   Meet live captions  ->  ws_collab meeting/chat context (one message per
+       finished line, sender "meet-<speaker>"), AND exposed at this process's own
+       GET /ws_collab/meet-bridge/captions diagnostics endpoint.
   OUT  ws_collab mailbox messages addressed to the bridge (default mailbox
        "google-meet")  ->  posted into the Meet's in-call chat, and
        optionally spoken aloud with Windows TTS (--speak).
@@ -143,7 +141,7 @@ from .tracker import CaptionTracker
 from ..meet_browser_settings import (
     MeetBrowserSettings,
     companion_click_runtime_layers,
-    select_startup_meeting,
+    select_bridge_start_meeting,
 )
 from ..urls import (
     MEET_BRIDGE_AUTHENTICATED_PATHS,
@@ -169,6 +167,7 @@ CAPTION_DUPLICATE_WINDOW_SECONDS = 15.0
 CAPTION_DUPLICATE_RECENT_LIMIT = 400
 CAPTION_PUSH_BINDING = "__wsCollabCaptionPush"
 CAPTION_PUSH_HEALTH_SECONDS = 5.0
+MEET_CAPTION_RETRY_MAX = 1000
 _BRIDGE_AUTHENTICATED_ROUTES = MEET_BRIDGE_AUTHENTICATED_PATHS
 
 
@@ -610,7 +609,7 @@ def update_companion_heard_stt_status(status: dict[str, Any], holder: dict[str, 
         "sinkDeviceLabel": holder.get("companion_heard_stt_sink_device_label"),
         "lastError": holder.get("companion_heard_stt_last_error"),
         "selfAudioExclusion": "only remote media-element MediaStreams are tapped; synthetic mic is not in that graph; /say and click artifact windows are dropped",
-        "engineScope": "server secondary capture excludes google_meet and feeds non-Meet STT engines",
+        "engineScope": "server secondary capture feeds configured audio STT engines; Meet caption text is separate context",
     }
     status["companionHeardStt"] = payload
     return payload
@@ -1423,6 +1422,7 @@ def queue_companion_interjection(
     now: float | None = None,
     floor_continue: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     action_evaluate: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    floor_guard: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Dispatch one silence action without conflating floor control and audio."""
 
@@ -1443,6 +1443,19 @@ def queue_companion_interjection(
         holder.get("companion_click_action")
         or "say:uh"
     ).strip().lower()
+    local_floor = floor_guard() if floor_guard is not None else {}
+    if action != "nothing" and local_floor.get("blocked"):
+        reason = (
+            "local-mic-floor-active"
+            if local_floor.get("state") == "speech"
+            else "local-mic-floor-hangover"
+        )
+        holder["companion_click_eligibility"] = reason
+        return {
+            "accepted": False,
+            "reason": reason,
+            "localMicFloor": local_floor,
+        }
     event_key = str(
         decision.get("eventKey")
         or f"interval:{meeting_url or 'unknown'}:{at:.6f}"
@@ -2009,6 +2022,121 @@ def drain_caption_push_events(
     return handled
 
 
+class CaptionRetryQueueFull(RuntimeError):
+    pass
+
+
+class DurableCaptionRetryQueue:
+    """Ordered crash-safe outbox for typed final-caption ingestion."""
+
+    def __init__(
+        self,
+        path: Path | str | None,
+        mailbox: Any,
+        status: dict[str, Any],
+        *,
+        max_items: int = MEET_CAPTION_RETRY_MAX,
+    ) -> None:
+        self.path = Path(path) if path is not None else None
+        self.mailbox = mailbox
+        self.status = status
+        self.max_items = max(1, int(max_items))
+        self._lock = threading.RLock()
+        self._rows: list[dict[str, Any]] = []
+        if self.path is not None and self.path.is_file():
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    self._rows = [row for row in loaded if isinstance(row, dict)]
+            except (OSError, ValueError) as error:
+                self.status["captionRetryError"] = f"retry outbox unreadable: {error}"
+        self._update_status()
+
+    def _update_status(self, error: str | None = None) -> None:
+        self.status["captionRetryDepth"] = len(self._rows)
+        self.status["captionRetryBackpressure"] = len(self._rows) >= self.max_items
+        self.status["captionDeliveryState"] = (
+            "blocked"
+            if len(self._rows) >= self.max_items
+            else ("pending" if self._rows else "ok")
+        )
+        if error is not None:
+            self.status["captionRetryError"] = error[:500]
+        elif not self._rows:
+            self.status["captionRetryError"] = None
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(self._rows, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self.path)
+
+    def enqueue(self, item: dict[str, Any]) -> None:
+        key = str(item["delivery_key"])
+        with self._lock:
+            if any(str(row.get("delivery_key")) == key for row in self._rows):
+                return
+            if len(self._rows) >= self.max_items:
+                message = "Meet caption retry queue full; delivery required"
+                self._update_status(message)
+                raise CaptionRetryQueueFull(message)
+            self._rows.append(dict(item))
+            try:
+                self._save()
+            except Exception as error:
+                self._rows.pop()
+                self._update_status(f"meeting caption could not be queued durably: {error}")
+                raise
+            self._update_status()
+
+    def drain(self) -> int:
+        delivered = 0
+        with self._lock:
+            while self._rows:
+                row = self._rows[0]
+                try:
+                    self.mailbox.ingest_meeting_caption(
+                        row["text"],
+                        correlation_id=row["correlation_id"],
+                        metadata=dict(row["metadata"]),
+                    )
+                except Exception as error:  # noqa: BLE001 - keep the durable head for retry
+                    self._update_status(f"meeting caption ingest pending: {error}")
+                    break
+                acknowledged = self._rows.pop(0)
+                try:
+                    self._save()
+                except Exception as error:
+                    self._rows.insert(0, acknowledged)
+                    self._update_status(
+                        f"caption acknowledged but retry acknowledgement is pending: {error}"
+                    )
+                    break
+                delivered += 1
+            self._update_status()
+        return delivered
+
+    def submit(self, item: dict[str, Any]) -> bool:
+        if len(self.pending) >= self.max_items:
+            self.drain()
+        self.enqueue(item)
+        self.drain()
+        return not any(
+            str(row.get("delivery_key")) == str(item["delivery_key"])
+            for row in self._rows
+        )
+
+    @property
+    def pending(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(row) for row in self._rows]
+
+
 class CaptionEmitter:
     def __init__(
         self,
@@ -2023,6 +2151,8 @@ class CaptionEmitter:
         ignore: set[str],
         self_name: str,
         sender_prefix: str,
+        retry_path: Path | str | None = None,
+        retry_max: int = MEET_CAPTION_RETRY_MAX,
         deduplicator: RecentCaptionDeduplicator | None = None,
         printer: Callable[[str], None] = print,
     ) -> None:
@@ -2038,6 +2168,12 @@ class CaptionEmitter:
         self.sender_prefix = sender_prefix
         self.deduplicator = deduplicator or RecentCaptionDeduplicator()
         self.printer = printer
+        self.retry_queue = DurableCaptionRetryQueue(
+            retry_path, mailbox, status, max_items=retry_max
+        )
+
+    def retry_pending(self) -> int:
+        return self.retry_queue.drain()
 
     def emit(self, role: str, key: str, speaker: str, text: str, final: bool = False, replaces: str | None = None) -> None:
         role = role if role in CAPTION_ROLES else "host"
@@ -2057,23 +2193,33 @@ class CaptionEmitter:
             text=text,
             final=final,
         )
+        revision = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:16]
+        delivery_key = (
+            f"meet-caption:{meeting_url_now or ''}:{key}:{revision}:{int(final)}"
+        )
+        correlation_id = (
+            f"meet-caption:{room_id(meeting_url_now) or 'unknown'}:{key}"
+        )
         full_meta = {
-            "source": "google-meet-captions", "speaker": speaker, "key": key,
+            "source": "google_meet_caption", "speaker": speaker, "key": key,
             "final": final, "replaces": replaces, "meetingUrl": meeting_url_now,
             "role": role, "duplicateOf": duplicate_of,
+            "revision": revision,
+            "idempotencyKey": delivery_key,
         }
         if duplicate_of is None:
             if final:
-                try:
-                    self.mailbox.ingest_transcript(
-                        text,
-                        correlation_id=f"meet-caption:{room_id(meeting_url_now) or 'unknown'}:{key}",
-                        source_kind="operator" if speaker == self.self_name else "unknown",
-                        audio_meta=dict(full_meta),
-                    )
-                except Exception as error:  # noqa: BLE001
-                    print(f"[stt] google_meet ingest failed: {error}", file=sys.stderr, flush=True)
+                self.retry_queue.submit(
+                    {
+                        "delivery_key": delivery_key,
+                        "text": text,
+                        "correlation_id": correlation_id,
+                        "metadata": dict(full_meta),
+                    }
+                )
             for recipient in self.recipients:
+                if str(recipient).strip().casefold() == "conversation":
+                    continue
                 try:
                     self.mailbox.send(recipient, line, sender=sender, metadata=dict(full_meta))
                 except Exception as error:  # noqa: BLE001
@@ -2594,7 +2740,7 @@ def main() -> None:
     parser.add_argument("--companion-click-f0", type=companion_click_positive_float, default=125.0, help="'uh' fundamental frequency in Hz (default %(default)s)")
     parser.add_argument("--companion-click-f1", type=companion_click_positive_float, default=600.0, help="'uh' first formant bandpass center in Hz (default %(default)s)")
     parser.add_argument("--companion-click-f2", type=companion_click_positive_float, default=1300.0, help="'uh' second formant bandpass center in Hz (default %(default)s)")
-    parser.add_argument("--status-port", type=int, default=48699, help="Local health/status HTTP port -- what ws_collab's google_meet STT driver and admin UI read (0 disables; default %(default)s)")
+    parser.add_argument("--status-port", type=int, default=48699, help="Local health/status HTTP port used by the ws_collab Meet diagnostics UI (0 disables; default %(default)s)")
     parser.add_argument("--self-name", default="You", help="Name captions attribute to the bridge account's own mic (Meet shows 'You'; default %(default)s)")
     parser.add_argument("--no-autojoin", action="store_true", help="Do not auto-click Join/mic/captions -- drive the Meet window manually")
     parser.add_argument("--browser", default=None, help="Path to chrome.exe/msedge.exe for the popup (auto-detected)")
@@ -3181,7 +3327,9 @@ def main() -> None:
         ignore=ignore,
         self_name=args.self_name,
         sender_prefix=args.sender_prefix,
+        retry_path=settings_dir / "meet_caption_retry.json",
     )
+    caption_emitter.retry_pending()
     # Live per-room snapshot, keyed by room id (e.g. "bgb-xqts-xjt") -- one
     # entry per DRIVER meeting this bridge has ever been in, holding
     # "as of last time we were there" host/companion profile+state. Never
@@ -4622,6 +4770,7 @@ def main() -> None:
                         meeting_url=holder.get("url"),
                         now=now_mono,
                         action_evaluate=mailbox.evaluate_meeting_silence_action,
+                        floor_guard=mailbox.local_mic_floor,
                     )
                     if queued.get("accepted") and queued.get("action") == "continue":
                         _log_companion_click(
@@ -4694,6 +4843,11 @@ def main() -> None:
         tab = holder.get("companion_tab")
         if tab is None or holder.get("companion_tab_id") != item.get("tabId"):
             raise RuntimeError("companion tab changed before playback")
+        local_floor = mailbox.local_mic_floor()
+        if local_floor.get("blocked"):
+            raise RuntimeError(
+                "companion playback blocked by local microphone floor"
+            )
         if item.get("kind") == "interject":
             decision = (item.get("metadata") or {}).get("decision") or {}
             phrase = str((item.get("metadata") or {}).get("phrase") or "uh")
@@ -4739,6 +4893,10 @@ def main() -> None:
         companion_audio.report_duration(str(item.get("id") or ""), duration)
         if cancel_event.is_set() or not _companion_audio_readiness(item.get("meetingUrl")).get("ready"):
             raise RuntimeError("companion speech cancelled before playback")
+        if mailbox.local_mic_floor().get("blocked"):
+            raise RuntimeError(
+                "companion playback blocked by local microphone floor"
+            )
         artifact_started = time.time()
         holder["companion_say_artifact_started_at"] = artifact_started
         holder["companion_say_artifact_until"] = artifact_started + duration + 2.0
@@ -5277,7 +5435,16 @@ def main() -> None:
                 except Exception as error:  # noqa: BLE001
                     print(f"[meet-chat] failed: {error}", file=sys.stderr, flush=True)
                 if args.speak:
-                    threading.Thread(target=speak_windows, args=(text,), daemon=True).start()
+                    floor = mailbox.local_mic_floor()
+                    if floor.get("blocked"):
+                        print(
+                            f"[outbox-tts] blocked by local microphone floor ({floor.get('state')})",
+                            flush=True,
+                        )
+                    else:
+                        threading.Thread(
+                            target=speak_windows, args=(text,), daemon=True
+                        ).start()
             stop.wait(1.5)
 
     if not args.no_out:
@@ -5293,9 +5460,14 @@ def main() -> None:
     last_autojoin_verdict = ""
     fallback_logged_keys: set[str] = set()
     next_poll_at = 0.0
+    next_caption_retry_at = 0.0
     push_reinstall_at = {role: 0.0 for role in CAPTION_ROLES}
     try:
         while True:
+            now = time.time()
+            if now >= next_caption_retry_at:
+                caption_emitter.retry_pending()
+                next_caption_retry_at = now + 2.0
             tab = holder["tab"]
             active_roles = ["host", *(["companion"] if holder.get("companion_tab") is not None else [])]
             for role, role_tab in (("host", tab), ("companion", holder.get("companion_tab"))):
