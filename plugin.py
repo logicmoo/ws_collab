@@ -70,4 +70,30 @@ def create_router(manifest: dict[str, Any] | None = None):
     return _create_router(manifest)
 
 
-__all__ = ["create_router", "resolve_ui_pages"]
+def start_server(
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    state_dir: str | Path | None = None,
+    timeout: float = 20.0,
+    python_executable: str | Path | None = None,
+) -> dict[str, Any]:
+    """Start/reuse the standalone service without needing its HTTP server alive.
+
+    This local Python API is for the plugin host, not an unauthenticated HTTP
+    route. The host must authorize any UI/remote action that invokes it.
+    """
+    if _mode() == "embedded":
+        raise RuntimeError("Embedded WS_COLLAB is owned by its host; standalone startup is unavailable")
+    from ws_collab import standalone
+
+    return standalone.start_server(
+        host=host if host is not None else standalone.DEFAULT_HOST,
+        port=port if port is not None else standalone.DEFAULT_PORT,
+        state_dir=state_dir,
+        timeout=timeout,
+        python_executable=python_executable,
+    )
+
+
+__all__ = ["create_router", "resolve_ui_pages", "start_server"]

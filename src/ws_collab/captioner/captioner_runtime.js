@@ -55,6 +55,7 @@
       this.rms = 0;
       this.threshold = this.onThreshold();
       this.lastMonotonicMs = null;
+      this.lastSampleClockMs = null;
       this.lastWallMs = null;
       this.hadSpeech = false;
       this.voicedCandidate = null;
@@ -81,12 +82,20 @@
       );
     }
 
-    processFrame(rms, monotonicMs, wallMs, epoch = this.epoch) {
+    processFrame(rms, monotonicMs, wallMs, epoch = this.epoch, sampleClockMs = monotonicMs) {
       if (this.epoch === null || epoch !== this.epoch) return [];
       if (![rms, monotonicMs, wallMs].every(Number.isFinite)) return [];
       if (this.lastMonotonicMs !== null && monotonicMs < this.lastMonotonicMs) return [];
+      if (!Number.isFinite(sampleClockMs)) return [];
+      if (this.lastSampleClockMs !== null && sampleClockMs < this.lastSampleClockMs) return [];
+      if (this.lastSampleClockMs !== null
+          && sampleClockMs - this.lastSampleClockMs > Math.max(250, this.frameIntervalMs * 5)) {
+        // A suspended/throttled analyser cannot certify silence during its missing frames.
+        this.reset(epoch);
+      }
       this.rms = Math.max(0, Math.min(1, rms));
       this.lastMonotonicMs = monotonicMs;
+      this.lastSampleClockMs = sampleClockMs;
       this.lastWallMs = wallMs;
       const events = [];
       const threshold = this.state === "speech" ? this.offThreshold() : this.onThreshold();
@@ -222,31 +231,54 @@
   }
 
   class PauseAssociation {
-    constructor({ maxPauses = MAX_PAUSES } = {}) {
+    constructor({ maxPauses = MAX_PAUSES, positionMapper = null } = {}) {
       this.maxPauses = maxPauses;
+      this.positionMapper = positionMapper;
       this.pending = [];
       this.keys = new Set();
       this.transcript = "";
+      this.openSilence = null;
+      this.utteranceId = null;
+      this.version = 0;
+      this.generation = 0;
     }
 
     reset() {
       this.pending = [];
       this.keys.clear();
       this.transcript = "";
+      this.openSilence = null;
+      this.utteranceId = null;
+      this.version += 1;
+      this.generation += 1;
     }
 
-    updateTranscript(text) {
+    updateTranscript(text, utteranceId = this.utteranceId) {
       this.transcript = String(text || "").trim().slice(0, 4000);
+      this.utteranceId = utteranceId;
+      this.version += 1;
+    }
+
+    silenceStarted(at) {
+      this.openSilence = { at, prefix: this.transcript, utteranceId: this.utteranceId };
     }
 
     record(pause) {
       const key = `${pause.start_at}|${pause.end_at}`;
       if (this.keys.has(key)) return false;
       this.keys.add(key);
-      const prefix = this.transcript;
+      const prefix = this.openSilence?.at === pause.start_at
+        ? this.openSilence.prefix : this.transcript;
+      const utteranceId = this.openSilence?.at === pause.start_at
+        ? this.openSilence.utteranceId : this.utteranceId;
+      this.openSilence = null;
       this.pending.push({
-        ...pause,
+        duration_ms: pause.duration_ms,
+        start_at: pause.start_at,
+        end_at: pause.end_at,
+        source: pause.source,
         prefix,
+        utteranceId,
         after_char: [...prefix].length,
         alignment: prefix ? "interim_prefix" : "between_utterances",
       });
@@ -259,14 +291,20 @@
 
     finalize(text, { consume = true } = {}) {
       const finalText = String(text || "").trim();
-      const pauses = this.pending.map(({ prefix, ...pause }) => {
+      const pauses = this.pending.map(({ prefix, utteranceId: _utteranceId, ...pause }) => {
         if (pause.alignment === "between_utterances") {
           return { ...pause, after_char: 0 };
+        }
+        if (this.positionMapper) {
+          return {
+            ...pause, after_char: this.positionMapper(prefix, finalText),
+            alignment: finalText.startsWith(prefix) ? pause.alignment : "approximate_text_position",
+          };
         }
         if (prefix && finalText.startsWith(prefix)) {
           return {
             ...pause,
-            after_char: Math.min([...prefix].length, [...finalText].length),
+            after_char: nearestTokenBoundary(finalText, [...prefix].length),
           };
         }
         return {
@@ -283,19 +321,101 @@
       };
     }
 
-    commit() {
-      this.pending = [];
-      this.keys.clear();
-      this.transcript = "";
+    snapshot(text, { reserve = false } = {}) {
+      const snapshot = {
+        metadata: this.finalize(text, { consume: false }),
+        entries: new Set(this.pending),
+        utteranceId: this.utteranceId,
+        version: this.version,
+        generation: this.generation,
+      };
+      if (reserve) this.pending = this.pending.filter(pause => !snapshot.entries.has(pause));
+      return snapshot;
     }
+
+    restore(snapshot) {
+      if (snapshot.generation !== this.generation) return;
+      const existing = new Set(this.pending);
+      this.pending = [...snapshot.entries].filter(pause => !existing.has(pause)).concat(this.pending);
+    }
+
+    commit(snapshot = null) {
+      if (snapshot && snapshot.generation !== this.generation) return;
+      const entries = snapshot?.entries || new Set(this.pending);
+      for (const pause of entries) this.keys.delete(`${pause.start_at}|${pause.end_at}`);
+      this.pending = this.pending.filter(pause => {
+        if (entries.has(pause)) {
+          this.keys.delete(`${pause.start_at}|${pause.end_at}`);
+          return false;
+        }
+        // A gap detected during the final's async save belongs at the next text boundary.
+        if (snapshot && pause.utteranceId === snapshot.utteranceId) {
+          pause.prefix = "";
+          pause.after_char = 0;
+          pause.alignment = "between_utterances";
+          pause.utteranceId = null;
+        }
+        return true;
+      });
+      if (!snapshot || this.version === snapshot.version) this.updateTranscript("", null);
+      if (this.openSilence && (!snapshot || this.openSilence.utteranceId === snapshot.utteranceId)) {
+        this.openSilence.prefix = "";
+        this.openSilence.utteranceId = null;
+      }
+    }
+  }
+
+  class RmsFrameAccumulator {
+    constructor(rate, intervalMs, emit) {
+      this.rate = rate;
+      this.frameSamples = Math.max(1, Math.round(rate * intervalMs / 1000));
+      this.emit = emit;
+      this.count = 0;
+      this.energy = 0;
+    }
+
+    push(samples, firstFrame) {
+      for (let index = 0; index < samples.length; index += 1) {
+        this.energy += samples[index] * samples[index];
+        this.count += 1;
+        if (this.count === this.frameSamples) {
+          this.emit({
+            rms: Math.sqrt(this.energy / this.count),
+            audio_time_ms: (firstFrame + index + 1) * 1000 / this.rate,
+          });
+          this.count = 0;
+          this.energy = 0;
+        }
+      }
+    }
+  }
+
+  // This same served file is also loaded inside AudioWorklet; no page timers or PCM messages.
+  if (typeof registerProcessor === "function") {
+    class MicrophoneRmsProcessor extends AudioWorkletProcessor {
+      constructor(options) {
+        super();
+        this.frames = new RmsFrameAccumulator(
+          sampleRate, options.processorOptions.frameIntervalMs,
+          (frame) => this.port.postMessage(frame)
+        );
+      }
+
+      process(inputs) {
+        const samples = inputs[0]?.[0];
+        if (samples) this.frames.push(samples, currentFrame);
+        return true;
+      }
+    }
+    registerProcessor("ws-collab-microphone-rms", MicrophoneRmsProcessor);
   }
 
   class BrowserVadCapture {
     constructor({
       mediaDevices,
       AudioContextClass,
-      setTimer = setInterval,
-      clearTimer = clearInterval,
+      AudioWorkletNodeClass = globalThis.AudioWorkletNode,
+      workletUrl = "captioner_runtime.js",
       monotonicNow = () => performance.now(),
       wallNow = () => Date.now(),
       vad = new BrowserRmsVad(),
@@ -304,8 +424,8 @@
     } = {}) {
       this.mediaDevices = mediaDevices;
       this.AudioContextClass = AudioContextClass;
-      this.setTimer = setTimer;
-      this.clearTimer = clearTimer;
+      this.AudioWorkletNodeClass = AudioWorkletNodeClass;
+      this.workletUrl = workletUrl;
       this.monotonicNow = monotonicNow;
       this.wallNow = wallNow;
       this.vad = vad;
@@ -314,9 +434,11 @@
       this.stream = null;
       this.context = null;
       this.source = null;
-      this.analyser = null;
-      this.samples = null;
-      this.timer = null;
+      this.processor = null;
+      this.output = null;
+      this.lastSampleMs = null;
+      this.lastFrameReceivedMs = null;
+      this.clockOrigin = null;
       this.generation = 0;
       this.permission = "unknown";
       this.error = null;
@@ -336,13 +458,15 @@
       if (this.stream) return true;
       const generation = ++this.generation;
       if (!this.mediaDevices || typeof this.mediaDevices.getUserMedia !== "function"
-          || !this.AudioContextClass) {
-        this.error = "Web Audio microphone capture is unavailable";
+          || !this.AudioContextClass || !this.AudioWorkletNodeClass) {
+        this.error = "AudioWorklet microphone capture is unavailable";
         this.onStatus(this.status());
         return false;
       }
+      let stream = null;
+      let context = null;
       try {
-        const stream = await this.mediaDevices.getUserMedia({
+        stream = await this.mediaDevices.getUserMedia({
           audio: {
             channelCount: { ideal: 1 },
             echoCancellation: { ideal: true },
@@ -354,7 +478,14 @@
           stream.getTracks().forEach((track) => track.stop());
           return false;
         }
-        const context = new this.AudioContextClass();
+        context = new this.AudioContextClass();
+        if (!context.audioWorklet) throw new Error("AudioWorklet is required for background silence detection");
+        await context.audioWorklet.addModule(this.workletUrl);
+        if (generation !== this.generation) {
+          stream.getTracks().forEach((track) => track.stop());
+          await context.close();
+          return false;
+        }
         const track = typeof stream.getAudioTracks === "function"
           ? stream.getAudioTracks()[0]
           : stream.getTracks()[0];
@@ -375,25 +506,53 @@
           sample_rate: scalar(settings.sampleRate),
         };
         const source = context.createMediaStreamSource(stream);
-        const analyser = context.createAnalyser();
-        analyser.fftSize = 1024;
-        analyser.smoothingTimeConstant = 0;
-        source.connect(analyser);
+        const processor = new this.AudioWorkletNodeClass(context, "ws-collab-microphone-rms", {
+          numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+          channelCount: 1, channelCountMode: "explicit",
+          processorOptions: { frameIntervalMs: this.vad.frameIntervalMs },
+        });
+        const output = context.createGain();
+        output.gain.value = 0;
+        source.connect(processor);
+        processor.connect(output);
+        output.connect(context.destination);
         if (context.state === "suspended" && typeof context.resume === "function") {
           await context.resume();
+        }
+        if (generation !== this.generation) {
+          source.disconnect();
+          stream.getTracks().forEach((track) => track.stop());
+          await context.close();
+          return false;
         }
         this.stream = stream;
         this.context = context;
         this.source = source;
-        this.analyser = analyser;
-        this.samples = new Float32Array(analyser.fftSize);
+        this.processor = processor;
+        this.output = output;
         this.permission = "granted";
         this.error = null;
         this.vad.start(epoch);
-        this.timer = this.setTimer(() => this.sample(epoch), this.vad.frameIntervalMs);
+        this.resetClock();
+        processor.port.onmessage = ({ data }) => {
+          if (generation === this.generation) this.sampleFrame(data, epoch);
+        };
+        processor.onprocessorerror = () => {
+          if (generation !== this.generation) return;
+          this.error = "Microphone audio processor failed";
+          void this.stop();
+        };
+        context.onstatechange = () => {
+          if (generation !== this.generation) return;
+          this.vad.reset(epoch);
+          this.resetClock();
+          this.onStatus(this.status());
+        };
         this.onStatus(this.status());
         return true;
       } catch (error) {
+        if (stream && stream !== this.stream) stream.getTracks().forEach((track) => track.stop());
+        if (context && context !== this.context && context.state !== "closed") await context.close();
         this.permission = error && error.name === "NotAllowedError" ? "denied" : "error";
         this.error = String((error && error.message) || error || "microphone capture failed").slice(0, 500);
         await this.stop();
@@ -402,19 +561,35 @@
       }
     }
 
-    sample(epoch) {
-      if (!this.analyser || this.vad.epoch !== epoch) return;
-      this.analyser.getFloatTimeDomainData(this.samples);
-      let sum = 0;
-      for (let index = 0; index < this.samples.length; index += 1) {
-        sum += this.samples[index] * this.samples[index];
+    resetClock() {
+      const audioMs = this.context.currentTime * 1000;
+      this.clockOrigin = { audioMs, monotonicMs: this.monotonicNow(), wallMs: this.wallNow() };
+      this.lastSampleMs = null;
+      this.lastFrameReceivedMs = null;
+    }
+
+    sampleFrame(frame, epoch) {
+      if (!this.processor || this.vad.epoch !== epoch || this.context.state !== "running") return;
+      if (!frame || !Number.isFinite(frame.rms) || !Number.isFinite(frame.audio_time_ms)) return;
+      const offset = frame.audio_time_ms - this.clockOrigin.audioMs;
+      if (offset < 0) return;
+      const receivedAt = this.monotonicNow();
+      const output = typeof this.context.getOutputTimestamp === "function"
+        ? this.context.getOutputTimestamp() : null;
+      let sampleAt = this.clockOrigin.monotonicMs + offset;
+      if (output && Number.isFinite(output.contextTime) && output.contextTime >= 0
+          && Number.isFinite(output.performanceTime) && output.performanceTime > 0) {
+        // The audio clock can advance at a different rate from performance.now().
+        sampleAt = output.performanceTime + frame.audio_time_ms - output.contextTime * 1000;
       }
-      const rms = Math.sqrt(sum / this.samples.length);
+      this.lastSampleMs = Math.max(this.lastSampleMs ?? -Infinity, Math.min(receivedAt, sampleAt));
+      this.lastFrameReceivedMs = receivedAt;
       const events = this.vad.processFrame(
-        rms,
-        this.monotonicNow(),
-        this.wallNow(),
-        epoch
+        frame.rms,
+        this.lastSampleMs,
+        this.wallNow() + this.lastSampleMs - receivedAt,
+        epoch,
+        frame.audio_time_ms
       );
       if (events.length) this.onEvents(events);
       this.onStatus(this.status());
@@ -422,18 +597,27 @@
 
     async stop() {
       this.generation += 1;
-      if (this.timer !== null) this.clearTimer(this.timer);
-      this.timer = null;
+      if (this.processor) {
+        this.processor.port.onmessage = null;
+        this.processor.onprocessorerror = null;
+        this.processor.port.close();
+        this.processor.disconnect();
+      }
+      if (this.output) this.output.disconnect();
       if (this.source && typeof this.source.disconnect === "function") {
         try { this.source.disconnect(); } catch (_) {}
       }
       if (this.stream) this.stream.getTracks().forEach((track) => track.stop());
       const context = this.context;
+      if (context) context.onstatechange = null;
       this.stream = null;
       this.context = null;
       this.source = null;
-      this.analyser = null;
-      this.samples = null;
+      this.processor = null;
+      this.output = null;
+      this.lastSampleMs = null;
+      this.lastFrameReceivedMs = null;
+      this.clockOrigin = null;
       this.vad.reset();
       if (context && typeof context.close === "function") {
         try { await context.close(); } catch (_) {}
@@ -442,11 +626,20 @@
     }
 
     status() {
+      const now = this.monotonicNow();
+      const receiving = this.lastFrameReceivedMs !== null && now - this.lastFrameReceivedMs <= 1000;
+      const running = this.stream && this.context?.state === "running";
+      let error = this.error;
+      if (!error && this.stream) {
+        if (!running) error = `Microphone audio context is ${this.context?.state || "unavailable"}`;
+        else if (this.lastFrameReceivedMs === null) error = "Waiting for microphone audio frames";
+        else if (!receiving) error = `No microphone audio frames received for ${Math.round(now - this.lastFrameReceivedMs)}ms`;
+      }
       return {
-        ...this.vad.status(this.monotonicNow()),
-        available: Boolean(this.stream),
+        ...this.vad.status(now),
+        available: Boolean(running && receiving),
         permission: this.permission,
-        error: this.error,
+        error,
         input: { ...this.input },
       };
     }
@@ -594,11 +787,62 @@
     }
   }
 
+  function captionerState({
+    paused, enabled, supported, terminal, terminalState, lastError,
+    authorized, authorityReason, queueBlocked, owned, starting, restarting,
+    speaking, listening, micPermission,
+  }) {
+    if (paused) return { state: "paused", label: "Paused", detail: "Listening paused by the user. Use Resume listening to continue." };
+    if (!enabled) return { state: "standby", label: "Disabled", detail: "Chrome Captions is disabled in the source controls." };
+    if (!supported) return { state: "unsupported", label: "Unsupported", detail: "Chrome Web Speech API is unavailable." };
+    if (micPermission === "denied") return { state: "permission_denied", label: "Permission denied", detail: "Allow microphone access in Chrome, then use Resume listening." };
+    if (terminal) return { state: terminalState, label: "Error", detail: lastError || "Recognition is unavailable." };
+    if (!authorized) return {
+      state: "standby", label: "Standby",
+      detail: `Waiting for backend selection: ${authorityReason || "selection unavailable"}.`,
+    };
+    if (queueBlocked) return { state: "error", label: "Delivery blocked", detail: "Caption delivery queue is full; waiting for acknowledgements." };
+    if (!owned) return { state: "standby", label: "Standby", detail: "Waiting for this window's microphone ownership." };
+    if (starting || restarting) return { state: "restarting", label: "Reconnecting", detail: "Reconnecting speech recognition; local detection continues if the microphone is available." };
+    if (speaking) return { state: "speaking", label: "Speaking", detail: "" };
+    if (listening) return { state: "listening", label: "Listening", detail: "" };
+    return { state: "idle", label: "Starting", detail: lastError || "Starting the microphone and speech recognition." };
+  }
+
+  function recognitionRestartDelay(reason, attempt, random = Math.random) {
+    const normalEnd = reason === "no-speech" || reason === "recognizer ended";
+    const base = normalEnd ? 500 : Math.min(30000, 500 * (2 ** Math.min(attempt - 1, 6)));
+    return base + Math.floor(random() * Math.min(3000, base * 0.25));
+  }
+
+  function recognitionUpdates(event) {
+    const updates = [];
+    const interim = [];
+    let interimIndex = null;
+    for (let index = 0; index < event.results.length; index += 1) {
+      const result = event.results[index];
+      const text = String(result[0]?.transcript || "").trim();
+      if (result.isFinal) {
+        if (index >= event.resultIndex && text) {
+          updates.push({ index, text, isFinal: true, confidence: result[0]?.confidence });
+        }
+      } else {
+        if (interimIndex === null) interimIndex = index;
+        if (text) interim.push(text);
+      }
+    }
+    if (interimIndex !== null && interim.length) {
+      updates.push({ index: interimIndex, text: interim.join(" "), isFinal: false, confidence: null });
+    }
+    return updates;
+  }
+
   return {
     MAX_PAUSES,
     MAX_PAUSE_MS,
     BrowserRmsVad,
     BrowserVadCapture,
+    RmsFrameAccumulator,
     PauseAssociation,
     createIdentity,
     nextFallbackSequence,
@@ -606,5 +850,8 @@
     classifyRecognitionError,
     pruneQueueRows,
     HeartbeatFailureGuard,
+    captionerState,
+    recognitionRestartDelay,
+    recognitionUpdates,
   };
 });

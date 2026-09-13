@@ -30,6 +30,10 @@
     <span class="brand">WS_COLLAB</span>
     <span class="mono" id="top-title" style="color:var(--text-secondary)">Transcript</span>
     <span class="spacer"></span>
+    <span id="lc-global" class="lc-global" hidden>
+      <a href="#chatbot-test" id="lc-global-state">ChatBot Test active</a>
+      <button id="lc-global-stop" class="danger" title="Stop ChatBot Test and browser speech immediately; existing STT listening is unaffected">Stop voice chat</button>
+    </span>
     <span class="mono" style="color:var(--text-muted)" id="top-clock">--:--:--</span>
     <span class="transport-wrap">
       <button class="transport-badge" id="transport" data-state="disconnected"
@@ -43,6 +47,11 @@
           <span class="mono hint" id="endpoint-retry"></span>
         </div>
       </div>
+    </span>
+    <span class="server-controls" role="group" aria-label="WS_COLLAB server controls">
+      <button id="server-restart" type="button" title="Restart only WS_COLLAB, loading fresh server code. Requires confirmation and operator permission.">Restart WS_COLLAB</button>
+      <button id="server-shutdown" type="button" class="danger" title="Gracefully shut down WS_COLLAB. This page cannot start it afterward; use the external launcher. Requires confirmation and operator permission.">Shut down WS_COLLAB</button>
+      <span id="server-lifecycle-result" class="server-lifecycle-result" role="status" aria-live="polite" hidden></span>
     </span>
     <button id="inspector-toggle" title="Toggle inspector">Inspector</button>
     <button id="logout">Sign out</button>
@@ -58,6 +67,11 @@
     <div class="nav-item" data-page="conversation" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 3h12v8H6l-4 3z"/></svg>
       <span class="nav-label">Conversation</span>
+    </div>
+    <div class="nav-item" data-page="chatbot-test" tabindex="0">
+      <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 3h12v8H6l-4 3zM5 6v2M8 5v4M11 6v2"/></svg>
+      <span class="nav-label">ChatBot Test</span>
+      <span class="status-dot" id="lc-nav-dot" title="Voice chat stopped"></span>
     </div>
     <div class="nav-item nav-expandable" id="nav-streams" data-page="streams" tabindex="0">
       <svg class="nav-icon" viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
@@ -178,6 +192,134 @@
       <button class="jump-latest" id="cv-jump">↓ Jump to latest (<span id="cv-unseen">0</span> unseen)</button>
     </section>
 
+    <!-- ------------------------------------------------------- language chat -->
+    <section class="page" data-page="chatbot-test" aria-label="ChatBot Test">
+      <div class="toolbar lc-controls">
+        <button id="lc-start" class="primary" title="Opt in once: automatically monitor finalized non-echo STT between replies; wait for the full model response and browser playback before accepting another turn" disabled>Start voice chat</button>
+        <button id="lc-stop" class="danger" title="Stop LLM turns and cancel browser speech immediately; do not stop the existing STT pipeline" disabled>Stop</button>
+        <button id="lc-interrupt" title="Cancel the current generated reply and browser speech explicitly; input resumes when the server gate reopens after the echo tail" disabled>Interrupt reply</button>
+        <button id="lc-send-now" title="Submit the pending spoken turn now instead of waiting for the silence threshold" disabled>Send now</button>
+        <button id="lc-captioner" title="Foreground the existing Chrome Captions window without changing its source policy or starting another microphone">Open Chrome Captions</button>
+      </div>
+      <div class="panel-body lc-body">
+        <div class="lc-intro">
+          <h2>ChatBot Test</h2>
+          <p>Test and learn with a registered emullm agent whose prompt and history you maintain. Choose <strong>Start voice chat</strong> once to enable automatic monitoring of the existing STT pipeline. Finalized non-echo speech is sent after the turn-silence threshold; no per-turn Send is required. Nothing is sent to this agent before Start. Stop ends LLM/TTS activity, not existing STT listening.</p>
+          <p><strong>Half-duplex:</strong> wait for the full model response, the entire browser TTS queue, and a brief echo tail before speaking again. Speech during replies is ignored by this agent, not treated as interruption or queued for later. Shared STT/VAD continues independently. There is no automatic voice barge-in; use <strong>Interrupt reply</strong> explicitly if needed.</p>
+        </div>
+        <div id="lc-error" class="lc-error" role="alert" hidden></div>
+        <dl class="lc-status" aria-label="Live voice chat status">
+          <div><dt>Mode / phase</dt><dd id="lc-phase" role="status">Loading…</dd></div>
+          <div><dt>Half-duplex agent input</dt><dd id="lc-input-gate" role="status">Input gate unknown</dd><dd id="lc-input-detail" class="hint">Waiting for server input status.</dd></div>
+          <div><dt>Existing STT input / silence</dt><dd id="lc-mic">Unknown</dd></div>
+          <div><dt>Registered agent / emullm model</dt><dd id="lc-model-status">Not loaded</dd></div>
+          <div><dt>Browser TTS</dt><dd id="lc-tts" role="status">Start to enable spoken replies</dd></div>
+        </dl>
+        <div class="lc-layout">
+          <div class="lc-conversation">
+            <div class="panel">
+              <div class="panel-title lc-heading">Conversation <button id="lc-latest" title="Scroll to the most recent chat turn" hidden>Jump to latest</button></div>
+              <div class="panel-content">
+                <div id="lc-messages" role="log" aria-label="User turns and streamed agent replies" aria-live="off" tabindex="0">
+                  <p class="hint">No turns yet. Start voice chat to automatically test emullm/default with the existing STT pipeline. Typing is optional.</p>
+                </div>
+                <div class="lc-pending"><strong>Pending spoken turn</strong><div id="lc-pending">No pending speech.</div></div>
+                <form id="lc-composer" class="lc-composer">
+                  <label for="lc-text">Type a message</label>
+                  <textarea id="lc-text" rows="2" placeholder="Message the selected agent…" aria-describedby="lc-compose-help"></textarea>
+                  <div class="lc-heading">
+                    <span class="hint" id="lc-compose-help">Start once, then speak when the agent is ready. Typing and Send now are optional test controls.</span>
+                    <button id="lc-send" class="primary" type="submit" title="Submit this typed message to the active emullm agent" disabled>Send message</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+            <div class="panel" aria-labelledby="lc-timing-title">
+              <div class="panel-title lc-heading"><span id="lc-timing-title">Timing trace</span><span id="lc-timing-status" role="status">No timed turn</span></div>
+              <div class="panel-content">
+                <p id="lc-timing-turn" class="hint mono">No turn timings received yet.</p>
+                <p id="lc-timing-total" class="lc-timing-total"></p>
+                <ol id="lc-timing-stages" class="lc-timing-stages" aria-label="Latest turn timing stages"></ol>
+                <p class="hint">Backend measurements only; Not measured means unknown, not zero. Waiting stages are not completed. emullm response total includes time to first token, so do not sum every row. Elapsed time is not an estimated LLM duration.</p>
+              </div>
+            </div>
+            <div class="panel">
+              <div class="panel-title">Spoken replies</div>
+              <div class="panel-content">
+                <label class="inline"><input type="checkbox" id="lc-mute" title="Immediately cancel browser speech and keep subsequent replies as text only" /> Mute replies</label>
+                <p id="lc-speech-estimate" class="hint" hidden></p>
+                <p class="hint">Speech-duration estimates are approximate (180 words/minute × speech rate), not countdowns. More text may arrive while the model responds. Only actual browser completion/error acknowledgements and the server input gate determine when you can speak again.</p>
+                <p class="hint" id="lc-voice-help">Start or Save agent settings automatically binds and saves an installed/default browser voice for this agent; no manual voice setup is needed. Replies use real browser speechSynthesis, not the server TTS placeholder. Every page gets a fresh owner id; only the active owner page speaks. After reload, Start is available once the previous session stops or its lease expires.</p>
+                <p class="hint">Use headphones. This agent monitors the existing STT pipeline, including Chrome Captions and other enabled STT sources; no second microphone is opened. Echo cancellation is not a guarantee: speaker audio can be transcribed. Check <a href="#stt">STT engines</a> or <a href="#chrome-captions">caption source policy</a> if input is paused, disabled, or unavailable.</p>
+              </div>
+            </div>
+          </div>
+          <div class="lc-editors">
+            <div class="panel">
+              <div class="panel-title">Registered agent settings</div>
+              <div class="panel-content">
+                <p class="hint">Type model IDs and endpoint URLs directly, even while chat is running. Suggestions are optional. Stop chat before applying changes; drafts are kept during refreshes. Other settings are edited while stopped.</p>
+                <form id="lc-settings">
+                  <fieldset id="lc-settings-fields" class="lc-fields" disabled>
+                    <label for="lc-agent">Agent id</label>
+                    <div class="lc-input-row">
+                      <input type="text" id="lc-agent" list="lc-agents" value="language-chat" required autocomplete="off" />
+                      <datalist id="lc-agents"></datalist>
+                      <button id="lc-load-agent" type="button" title="Load this agent's saved prompt, settings and history; save any edits first">Load agent</button>
+                    </div>
+                    <label for="lc-endpoint">emullm endpoint</label>
+                    <input type="text" id="lc-endpoint" value="http://127.0.0.1:8801/v1" placeholder="Type an OpenAI-compatible HTTP(S) endpoint" required spellcheck="false" autocomplete="off" aria-describedby="lc-models-note" />
+                    <label for="lc-model">emullm model id</label>
+                    <div class="lc-input-row">
+                      <input type="text" id="lc-model" list="lc-models" value="emullm/default" placeholder="Type any model ID; suggestions are optional" required autocomplete="off" spellcheck="false" aria-describedby="lc-models-note" />
+                      <datalist id="lc-models"></datalist>
+                      <button id="lc-refresh-models" type="button" title="List models from the saved emullm endpoint; never download a model">Refresh models</button>
+                    </div>
+                    <span class="hint" id="lc-models-note">Free-text model ID and endpoint: entries need not appear in discovery results. Refresh queries the saved endpoint, never an unsaved draft. Save applies your text; server URL validation still applies.</span>
+                    <span class="hint" id="lc-model-route-hint"></span>
+                    <label for="lc-prompt">System prompt</label>
+                    <textarea id="lc-prompt" rows="5" placeholder="Instructions for this registered agent"></textarea>
+                    <div class="lc-field-grid">
+                      <label for="lc-silence">Turn silence (ms)<input type="number" id="lc-silence" value="1000" min="300" max="10000" step="1" required /></label>
+                      <label for="lc-max-tokens">Max output tokens<input type="number" id="lc-max-tokens" value="512" min="64" max="4096" required /></label>
+                      <label for="lc-history-limit">History messages<input type="number" id="lc-history-limit" value="24" min="1" step="1" required /></label>
+                      <label for="lc-language">Speech language<input type="text" id="lc-language" value="en-US" required /></label>
+                    </div>
+                    <label for="lc-voice">Browser voice override (optional)</label>
+                    <select id="lc-voice" aria-describedby="lc-voice-help"><option value="">Auto-bind installed/default voice on Start or Save</option></select>
+                    <label for="lc-rate">Speech rate (0.5–2×)</label>
+                    <input type="number" id="lc-rate" min="0.5" max="2" step="0.1" value="1" required />
+                    <button class="primary" type="submit" id="lc-save-settings" title="Save this agent's model, endpoint, system prompt and voice settings">Save agent settings</button>
+                  </fieldset>
+                  <p id="lc-settings-result" class="hint" role="status"></p>
+                </form>
+              </div>
+            </div>
+            <details class="panel" open>
+              <summary class="panel-title">Editable model history</summary>
+              <div class="panel-content">
+                <p class="hint" id="lc-history-help">JSON array of <code>{"role":"user","content":"Hello"}</code> or assistant messages. Use only <code>user</code>/<code>assistant</code> roles; edit the system prompt above. Saving replaces the next model context, not the append-only audit log. Agent-voice announcements appear in the conversation but are excluded from this model history.</p>
+                <form id="lc-history-form">
+                  <label for="lc-history">History for the loaded agent</label>
+                  <textarea id="lc-history" rows="8" aria-describedby="lc-history-help" spellcheck="false" disabled>[]</textarea>
+                  <button id="lc-save-history" type="submit" title="Replace this agent's editable conversation context while stopped; retain the audit log" disabled>Save history</button>
+                  <p id="lc-history-result" class="hint" role="status"></p>
+                </form>
+              </div>
+            </details>
+            <details class="panel" id="lc-preview-panel">
+              <summary class="panel-title">Submitted-context inspector</summary>
+              <div class="panel-content">
+                <p class="hint">Inspect the exact next request from saved server context: model, messages, stream and max_tokens. Unsaved edits are not included. New turns can change the request after inspection. This client submits chat context only; external emullm agent permissions govern its actions.</p>
+                <button id="lc-preview" title="Fetch the next emullm request payload without credentials">Inspect exact next submitted request</button>
+                <pre id="lc-request" tabindex="0">No request inspected yet.</pre>
+              </div>
+            </details>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- ------------------------------------------------------ jsonl streams -->
     <section class="page" data-page="streams">
       <div class="toolbar">
@@ -271,11 +413,11 @@
     <!-- ------------------------------------------------------ chrome captions -->
     <section class="page" data-page="chrome-captions">
       <div class="toolbar">
-        <button class="primary" id="cc-refresh">Refresh</button>
-        <button id="cc-open">Open</button>
-        <button id="cc-focus">Foreground</button>
-        <button id="cc-pause">Pause</button>
-        <button id="cc-resume">Resume</button>
+        <button class="primary" id="cc-refresh" title="Reload driver status and saved captions without restarting listening.">Refresh</button>
+        <button id="cc-open" title="Open or reuse the dedicated Chrome Captions browser tab. This does not resume a user pause or change the primary source.">Open captioner</button>
+        <button id="cc-focus" title="Open or bring the dedicated Chrome Captions window to the front so you can see it and respond to microphone permission prompts.">Show window</button>
+        <button id="cc-pause" title="Stop Chrome Captions listening: release the microphone and stop speech recognition and silence detection until you resume. Saved captions are kept.">Pause listening</button>
+        <button id="cc-resume" title="Clear the user pause so the backend-selected Chrome Captions window can listen again. This does not change the primary source.">Resume listening</button>
         <label class="hint" for="cc-language">Language</label>
         <input id="cc-language" value="en-US" maxlength="35" style="width:90px" />
         <label class="hint" for="cc-send-interims">
@@ -288,15 +430,16 @@
           <div class="panel-content">
             <div id="cc-status">Loading Chrome Captions status...</div>
             <div id="cc-health" class="hint"></div>
-            <div id="cc-vad" class="hint">Local pause detector: waiting for heartbeat</div>
+            <div id="cc-vad" class="hint">Local silence detector: waiting for heartbeat</div>
             <div id="cc-input" class="hint">Input scope: microphone</div>
             <div id="cc-floor" class="hint">Local microphone floor: unknown</div>
             <div id="cc-profile" class="hint mono"></div>
             <div id="cc-suppressions" class="hint"></div>
             <div id="cc-policy-summary" class="hint"></div>
             <div class="hint">Autostarts with WS_COLLAB · Browser tab required · May run in background/minimized · First run requires visible microphone permission</div>
+            <div class="hint">Silence means listening is active. Pause listening is an explicit user action that stops detection; standby, reconnecting, and permission errors are not pauses.</div>
             <div class="hint">Chrome Web Speech may use Google cloud. It is not local or offline recognition. Pause detection separately analyzes microphone RMS in the browser; WS_COLLAB does not transmit or store those samples.</div>
-            <div class="hint"><strong>Input scope: microphone only.</strong> Other tabs are not captured directly. Speaker audio that leaks into the mic cannot be reliably identified; use headphones or separate virtual audio devices. Chrome Web Speech listens to the Chrome/OS default input.</div>
+            <div class="hint"><strong>Input scope: microphone only.</strong> Recognition and silence detection share the same microphone track (Chrome desktop 135 or newer). Other tabs are not captured directly. Speaker audio that leaks into the mic cannot be reliably identified; use headphones or separate virtual audio devices.</div>
             <div class="hint"><strong>Isolated browser profile: no Google login is used or inherited.</strong></div>
           </div>
         </div>
@@ -321,7 +464,7 @@
         <div class="panel">
           <div class="panel-title">Browser captioner instances</div>
           <div class="panel-content">
-            <div class="hint">The backend selects exactly one healthy tab. Pinned selection is retained while fresh; instance Disable lasts for that tab instance and resets when the tab reloads with a new instance ID.</div>
+            <div class="hint">Live pages and earlier page records are listed separately. A new page instance ID can mean a reload of the same browser tab, not another window. Recognition retry means the speech engine is reconnecting, not that Chrome disconnected. The backend selects one fresh, enabled page; pinned selection lasts while fresh.</div>
             <div id="cc-instances">Waiting for browser instance heartbeats…</div>
           </div>
         </div>
@@ -349,7 +492,7 @@
               <span class="transcript-empty">No finalized Chrome captions yet.</span>
             </div>
             <div class="hint cc-marker-help">
-              Solid blue markers are acoustic pauses measured locally from microphone RMS (position is best-effort because Chrome has no word timestamps); dashed ~ markers are approximate event-time gaps.
+              Speech appears here as it starts; italic words are provisional until confirmed. Solid blue durations are silence measured locally from microphone RMS (position is best-effort because Chrome has no word timestamps); dashed ~ markers are approximate event-time gaps. The last indicator counts ongoing silence while listening. "Last caption" is caption age, not measured silence.
             </div>
           </div>
         </div>
@@ -828,6 +971,7 @@
 
 <script src="silences.js"></script>
 <script src="transcript_runtime.js"></script>
+<script src="language_chat_runtime.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

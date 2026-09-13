@@ -70,7 +70,12 @@ button:disabled { opacity: .45; cursor: default; }
   transform: scaleX(var(--silence-scale));
   transform-origin: center;
 }
-.silence-marker svg { width: 8px; height: 10px; fill: currentColor; flex: none; }
+.transcript-live-tail { margin-inline-start: 6px; font-size: .85em; }
+.transcript-draft { font-size: 1.176em; font-style: italic; margin-inline-end: 6px; }
+.transcript-last-age, .transcript-detector-state { color: #94a3b8; }
+.transcript-last-age { font-variant-numeric: tabular-nums; }
+.silence-marker.live { transform: none; font-variant-numeric: tabular-nums; }
+.silence-marker[hidden] { display: none; }
 .silence-marker.approximate { border-style: dashed; opacity: .72; }
 .error { min-height: 1.5em; color: #fca5a5; margin-top: 16px; }
 footer { margin-top: 32px; color: #94a3b8; font-size: .82rem; line-height: 1.5; }
@@ -80,6 +85,5 @@ a { color: #7dd3fc; }
   .controls { align-items: stretch; flex-direction: column; }
 }
 @media (max-width: 380px) {
-  .silence-marker svg { display: none; }
   .silence-marker { margin-inline: 3px; }
 }

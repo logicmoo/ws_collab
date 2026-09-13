@@ -62,6 +62,9 @@ const state = {
   ws: null,
   wsReady: false,
   restTimers: {},
+  restControllers: new Map(),
+  restInFlight: 0,
+  restGeneration: 0,
   page: "transcript",
   selected: null,
   inspectorTab: "event",
@@ -256,6 +259,489 @@ function pushError(message) {
   $("sb-errors").textContent = state.errors[0] || "";
 }
 
+/* ----------------------------------------------------------- language chat */
+let languageChat = null;
+
+function initLanguageChat() {
+  if (languageChat) return;
+  const logic = window.WsCollabLanguageChat;
+  if (!logic) {
+    $("lc-error").hidden = false;
+    $("lc-error").textContent = "ChatBot Test runtime failed to load. Reload after checking the admin static asset route.";
+    return;
+  }
+  const clientId = logic.createClientId(sessionStorage, window.crypto);
+  const gate = logic.createRevisionGate();
+  const settingsDraft = logic.createDraft();
+  const historyDraft = logic.createDraft();
+  const defaultModel = "emullm/default";
+  let latest = null, visible = false, timer = null, polling = false, unloading = false;
+  let busy = 0, stopRequested = false, contactError = "", actionError = "", localMute = null;
+  let commandChain = Promise.resolve(), lastHeartbeat = 0, messagesSignature = "", voicesSignature = "", timingSignature = "";
+  let followLatest = true, settingsContentDirty = false;
+  const fields = {
+    agent_id: "lc-agent", endpoint: "lc-endpoint", model: "lc-model", system_prompt: "lc-prompt",
+    turn_silence_ms: "lc-silence", max_tokens: "lc-max-tokens", history_limit: "lc-history-limit",
+    language: "lc-language", voice_uri: "lc-voice", speech_rate: "lc-rate",
+  };
+
+  async function request(path, body, timeout = 3500) {
+    const abort = new AbortController();
+    const deadline = setTimeout(() => abort.abort(), timeout);
+    try {
+      const response = await fetch(`${API_BASE}${path}`, {
+        method: body === undefined ? "GET" : "POST",
+        headers: { Authorization: `Bearer ${state.token}`, "Content-Type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: abort.signal,
+        cache: "no-store",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const detail = (payload.error && (payload.error.message || payload.error)) || payload.detail || response.statusText;
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+      return payload;
+    } catch (error) {
+      if (error.name === "AbortError") throw new Error("ChatBot Test request timed out; server state is unknown.");
+      throw error;
+    } finally { clearTimeout(deadline); }
+  }
+
+  const playback = logic.createPlayback({
+    clientId, storage: sessionStorage, synthesis: window.speechSynthesis,
+    Utterance: window.SpeechSynthesisUtterance,
+    ack: (body) => request("/language-chat/heartbeat", body),
+    onStatus: (status) => {
+      if (status.status === "unknown") contactError = status.detail;
+      render();
+    },
+    onUnreachable: (error) => { contactError = error.message || String(error); render(); },
+  });
+
+  function setText(id, text) {
+    const node = $(id);
+    const value = String(text == null ? "" : text);
+    if (node.textContent !== value) node.textContent = value;
+  }
+
+  function installedVoices() {
+    try { return window.speechSynthesis ? window.speechSynthesis.getVoices() : []; }
+    catch (_) { return []; }
+  }
+
+  function refreshVoices() {
+    const voices = installedVoices();
+    const selected = $("lc-voice").value || (latest && latest.config.voice_uri) || "";
+    const signature = JSON.stringify([selected, voices.map((v) => [v.voiceURI, v.name, v.lang, v.localService])]);
+    if (signature === voicesSignature) return;
+    voicesSignature = signature;
+    const select = $("lc-voice");
+    select.replaceChildren();
+    const add = (value, text) => {
+      const option = el("option", "", text);
+      option.value = value;
+      select.appendChild(option);
+    };
+    add("", "Auto-bind installed/default voice on Start or Save");
+    voices.forEach((voice) => add(voice.voiceURI, `${voice.name} — ${voice.lang} (${voice.localService ? "local" : "network"})`));
+    if (selected && !voices.some((voice) => voice.voiceURI === selected)) add(selected, `${selected} — unavailable`);
+    select.value = selected;
+  }
+
+  function syncForms() {
+    if (!latest) return;
+    settingsDraft.sync(() => {
+      Object.entries(fields).forEach(([key, id]) => {
+        if (id === "lc-voice") return;
+        const value = key === "agent_id" ? latest.agent_id : key === "model" ? latest.config.model || defaultModel : latest.config[key];
+        $(id).value = value == null ? "" : String(value);
+      });
+      // Show missing configured voices in the editor; Start automatically rebinds them.
+      if (![...$("lc-voice").options].some((option) => option.value === (latest.config.voice_uri || ""))) {
+        const option = el("option", "", `${latest.config.voice_uri} — unavailable`);
+        option.value = latest.config.voice_uri;
+        $("lc-voice").appendChild(option);
+      }
+      $("lc-voice").value = latest.config.voice_uri || "";
+    });
+    historyDraft.sync(() => {
+      $("lc-history").value = fmt((latest.messages || [])
+        .filter((message) => ["user", "assistant"].includes(message.role) && message.channel !== "agent_voice")
+        .map(({ role, content }) => ({ role, content })));
+    });
+    $("lc-mute").checked = localMute === null ? latest.config.speak_replies === false : localMute;
+    const agents = (latest.agents || []).map((agent) => agent.agent_id);
+    if (JSON.stringify(agents) !== $("lc-agents").dataset.ids) {
+      $("lc-agents").dataset.ids = JSON.stringify(agents);
+      $("lc-agents").replaceChildren(...agents.map((id) => {
+        const option = el("option", "", id);
+        option.value = id;
+        return option;
+      }));
+    }
+  }
+
+  function render() {
+    const active = !!(latest && latest.active);
+    const owner = active && latest.client_id === clientId;
+    const unknown = !!contactError;
+    const dirty = settingsDraft.dirty || historyDraft.dirty;
+    const canControl = owner && !stopRequested;
+    const inputAccepting = !!(active && latest.input_accepting === true && !stopRequested && !unknown);
+    const errors = [contactError, actionError, latest && latest.error, latest && latest.microphone && latest.microphone.error].filter(Boolean);
+    setText("lc-error", errors.map((error) => typeof error === "string" ? error : fmt(error)).join("\n"));
+    $("lc-error").hidden = !errors.length;
+    setText("lc-phase", unknown ? "Unknown — playback paused" : stopRequested && active ? "Stop requested — awaiting confirmation" : active ? `${latest.phase || "active"} · ${owner ? "this client" : "another client"}` : latest ? "Stopped — opt-in only" : "Loading…");
+    const inputKnown = latest && typeof latest.input_accepting === "boolean" && !unknown;
+    setText("lc-input-gate", !inputKnown ? "Input gate unknown" : !active || stopRequested ? "Stopped — input not accepted" : inputAccepting ? "Ready for your speech" : "Agent replying — waiting for playback");
+    $("lc-input-gate").dataset.state = inputAccepting ? "ready" : active && inputKnown ? "waiting" : "unknown";
+    const suppressed = latest && latest.suppressed_input_count;
+    const suppressedText = typeof suppressed === "number" && Number.isFinite(suppressed) && suppressed >= 0 ? String(suppressed) : "not reported";
+    setText("lc-input-detail", `Gate reason: ${latest && latest.input_gate_reason || "not reported"} · Suppressed input: ${suppressedText}. Shared STT/VAD continues.`);
+    const mic = latest && latest.microphone;
+    setText("lc-mic", mic ? `${mic.available ? (mic.state || "available") : "unavailable"} · silence ${Number.isFinite(Number(mic.current_silence_ms)) && mic.current_silence_ms != null ? Math.max(0, Math.round(Number(mic.current_silence_ms))) + " ms" : "unknown"}` : "Unknown");
+    const pinnedWorker = latest && String(latest.config.endpoint || "").match(/\/emullm\/specific_worker\/([^/?#]+)\/v1\/?$/);
+    setText("lc-model-status", latest
+      ? `${latest.agent_id} · ${latest.config.model || defaultModel}${pinnedWorker ? ` · ${pinnedWorker[1]} (pinned)` : ""}`
+      : "Not loaded");
+    setText("lc-model-route-hint", pinnedWorker
+      ? "Worker-pinned endpoint: changing only the model label does not change that worker's backing model. Select the intended worker endpoint when switching models."
+      : "Select or type a model ID. Emullm controls routing; a requested label alone does not verify the backing model.");
+    setText("lc-tts", `${playback.status}: ${playback.detail}`);
+    $("lc-global").hidden = !(active || stopRequested);
+    setText("lc-global-state", unknown ? "ChatBot Test unknown" : stopRequested ? "ChatBot Test stopping" : owner ? "ChatBot Test active" : "ChatBot Test · other client");
+    $("lc-global-stop").disabled = active && !owner;
+    $("lc-nav-dot").title = unknown ? "Voice chat state unknown" : active ? "Voice chat active" : "Voice chat stopped";
+    $("lc-nav-dot").className = `status-dot${unknown ? " warn" : active ? " ok" : ""}`;
+    $("lc-start").disabled = !latest || !!busy || unknown || dirty || (active && (!owner || playback.armed)) || stopRequested;
+    $("lc-stop").disabled = (!active && !busy && !stopRequested) || (active && !owner);
+    $("lc-interrupt").disabled = !canControl || unknown;
+    $("lc-send-now").disabled = !canControl || !inputAccepting || !!busy || !latest.pending_text;
+    $("lc-send").disabled = !canControl || !inputAccepting || !!busy || !$("lc-text").value.trim();
+    $("lc-mute").disabled = !latest || !!busy || (active && !owner);
+    const settingsLocked = !latest || active || !!busy || unknown;
+    $("lc-settings-fields").disabled = !latest;
+    Object.entries(fields).forEach(([name, id]) => {
+      $(id).disabled = name === "model" || name === "endpoint" ? !latest : settingsLocked;
+    });
+    $("lc-load-agent").disabled = settingsLocked;
+    $("lc-save-settings").disabled = settingsLocked;
+    $("lc-history").disabled = !latest || active || !!busy || unknown;
+    $("lc-save-history").disabled = !latest || active || !!busy || unknown || $("lc-agent").value.trim() !== latest.agent_id;
+    setText("lc-compose-help", active ? (owner ? inputAccepting ? "Automatically monitoring finalized non-echo STT. Ready for your speech; typing and Send now are optional." : "Wait for the full response and all playback, or use Interrupt reply. Speech does not automatically interrupt the agent." : "Another client owns this session; this page is read-only.") : "Start once, then speak when the agent is ready. Typing and Send now are optional test controls.");
+    if (!visible) return;
+    syncForms();
+    const estimateMs = $("lc-mute").checked ? null : logic.queuedSpeechEstimateMs(latest);
+    $("lc-speech-estimate").hidden = estimateMs === null;
+    setText("lc-speech-estimate", estimateMs === null ? "" : `Approximate speech duration for current + queued text: ~${logic.formatDurationMs(estimateMs)}. Not a completion signal or remaining-time countdown.`);
+    const trace = logic.timingTrace(latest && latest.turn_timings);
+    setText("lc-timing-status", trace ? trace.status : "No timed turn");
+    const receivedAt = trace ? logic.timestampMillis(trace.latest.input_received_at) : null;
+    setText("lc-timing-turn", trace ? `${trace.latest.agent_id || "Unknown agent"} · ${trace.latest.message_id || "Unknown message"} · source ${trace.latest.input_source || "not measured"}${receivedAt === null ? "" : ` · received ${new Date(receivedAt).toLocaleTimeString()}`}` : "No turn timings received yet.");
+    setText("lc-timing-total", trace ? `Elapsed: ${trace.elapsed} · Total: ${trace.total}` : "");
+    const stages = trace ? trace.stages : [];
+    const nextTimingSignature = JSON.stringify(stages);
+    if (nextTimingSignature !== timingSignature) {
+      timingSignature = nextTimingSignature;
+      $("lc-timing-stages").replaceChildren(...stages.map((stage) => {
+        const row = el("li");
+        row.dataset.state = stage.state;
+        row.append(el("span", "", stage.label), el("span", "lc-timing-value", stage.display));
+        return row;
+      }));
+    }
+    setText("lc-pending", latest && latest.pending_text || "No pending speech.");
+    const messages = latest && latest.messages || [];
+    const signature = JSON.stringify(messages);
+    if (signature !== messagesSignature) {
+      messagesSignature = signature;
+      const log = $("lc-messages");
+      const position = log.scrollTop;
+      log.replaceChildren(...messages.map((message) => logic.renderMessage(document, message)));
+      if (!messages.length) log.appendChild(el("p", "hint", "No turns yet. Start voice chat to automatically test the selected emullm agent with the existing STT pipeline. Typing is optional."));
+      if (followLatest) log.scrollTop = log.scrollHeight;
+      else { log.scrollTop = position; $("lc-latest").hidden = false; }
+    }
+  }
+
+  function accept(payload, ticket, after) {
+    if (!payload || typeof payload.active !== "boolean" || !payload.config) throw new Error("ChatBot Test returned an invalid state.");
+    if (!gate.accept(ticket, payload) || unloading) return false;
+    if (after) after(payload);
+    latest = payload;
+    contactError = "";
+    if (!payload.active) stopRequested = false;
+    // A late server snapshot may still say active after Stop. Never re-arm locally.
+    if (stopRequested) playback.stop();
+    else playback.update(payload);
+    render();
+    return true;
+  }
+
+  function schedule(delay) {
+    clearTimeout(timer);
+    if (!unloading && (visible || (latest && latest.active) || stopRequested)) timer = setTimeout(poll, delay);
+  }
+
+  async function poll() {
+    if (unloading || polling || busy) { schedule(450); return; }
+    polling = true;
+    const ticket = gate.ticket();
+    try {
+      const payload = await request("/language-chat");
+      if (accept(payload, ticket) && payload.active && payload.client_id === clientId && !stopRequested &&
+          Date.now() - lastHeartbeat >= 2400) {
+        lastHeartbeat = Date.now();
+        playback.heartbeat();
+      }
+    } catch (error) {
+      if (gate.current(ticket) && !unloading) {
+        contactError = error.message;
+        playback.unavailable(error.message);
+        render();
+      }
+    } finally {
+      polling = false;
+      schedule(latest && latest.active || stopRequested ? 450 : 2000);
+    }
+  }
+
+  function command(path, body, after, before) {
+    gate.invalidate();
+    const ticket = gate.ticket();
+    busy += 1;
+    actionError = "";
+    render();
+    const work = commandChain.then(async () => {
+      try {
+        if (!gate.current(ticket) || unloading) return;
+        if (before) await before(ticket);
+        if (!gate.current(ticket) || unloading) return;
+        let payload = await request(`/language-chat/${path}`, body);
+        if (!payload || typeof payload.active !== "boolean" || !payload.config) payload = await request("/language-chat");
+        if (!gate.current(ticket) || unloading) return;
+        accept(payload, ticket, after);
+      } catch (error) {
+        if (!gate.current(ticket) || unloading) return;
+        actionError = error.message;
+        if (["start", "stop", "interrupt", "send", "send-now"].includes(path)) {
+          contactError = "Action was not confirmed; server state is unknown.";
+          playback.unavailable(error.message);
+        }
+      } finally {
+        busy -= 1;
+        render();
+        schedule(0);
+      }
+    });
+    commandChain = work.catch((error) => { actionError = error.message; render(); });
+    return commandChain;
+  }
+
+  function stop() {
+    stopRequested = true;
+    playback.stop();
+    return command("stop", { client_id: clientId });
+  }
+
+  function stopForUnload() {
+    if (unloading) return;
+    unloading = true;
+    clearTimeout(timer);
+    gate.invalidate();
+    playback.stop();
+    if ((latest && latest.active && latest.client_id === clientId) || busy || stopRequested) {
+      // keepalive preserves authenticated best-effort delivery without blocking pagehide.
+      fetch(`${API_BASE}/language-chat/stop`, {
+        method: "POST", keepalive: true,
+        headers: { Authorization: `Bearer ${state.token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ client_id: clientId }),
+      }).catch(() => {});
+    }
+  }
+
+  async function autoVoice(config, ticket) {
+    if (playback.supported && !installedVoices().length) {
+      setText("lc-settings-result", "Waiting briefly for browser voices…");
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+    }
+    if (!gate.current(ticket) || unloading) return null;
+    return logic.chooseVoice(installedVoices(), config);
+  }
+
+  $("lc-start").onclick = () => {
+    if ($("lc-start").disabled) return;
+    playback.unlock();
+    stopRequested = false;
+    command("start", { client_id: clientId }, null, async (ticket) => {
+      if (latest.active) return;
+      const voice = await autoVoice(latest.config, ticket);
+      if (!gate.current(ticket) || unloading) return;
+      const config = { agent_id: latest.agent_id, voice_uri: voice ? voice.voiceURI : "" };
+      if (!latest.active) config.model = latest.config.model || defaultModel;
+      // Do not apply this stopped-state response: the original gesture must stay armed.
+      await request("/language-chat/config", config);
+      if (!gate.current(ticket) || unloading) return;
+      setText("lc-settings-result", voice ? `Bound browser voice: ${voice.name} (${voice.lang}). Saved for this agent.` : playback.supported ? "Browser exposes no voice URI yet; saved browser-default voice selection." : "Browser TTS unavailable; this session will show text replies.");
+    });
+  };
+  $("lc-stop").onclick = stop;
+  $("lc-global-stop").onclick = stop;
+  $("lc-interrupt").onclick = () => {
+    playback.interrupt();
+    command("interrupt", { client_id: clientId });
+  };
+  $("lc-send-now").onclick = () => {
+    if (!$("lc-send-now").disabled) command("send-now", { client_id: clientId });
+  };
+  $("lc-composer").onsubmit = (event) => {
+    event.preventDefault();
+    if ($("lc-send").disabled) return;
+    const text = $("lc-text").value;
+    command("send", { client_id: clientId, text: text.trim() }, () => {
+      if ($("lc-text").value === text) $("lc-text").value = "";
+    });
+  };
+  $("lc-text").addEventListener("input", render);
+  $("lc-settings").addEventListener("input", (event) => {
+    settingsDraft.edit();
+    if (event.target.id !== "lc-agent") settingsContentDirty = true;
+    setText("lc-settings-result", latest && latest.active
+      ? "Draft kept. Stop voice chat, then Save agent settings to apply it; the running chat is unchanged."
+      : "Unsaved settings — polling will not replace your edits.");
+    render();
+  });
+  $("lc-history").addEventListener("input", () => {
+    historyDraft.edit();
+    setText("lc-history-result", "Unsaved history — not submitted to the model yet.");
+    render();
+  });
+  $("lc-settings").onsubmit = (event) => {
+    event.preventDefault();
+    if (latest && latest.active) {
+      setText("lc-settings-result", "Stop voice chat before applying settings. Your model and endpoint draft is kept.");
+      return;
+    }
+    if (!latest || busy || contactError) return;
+    if ($("lc-settings-fields").disabled || !$("lc-settings").reportValidity()) return;
+    const body = {};
+    Object.entries(fields).forEach(([key, id]) => { body[key] = $(id).value; });
+    ["turn_silence_ms", "max_tokens", "history_limit", "speech_rate"].forEach((key) => { body[key] = Number(body[key]); });
+    body.agent_id = body.agent_id.trim();
+    if (body.agent_id !== latest.agent_id && historyDraft.dirty) {
+      actionError = "Save the loaded agent's history before changing agent id.";
+      render();
+      return;
+    }
+    body.endpoint = body.endpoint.trim();
+    body.model = body.model.trim();
+    body.speak_replies = !$("lc-mute").checked;
+    const revision = settingsDraft.capture();
+    command("config", body, () => {
+      settingsDraft.saved(revision);
+      if (!settingsDraft.dirty) settingsContentDirty = false;
+      setText("lc-settings-result", settingsDraft.dirty ? "Saved submitted settings; newer edits remain unsaved." : "Agent settings and browser voice saved.");
+    }, async (ticket) => {
+      const voice = await autoVoice(body, ticket);
+      if (gate.current(ticket) && !unloading) body.voice_uri = voice ? voice.voiceURI : "";
+    });
+  };
+  $("lc-load-agent").onclick = () => {
+    if (historyDraft.dirty || settingsContentDirty) {
+      actionError = "Save the current settings and history before loading another agent.";
+      render();
+      return;
+    }
+    // Loading is explicit: changing the input alone never switches the model context.
+    const agentId = $("lc-agent").value.trim();
+    if (!agentId) { actionError = "Enter an agent id."; render(); return; }
+    const revision = settingsDraft.capture();
+    command("config", { agent_id: agentId }, () => {
+      settingsDraft.saved(revision);
+      setText("lc-settings-result", "Loaded saved agent settings and history.");
+    });
+  };
+  $("lc-history-form").onsubmit = (event) => {
+    event.preventDefault();
+    if ($("lc-save-history").disabled) return;
+    let messages;
+    try { messages = logic.parseHistory($("lc-history").value); }
+    catch (error) { setText("lc-history-result", error.message); return; }
+    const revision = historyDraft.capture();
+    command("history", { agent_id: latest.agent_id, messages }, () => {
+      historyDraft.saved(revision);
+      setText("lc-history-result", historyDraft.dirty ? "Submitted history saved; newer edits remain unsaved." : "Model context replaced. Audit log retained.");
+    });
+  };
+  $("lc-mute").onchange = () => {
+    localMute = $("lc-mute").checked;
+    playback.mute(localMute);
+    command("config", { agent_id: latest.agent_id, speak_replies: !localMute }, () => {
+      localMute = null;
+      playback.mute(false);
+    });
+  };
+  $("lc-refresh-models").onclick = async () => {
+    $("lc-refresh-models").disabled = true;
+    try {
+      const payload = await request("/language-chat/models", undefined, 10000);
+      $("lc-models").replaceChildren(...(payload.models || []).map((model) => {
+        const option = el("option", "", model.id);
+        option.value = model.id;
+        return option;
+      }));
+      setText("lc-models-note", `${(payload.models || []).length} models from ${payload.endpoint || "saved emullm endpoint"}. You may also type a model id.`);
+    } catch (error) { setText("lc-models-note", `Model list unavailable: ${error.message}. A typed emullm model id is accepted.`); }
+    finally { $("lc-refresh-models").disabled = false; }
+  };
+  $("lc-preview").onclick = async () => {
+    $("lc-preview").disabled = true;
+    try {
+      const payload = await request("/language-chat/request-preview");
+      $("lc-preview-panel").open = true;
+      setText("lc-request", fmt(payload));
+    } catch (error) { setText("lc-request", `Request inspection failed: ${error.message}`); }
+    finally { $("lc-preview").disabled = false; }
+  };
+  $("lc-captioner").onclick = async () => {
+    $("lc-captioner").disabled = true;
+    try {
+      await request("/captioner/foreground", {});
+      actionError = "";
+    } catch (error) { actionError = `Could not foreground Chrome Captions: ${error.message}. Check Chrome Captions and its source policy; no policy was changed.`; }
+    finally { $("lc-captioner").disabled = false; render(); }
+  };
+  $("lc-messages").addEventListener("scroll", () => {
+    const log = $("lc-messages");
+    followLatest = log.scrollTop + log.clientHeight >= log.scrollHeight - 24;
+    $("lc-latest").hidden = followLatest;
+  });
+  $("lc-latest").onclick = () => {
+    followLatest = true;
+    $("lc-messages").scrollTop = $("lc-messages").scrollHeight;
+    $("lc-latest").hidden = true;
+  };
+  if (window.speechSynthesis) window.speechSynthesis.addEventListener("voiceschanged", refreshVoices);
+  window.addEventListener("pagehide", stopForUnload);
+  window.addEventListener("pageshow", (event) => {
+    if (!event.persisted) return;
+    unloading = false;
+    poll();
+  });
+  refreshVoices();
+  languageChat = {
+    setVisible(value) { visible = value; render(); schedule(0); },
+    stopForUnload,
+  };
+  poll(); // One initial read restores the global active indicator, never auto-starts.
+}
+
+function loadLanguageChat() {
+  initLanguageChat();
+  if (languageChat) languageChat.setVisible(true);
+}
+
 /* ------------------------------------------------------ persistent UI state */
 let pageStateSaveTimer = null;
 
@@ -326,6 +812,7 @@ function capturePageState(page) {
 }
 
 function applyControlState(page, saved) {
+  if (page === "chatbot-test") return;
   const section = document.querySelector(`.page[data-page="${page}"]`);
   if (!section || !saved || !Array.isArray(saved.controls)) return;
   const nodes = [...section.querySelectorAll("input, select, textarea, details, button[aria-pressed], button[data-state]")];
@@ -368,11 +855,13 @@ function stateRequest(path, options = {}) {
     method: options.method || "GET",
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    signal: options.signal,
     keepalive: !!options.keepalive,
   });
 }
 
 async function restorePageState(page) {
+  if (page === "chatbot-test") return;
   if (state.restoredPageStates[page]) {
     applyControlState(page, state.restoredPageStates[page]);
     return;
@@ -401,7 +890,7 @@ async function restorePageState(page) {
 }
 
 function savePageState(page, keepalive = false) {
-  if (!page) return Promise.resolve();
+  if (!page || page === "chatbot-test") return Promise.resolve();
   const pageState = capturePageState(page);
   state.restoredPageStates[page] = pageState;
   return stateRequest(`${ADMIN_UI_STATE_BASE}/${encodeURIComponent(page)}`, {
@@ -412,6 +901,7 @@ function savePageState(page, keepalive = false) {
 }
 
 function schedulePageStateSave() {
+  if (state.page === "chatbot-test") return;
   clearTimeout(pageStateSaveTimer);
   pageStateSaveTimer = setTimeout(() => savePageState(state.page), 750);
 }
@@ -506,6 +996,17 @@ function ingest(event) {
   scheduleTilesRender(stream);
   Object.values(state.views).forEach((view) => view.onEvent(event));
   if (stream === "stt_transcripts") handleSttTranscriptEvent(event);
+  if (event.type === "LOCAL_MIC_FLOOR_ACQUIRED"
+      && event.data?.source === "browser_rms_vad"
+      && event.data.instance_id === state.captionerConfig?.instance_id
+      && !state.captionerConfig?.paused
+      && Math.abs(Date.now() - Date.parse(event.ts)) < 2000) {
+    updateChromeTranscriptTail();
+    chromeTranscriptTail.observe({
+      source: "browser_rms_vad", available: true, state: "speech", current_silence_ms: null,
+    });
+    updateChromeTranscriptTail();
+  }
   return true;
 }
 
@@ -613,32 +1114,48 @@ function reconnectNow() {
 
 function startRestFallback() {
   if (Object.keys(state.restTimers).length) return;
+  const generation = ++state.restGeneration;
   setTransport(location.protocol === "https:" ? "https rest" : "http rest");
   STREAMS.forEach((stream) => {
     const poll = async () => {
-      if (state.wsReady) return;
+      if (state.wsReady || generation !== state.restGeneration) return;
+      // Reserve browser HTTP connections for chat control, heartbeats and assets.
+      if (state.restInFlight >= 2) {
+        state.restTimers[stream] = setTimeout(poll, 100);
+        return;
+      }
+      const controller = new AbortController();
+      state.restControllers.set(stream, controller);
+      state.restInFlight += 1;
       try {
-        const query = new URLSearchParams({ stream, limit: "200", wait_ms: "20000" });
+        const query = new URLSearchParams({ stream, limit: "200", wait_ms: "1000" });
         if (state.cursors[stream]) query.set("after", state.cursors[stream]);
-        const page = await api(`${API_BASE}/events?${query}`);
-        if (page) {
+        const page = await api(`${API_BASE}/events?${query}`, { signal: controller.signal });
+        if (page && generation === state.restGeneration && !state.wsReady) {
           state.cursors[stream] = page.next_cursor;
           page.events.forEach(ingest);
         }
       } catch (error) {
+        if (error.name === "AbortError") return;
         if (error.status === 401) { logout(); return; }
         pushError(`rest ${stream}: ${error.message}`);
         await new Promise((r) => setTimeout(r, 3000));
+      } finally {
+        state.restInFlight -= 1;
+        if (state.restControllers.get(stream) === controller) state.restControllers.delete(stream);
       }
-      if (!state.wsReady) state.restTimers[stream] = setTimeout(poll, 50);
+      if (!state.wsReady && generation === state.restGeneration) state.restTimers[stream] = setTimeout(poll, 50);
     };
     state.restTimers[stream] = setTimeout(poll, 0);
   });
 }
 
 function stopRestFallback() {
+  state.restGeneration += 1;
   Object.values(state.restTimers).forEach(clearTimeout);
   state.restTimers = {};
+  for (const controller of state.restControllers.values()) controller.abort();
+  state.restControllers.clear();
 }
 
 /* ------------------------------------------------------- virtualized stream view */
@@ -1375,6 +1892,7 @@ async function showPage(page) {
   const previousPage = state.page;
   if (previousPage && previousPage !== page) await savePageState(previousPage);
   state.page = page;
+  if (languageChat) languageChat.setVisible(page === "chatbot-test");
   await restorePageState(page);
   document.querySelectorAll(".page").forEach((n) => n.classList.toggle("active", n.dataset.page === page));
   document.querySelectorAll(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.page === page));
@@ -1382,6 +1900,7 @@ async function showPage(page) {
     browser: "SSO / Browser",
     stt: "STT Engines",
     "chrome-captions": "Chrome Captions",
+    "chatbot-test": "ChatBot Test",
   };
   $("top-title").textContent = pageTitles[page] || (page.charAt(0).toUpperCase() + page.slice(1));
   // Keep the URL in sync so any page can be deep-linked and reloaded in place.
@@ -1391,6 +1910,7 @@ async function showPage(page) {
     accuracy: loadAccuracy, cursors: loadCursors, prompt: loadPrompt, system: loadSystem,
     meet: loadMeetWithPolling, silences: loadSilencesWithPolling, stt: loadStt,
     "chrome-captions": loadChromeCaptions,
+    "chatbot-test": loadLanguageChat,
     processes: loadProcesses, browser: loadBrowserSettings,
   };
   if (loaders[page]) {
@@ -1403,7 +1923,8 @@ async function showPage(page) {
 }
 
 function pageFromHash() {
-  const requested = location.hash.slice(1) === "sso" ? "browser" : location.hash.slice(1);
+  const aliases = Object.assign(Object.create(null), { sso: "browser", "language-chat": "chatbot-test" });
+  const requested = aliases[location.hash.slice(1)] || location.hash.slice(1);
   return document.querySelector(`.nav-item[data-page="${requested}"]`) ? requested : "transcript";
 }
 
@@ -5219,6 +5740,12 @@ function handleSttTranscriptEvent(event) {
   if (engine === "browser_captioner") {
     if (event.type === "STT_PARTIAL_RESULT" || d.is_final === false) {
       $("cc-live-partial").textContent = text || "Waiting for a caption...";
+      updateChromeTranscriptTail();
+      const finalized = state.chromeTranscript.rows.some(
+        row => row.sessionId === d.session_id && row.utteranceId === d.utterance_id
+      );
+      if (!finalized) chromeTranscriptTail.setInterim(event);
+      updateChromeTranscriptTail();
     } else if (event.type === "STT_FINAL_RESULT" && text) {
       $("cc-live-partial").textContent = "Waiting for a caption...";
       appendChromeTranscriptEvent(event);
@@ -5265,6 +5792,19 @@ function chromeTranscriptTimeRange(rows) {
     : `${format(Math.min(...times))} – ${format(Math.max(...times))}`;
 }
 
+let chromeTranscriptTail = null;
+let chromeTranscriptTimer = null;
+
+function updateChromeTranscriptTail() {
+  if (!chromeTranscriptTail) {
+    chromeTranscriptTail = new Transcript.LiveTranscriptTail(document, $("cc-live-log"));
+  }
+  const log = $("cc-live-log");
+  const follow = $("cc-autoscroll").checked && !captionerScrollPaused;
+  chromeTranscriptTail.update(visibleChromeTranscriptRows().at(-1));
+  if (follow) log.scrollTop = log.scrollHeight;
+}
+
 function renderChromeTranscript({ forceLatest = false } = {}) {
   const log = $("cc-live-log");
   if (!log) return;
@@ -5293,16 +5833,19 @@ function renderChromeTranscript({ forceLatest = false } = {}) {
   truncated.textContent = state.chromeTranscript.truncated
     ? `Showing a bounded view of ${Transcript.MAX_TRANSCRIPT_EVENTS} finalized captions; durable history continues.`
     : "";
+  updateChromeTranscriptTail();
   log.scrollTop = shouldFollow ? log.scrollHeight : previousScrollTop;
 }
 
 function appendChromeTranscriptEvent(event) {
+  const finalRow = chromeTranscriptTail?.finish(event);
   const before = state.chromeTranscript.rows.length;
   state.chromeTranscript.rows = Transcript.mergeFinalEvents(
     state.chromeTranscript.rows,
-    [event],
+    [finalRow || event],
   );
   if (state.chromeTranscript.rows.length !== before) renderChromeTranscript();
+  else updateChromeTranscriptTail();
 }
 
 async function reconcileChromeTranscript({ resetView = false } = {}) {
@@ -5389,43 +5932,74 @@ async function captionSourceAction(sourceId, action) {
 function renderCaptionerInstances(registry) {
   const body = $("cc-instances");
   if (!body || !registry) return;
-  const rows = (registry.instances || []).map((instance) => {
+  const historyOpen = body.querySelector("details")?.open === true;
+  const instances = registry.instances || [];
+  const live = instances.filter((instance) => !instance.stale);
+  const historical = instances.filter((instance) => instance.stale);
+  const row = (instance) => {
     const actions = el("div", "instance-actions");
     const primary = actionButton("Make primary", "mini primary", async () => {
       await captionerInstanceAction(instance.instance_id, "make-primary");
     });
-    primary.disabled = instance.selected && registry.selection_mode === "pinned";
+    primary.disabled = instance.stale || (instance.selected && registry.selection_mode === "pinned");
+    primary.title = instance.stale
+      ? "This page is no longer reporting. Use Open captioner or Show window to reach a live page."
+      : "Select this reporting page as the captioner and keep it selected while its heartbeat stays fresh.";
+    const toggle = actionButton(instance.enabled ? "Disable" : "Enable", "mini", async () => {
+      await captionerInstanceAction(instance.instance_id, instance.enabled ? "disable" : "enable");
+    });
+    toggle.title = "Allow or prevent this page instance from capturing. Does not close the browser or remove saved captions.";
     actions.append(
       primary,
-      actionButton(instance.enabled ? "Disable" : "Enable", "mini", async () => {
-        await captionerInstanceAction(
-          instance.instance_id,
-          instance.enabled ? "disable" : "enable",
-        );
-      }),
+      toggle,
     );
     const input = instance.input || {};
+    const shortId = mono(instance.instance_id.slice(0, 8));
+    shortId.title = instance.instance_id;
+    const session = mono(instance.session_fingerprint || instance.session_id.slice(0, 8));
+    session.title = "Stable browser session; reloading its page creates a new instance, not a new browser window.";
+    const recognition = instance.state === "restarting"
+      ? `Recognition retry${instance.last_error ? ` (${instance.last_error})` : ""}`
+      : instance.state || "unknown";
+    const detector = instance.vad?.available
+      ? `Detector listening (${instance.vad.state})` : "Detector unavailable";
     return [
-      instance.selected
+      instance.stale
+        ? badge("NO RECENT HEARTBEAT", "warn")
+        : instance.selected
         ? badge(registry.selection_mode === "pinned" ? "PRIMARY · PINNED" : "PRIMARY · AUTO", "ok")
-        : badge(instance.stale ? "STALE" : "STANDBY", instance.stale ? "warn" : ""),
-      mono(instance.instance_id),
-      mono(instance.session_id),
-      `${instance.state || "unknown"} · ${instance.healthy ? "healthy" : "degraded"}`,
+        : badge("STANDBY", ""),
+      shortId,
+      session,
+      instance.stale ? `Last reported: ${recognition}` : `${recognition}; ${detector}`,
       `${instance.last_seen_age_seconds ?? "—"}s`,
       String(instance.queue_depth ?? 0),
       `${input.input_scope || "microphone"} · ${input.track_label || "default input"}`,
       actions,
     ];
-  });
+  };
+  const headers = ["Selection", "Page instance", "Browser session", "Recognition / detector", "Last seen", "Queue", "Mic", "Actions"];
+  const summary = el("div", "hint",
+    `${live.length} reporting captioner page${live.length === 1 ? "" : "s"} ` +
+    `(heartbeat within ${registry.stale_after_seconds || 15}s). ` +
+    `${historical.length} stale record${historical.length === 1 ? "" : "s"} from earlier loads or disconnected pages.`);
+  summary.title = "Heartbeat count, not an operating-system window count. A page reload leaves an old record until it expires.";
   body.replaceChildren(
-    rows.length
-      ? table(
-        ["Selection", "Instance", "Session", "State", "Last seen", "Queue", "Mic", "Actions"],
-        rows,
-      )
-      : el("div", "hint", "No recent browser captioner instances."),
+    summary,
+    live.length
+      ? table(headers, live.map(row))
+      : el("div", "hint", "No page is reporting. Open captioner creates or reuses the dedicated tab; Show window brings it into view."),
   );
+  if (historical.length) {
+    const history = el("details");
+    history.open = historyOpen;
+    history.append(
+      el("summary", "hint", `Earlier / unresponsive page records (${historical.length})`),
+      el("div", "hint", "These are saved instance records, not additional open windows. Their displayed state is historical."),
+      table(headers, historical.map(row)),
+    );
+    body.appendChild(history);
+  }
 }
 
 async function captionerInstanceAction(instanceId, action) {
@@ -5455,19 +6029,36 @@ function renderChromeCaptionStatus(status) {
     ? "no heartbeat"
     : `${status.heartbeat_age_seconds}s heartbeat age`;
   $("cc-status").textContent =
-    `${status.display_name}: ${status.state}; tab ${status.tab_present ? "present" : "not detected"}; ${age}`;
+    `${status.display_name}: dedicated browser tab ${status.tab_present ? "detected" : "not detected"}; ${age}; ` +
+    `speech recognition ${status.state === "restarting" ? `retrying (${status.last_error || "reconnecting"})` : status.state}`;
   $("cc-health").textContent =
     `health ${status.health || "unknown"} · queue ${status.queue_depth || 0} · ` +
     `microphone ${status.mic_permission || "unknown"} · restarts ${status.restart_count || 0}` +
     (status.last_final_at ? ` · last final ${shortTs(status.last_final_at)}` : "") +
     (status.last_error ? ` · error: ${status.last_error}` : "");
   const vad = status.vad;
+  updateChromeTranscriptTail();
+  const registry = status.instance_registry || status.instances;
+  const selected = registry?.selected_instance_id;
+  let silenceReason = "";
+  if (status.paused) silenceReason = "Listening paused by the user";
+  else if (!status.enabled) silenceReason = "Chrome Captions disabled";
+  else if (registry && (!selected || selected !== status.instance_id)) {
+    silenceReason = "Waiting for the selected window's silence detector";
+  } else if (["stale", "standby", "permission_denied", "unsupported"].includes(status.state)) {
+    silenceReason = `Silence detector unavailable (${status.state})`;
+  }
+  chromeTranscriptTail.observe(vad, {
+    ageMs: status.heartbeat_age_seconds == null ? NaN : status.heartbeat_age_seconds * 1000,
+    reason: silenceReason,
+  });
+  updateChromeTranscriptTail();
   $("cc-vad").textContent = vad && vad.available
-    ? `Local pause detector: ${vad.state} · RMS ${Number(vad.rms).toFixed(4)} · ` +
+    ? `Local silence detector: ${vad.state} · RMS ${Number(vad.rms).toFixed(4)} · ` +
       `threshold ${Number(vad.threshold).toFixed(4)} · silence ${
         vad.current_silence_ms == null ? "—" : Transcript.formatDuration(vad.current_silence_ms)
       }`
-    : `Local pause detector: pause detector unavailable${
+    : `Local silence detector: detector unavailable${
       vad && vad.error ? ` · ${vad.error}` : ""
     }`;
   const input = status.input || {};
@@ -5500,6 +6091,10 @@ async function loadCaptionerStatus() {
     renderChromeCaptionStatus(status);
   } catch (error) {
     $("cc-status").textContent = `Chrome Captions status unavailable: ${error.message}`;
+    if (chromeTranscriptTail) {
+      chromeTranscriptTail.observe(null, { reason: "Silence detector unavailable (backend unreachable)" });
+      updateChromeTranscriptTail();
+    }
   }
 }
 
@@ -5511,6 +6106,16 @@ function pollChromeCaptionStatus() {
 }
 
 async function loadChromeCaptions() {
+  if (chromeTranscriptTimer === null) {
+    chromeTranscriptTimer = setInterval(() => {
+      if (state.page !== "chrome-captions") {
+        clearInterval(chromeTranscriptTimer);
+        chromeTranscriptTimer = null;
+        return;
+      }
+      updateChromeTranscriptTail();
+    }, 100);
+  }
   if (!chromeCaptionPolling) {
     chromeCaptionPolling = true;
     pollChromeCaptionStatus();
@@ -5702,57 +6307,86 @@ async function loadSystem() {
   } catch (error) { body.textContent = `error: ${error.message}`; }
 }
 
-function pollForRestart(previousBootId, attempt = 0) {
-  const result = $("sy-lifecycle-result");
-  if (attempt >= 120) {
-    result.className = "mono lifecycle-result error";
-    result.textContent = "Restart was accepted, but the server did not return within 60 seconds.";
+let lifecyclePending = false;
+
+function lifecycleResult(message, kind = "") {
+  for (const id of ["sy-lifecycle-result", "server-lifecycle-result"]) {
+    const result = $(id);
+    if (!result) continue;
+    result.hidden = false;
+    result.className = `${id === "server-lifecycle-result" ? "server-lifecycle-result" : "mono lifecycle-result"} ${kind}`;
+    result.textContent = message;
+  }
+}
+
+function lifecycleControls(pending) {
+  lifecyclePending = pending;
+  for (const id of ["sy-restart", "sy-shutdown", "server-restart", "server-shutdown"]) {
+    if ($(id)) $(id).disabled = pending;
+  }
+}
+
+function pollForRestart(previousBootId, deadline = performance.now() + 60000) {
+  if (performance.now() >= deadline) {
+    lifecycleResult("Restart was accepted, but the server did not return within 60 seconds. Check its launcher/log.", "error");
+    lifecycleControls(false);
     return;
   }
   setTimeout(async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), Math.max(0, Math.min(2500, deadline - performance.now())));
     try {
-      const response = await fetch(`${API_BASE}/status`, { cache: "no-store" });
+      const response = await fetch(`${API_BASE}/status`, { cache: "no-store", signal: controller.signal });
       if (response.ok) {
         const status = await response.json();
         if (status.boot_id && status.boot_id !== previousBootId) {
-          result.className = "mono lifecycle-result ok";
-          result.textContent = "Server restarted. Reconnecting…";
+          lifecycleResult("Server restarted. Reconnecting…", "ok");
           location.reload();
           return;
         }
       }
-    } catch {
-      // A connection failure is expected while the old server releases the port.
+    } catch (error) {
+      if (error.name !== "AbortError" && error.name !== "TypeError") {
+        lifecycleResult(`Could not read restart status: ${error.message}`, "error");
+        lifecycleControls(false);
+        return;
+      }
+    } finally {
+      clearTimeout(timeout);
     }
-    result.textContent = `Restart scheduled — waiting for ${API_BASE}/status…`;
-    pollForRestart(previousBootId, attempt + 1);
-  }, 500);
+    lifecycleResult(`Restart scheduled — waiting for ${API_BASE}/status…`);
+    pollForRestart(previousBootId, deadline);
+  }, Math.min(500, Math.max(0, deadline - performance.now())));
 }
 
 async function requestLifecycle(action) {
+  if (lifecyclePending) return;
   const target = location.host || "this server";
   const warning = action === "restart"
-    ? `Restart WS_COLLAB server ${target}? The UI will briefly disconnect and reconnect.`
-    : `Shut down WS_COLLAB server ${target}? The UI will go offline until it is started again.`;
+    ? `Restart WS_COLLAB server ${target}? This reloads server code and briefly stops voice chat/captioning. Other services are not restarted.`
+    : `Shut down WS_COLLAB server ${target}? Voice chat/captioning will stop. This UI cannot start a stopped server; use its external launcher to bring it back.`;
   if (!confirm(warning)) return;
 
-  const result = $("sy-lifecycle-result");
-  const restart = $("sy-restart");
-  const shutdown = $("sy-shutdown");
-  restart.disabled = true;
-  shutdown.disabled = true;
-  result.className = "mono lifecycle-result";
-  result.textContent = `Requesting ${action}…`;
+  lifecycleControls(true);
+  lifecycleResult(`Requesting ${action}…`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
   try {
-    const acknowledgement = await api(`${API_BASE}/admin/${action}`, { method: "POST" });
-    result.className = "mono lifecycle-result ok";
-    result.textContent = `${action}: ${acknowledgement.status} (pid ${acknowledgement.pid}, boot ${acknowledgement.boot_id})`;
+    const acknowledgement = await api(`${API_BASE}/admin/${action}`, { method: "POST", signal: controller.signal });
+    if (!acknowledgement || acknowledgement.action !== action || acknowledgement.scheduled !== true) {
+      throw new Error("Server did not acknowledge the requested action.");
+    }
+    lifecycleResult(action === "shutdown"
+      ? "Shutdown scheduled. Run ws-collab-standalone start or call plugin.start_server() to bring it back."
+      : `Restart ${acknowledgement.status} (pid ${acknowledgement.pid}).`, "ok");
     if (action === "restart") pollForRestart(acknowledgement.boot_id);
   } catch (error) {
-    result.className = "mono lifecycle-result error";
-    result.textContent = `${action} failed: ${error.message}`;
-    restart.disabled = false;
-    shutdown.disabled = false;
+    lifecycleResult(error.name === "AbortError"
+      ? `${action} acknowledgement timed out. The action may have been accepted; check server status before retrying.`
+      : `${action} failed: ${error.message}`, "error");
+    lifecycleControls(false);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -6348,6 +6982,8 @@ function wireEvents() {
   $("sy-refresh").onclick = loadSystem;
   $("sy-restart").onclick = () => requestLifecycle("restart");
   $("sy-shutdown").onclick = () => requestLifecycle("shutdown");
+  $("server-restart").onclick = () => requestLifecycle("restart");
+  $("server-shutdown").onclick = () => requestLifecycle("shutdown");
 
   window.addEventListener("resize", () => Object.values(state.views).forEach((v) => v.draw()));
 }
@@ -6375,6 +7011,7 @@ async function refreshStatusBar() {
 }
 
 function logout() {
+  if (languageChat) languageChat.stopForUnload();
   sessionStorage.removeItem("ws_collab_token");
   state.token = "";
   if (state.ws) { try { state.ws.close(); } catch {} }
@@ -6401,14 +7038,16 @@ async function boot() {
   }
   initViews();
   wireEvents();
+  initLanguageChat();
   installPageStatePersistence();
   connectWs();
   setTimeout(() => { if (!state.wsReady) startRestFallback(); }, 2500);
+  showPage(pageFromHash());
+  window.addEventListener("hashchange", () => showPage(pageFromHash()));
+  window.addEventListener("pagehide", stopRestFallback);
   await backfill(TRANSCRIPT_STREAMS, state.views.transcript);
   refreshStatusBar();
   setInterval(refreshStatusBar, 5000);
-  showPage(pageFromHash());
-  window.addEventListener("hashchange", () => showPage(pageFromHash()));
 }
 
 async function signIn(token) {

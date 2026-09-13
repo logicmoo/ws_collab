@@ -52,6 +52,7 @@
   let vadTransitionError = "";
   let vadSpeechStartedAt = null;
   let vadSpeechEndedAt = null;
+  let vadBoundaryVersion = 0;
   let recognizerSpeakingDiagnostic = false;
   let vadStatus = {
     source: "browser_rms_vad",
@@ -67,7 +68,8 @@
   };
   const utterances = new Map();
   const finalized = new Set();
-  const pauseAssociator = new Runtime.PauseAssociation();
+  const finalizing = new Set();
+  const pauseAssociator = new Runtime.PauseAssociation({ positionMapper: Transcript.silencePosition });
   const vadCapture = new Runtime.BrowserVadCapture({
     mediaDevices: navigator.mediaDevices,
     AudioContextClass: window.AudioContext || window.webkitAudioContext,
@@ -75,6 +77,8 @@
     onStatus: updateVadStatus,
   });
   let transcriptRows = [];
+  const transcriptTail = new Transcript.LiveTranscriptTail(document, $("final-log"));
+  let transcriptTimer = null;
   const heartbeatFailures = new Runtime.HeartbeatFailureGuard({ graceMs: 15000 });
 
   function nowIso() { return new Date().toISOString(); }
@@ -89,13 +93,14 @@
       ...status,
       state: status.available ? status.state : "unavailable",
     };
+    transcriptTail.observe(vadStatus, { maxAgeMs: 1000 });
     const state = vadStatus.available ? vadStatus.state : "pause detector unavailable";
     const rms = Number(vadStatus.rms || 0).toFixed(4);
     const threshold = Number(vadStatus.threshold || 0).toFixed(4);
     const silence = vadStatus.current_silence_ms == null
       ? "—" : Transcript.formatDuration(vadStatus.current_silence_ms);
     $("vad-status").textContent =
-      `Local pause detector: ${state} · RMS ${rms} · threshold ${threshold} · silence ${silence}`;
+      `Local silence detector: ${state} · RMS ${rms} · threshold ${threshold} · silence ${silence}`;
     const input = status.input || {};
     $("input-scope").textContent = input.input_scope || "microphone";
     $("input-device").textContent = input.track_label || "Chrome/OS default input";
@@ -135,18 +140,32 @@
   function handleVadEvents(events) {
     for (const event of events) {
       if (event.type === "speech_start") {
+        vadBoundaryVersion += 1;
         if (!vadSpeechStartedAt) vadSpeechStartedAt = event.at;
         vadSpeechEndedAt = null;
         speaking = true;
         if (listening) setState("Speaking");
         queueVadTransition("speech_start", "speech", event.at);
       } else if (event.type === "speech_end") {
+        vadBoundaryVersion += 1;
         vadSpeechEndedAt = event.at;
+        pauseAssociator.silenceStarted(event.at);
         speaking = false;
         if (listening) setState("Listening");
         queueVadTransition("speech_end", "silence", event.at);
       } else if (event.type === "pause") {
         pauseAssociator.record(event);
+        const interim = transcriptTail.interim;
+        if (interim) {
+          transcriptTail.setInterim({
+            ...interim.event,
+            type: "STT_PARTIAL_RESULT",
+            data: {
+              ...interim.event.data, is_final: false,
+              ...pauseAssociator.finalize(interim.text, { consume: false }),
+            },
+          });
+        }
       }
     }
   }
@@ -155,19 +174,36 @@
     $("send-interims").checked = config.send_interims;
     $("pause").disabled = config.paused || !config.enabled;
     $("resume").disabled = !config.paused && listening && !terminal;
+    $("mic").textContent = micPermission;
   }
   function currentState() {
-    if (!Recognition) return "unsupported";
-    if (terminal) return terminalState;
-    if (config.paused || !config.enabled) return "paused";
-    if (!backendAuthorized) return "standby";
-    if (queueBlocked) return "error";
-    if (!hasOwnership) return "standby";
-    if (speaking) return "speaking";
-    if (listening) return "listening";
-    if (restartTimer || starting) return "restarting";
-    if (lastError) return "error";
-    return "idle";
+    return driverStatus().state;
+  }
+  function driverStatus() {
+    return Runtime.captionerState({
+      paused: config.paused, enabled: config.enabled, supported: Boolean(Recognition),
+      terminal, terminalState, lastError, authorized: backendAuthorized,
+      authorityReason: backendAuthorityReason, queueBlocked, owned: hasOwnership,
+      starting, restarting: Boolean(restartTimer), speaking, listening, micPermission,
+    });
+  }
+  function showDriverStatus() {
+    const status = driverStatus();
+    setState(status.label, status.detail);
+  }
+  function shouldDetect() {
+    return config.enabled && !config.paused && backendAuthorized && hasOwnership
+      && micPermission !== "denied" && !unloading;
+  }
+  function updateTranscriptTail() {
+    if (!shouldDetect()) {
+      const status = driverStatus();
+      transcriptTail.observe(null, { reason: `${status.label}: ${status.detail}` });
+    }
+    const log = $("final-log");
+    const follow = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+    transcriptTail.update(transcriptRows.at(-1));
+    if (follow) log.scrollTop = log.scrollHeight;
   }
   function shouldRun() {
     return Boolean(
@@ -444,7 +480,7 @@
     if (!allowed) {
       stopRecognition();
       ownership.release();
-      setState("Standby", backendAuthorityReason || "Backend selected another captioner instance.");
+      showDriverStatus();
     } else if (!hasOwnership) {
       requestOwnership();
     }
@@ -505,7 +541,7 @@
     if (!result.accepted) return result;
     if (result.backpressure) {
       queueBlocked = true;
-      stopRecognition();
+      stopRecognition({ stopDetector: false });
       setState("Error", "queue full; delivery required");
     }
     scheduleDelivery(0);
@@ -555,6 +591,7 @@
     const event = {
       type: "STT_FINAL_RESULT",
       source_id: "browser_captioner",
+      ts: envelope.result_at,
       data: {
         engine: "browser_captioner",
         raw_text: envelope.text,
@@ -568,30 +605,33 @@
         pauses: envelope.pauses,
       },
     };
-    transcriptRows = Transcript.mergeFinalEvents(transcriptRows, [event]);
+    const finalRow = transcriptTail.finish(event);
+    transcriptRows = Transcript.mergeFinalEvents(transcriptRows, [finalRow || event]);
     Transcript.renderTranscript(document, $("final-log"), transcriptRows);
+    updateTranscriptTail();
     $("final-log").scrollTop = $("final-log").scrollHeight;
   }
   function scheduleRestart(reason) {
     if (!shouldRun() || restartTimer || starting || listening || stopping) return;
     restartAttempt += 1;
-    const base = Math.min(30000, 500 * (2 ** Math.min(restartAttempt - 1, 6)));
-    const delay = base + Math.floor(Math.random() * Math.min(3000, base * 0.25));
-    setState("Restarting", `${reason}; retry in ${(delay / 1000).toFixed(1)}s`);
+    const delay = Runtime.recognitionRestartDelay(reason, restartAttempt);
+    setState("Reconnecting", `Speech recognition: ${reason}; retry in ${(delay / 1000).toFixed(1)}s. This does not reopen the browser; local silence detection continues while the microphone is available.`);
     restartTimer = setTimeout(() => {
       restartTimer = null;
       startRecognition();
     }, delay);
   }
-  function stopRecognition() {
+  function stopRecognition({ stopDetector = true } = {}) {
     recognitionEpoch += 1;
-    queueVadTransition("state_sync", "unavailable");
-    vadSpeechStartedAt = null;
-    vadSpeechEndedAt = null;
-    speaking = false;
+    if (stopDetector) {
+      queueVadTransition("state_sync", "unavailable");
+      vadSpeechStartedAt = null;
+      vadSpeechEndedAt = null;
+      speaking = false;
+      pauseAssociator.reset();
+      void vadCapture.stop();
+    }
     recognizerSpeakingDiagnostic = false;
-    pauseAssociator.reset();
-    void vadCapture.stop();
     clearTimeout(restartTimer);
     restartTimer = null;
     if (recognizer && (listening || starting)) {
@@ -638,9 +678,11 @@
     starting = true;
     recognitionEpoch += 1;
     const epoch = recognitionEpoch;
-    vadSpeechStartedAt = null;
-    vadSpeechEndedAt = null;
-    pauseAssociator.reset();
+    if (!vadCapture.stream) {
+      vadSpeechStartedAt = null;
+      vadSpeechEndedAt = null;
+      pauseAssociator.reset();
+    }
     if (!vadFailureLatched) {
       const vadReady = await vadCapture.start(epoch);
       if (!vadReady) vadFailureLatched = true;
@@ -650,6 +692,21 @@
       await vadCapture.stop();
       return;
     }
+    const audioTrack = vadCapture.stream?.getAudioTracks().find(
+      track => track.kind === "audio" && track.readyState === "live"
+    );
+    if (!audioTrack) {
+      starting = false;
+      terminal = true;
+      micPermission = vadCapture.permission;
+      terminalState = micPermission === "denied" ? "permission_denied" : "error";
+      lastError = vadCapture.error || "No live shared microphone track; recognition was not started on a different input.";
+      showDriverStatus();
+      updateControls();
+      return;
+    }
+    micPermission = "granted";
+    updateControls();
     const instance = new Recognition();
     recognizer = instance;
     instance.continuous = true;
@@ -672,29 +729,40 @@
       recognizerSpeakingDiagnostic = false;
     };
     instance.onresult = async (event) => {
-      if (!hasOwnership || recognizer !== instance) return;
-      lastResultAt = nowIso();
+      if (!hasOwnership || recognizer !== instance || stopping || !shouldRun()) return;
+      const resultAt = nowIso();
+      lastResultAt = resultAt;
       restartAttempt = 0;
-      for (let index = event.resultIndex; index < event.results.length; index += 1) {
-        const result = event.results[index];
-        const utteranceId = identity.utteranceId(epoch, index);
-        if (finalized.has(utteranceId)) continue;
+      const updates = Runtime.recognitionUpdates(event);
+      for (const update of updates) {
+        const utteranceId = identity.utteranceId(epoch, update.index);
+        if (finalized.has(utteranceId) || finalizing.has(utteranceId)) continue;
         const revision = (utterances.get(utteranceId) || 0) + 1;
         utterances.set(utteranceId, revision);
-        const text = String(result[0]?.transcript || "").trim().slice(0, 4000);
+        const text = update.text.slice(0, 4000);
         if (!text) continue;
-        const isFinal = Boolean(result.isFinal);
-        pauseAssociator.updateTranscript(text);
-        const pauseMetadata = isFinal
-          ? pauseAssociator.finalize(text, { consume: false })
-          : { pauses: [], silence_before_ms: null };
+        const isFinal = update.isFinal;
+        pauseAssociator.updateTranscript(text, utteranceId);
+        const pauseSnapshot = pauseAssociator.snapshot(text, { reserve: isFinal });
+        const boundaryVersion = vadBoundaryVersion;
         const speechMetadata = {
           speech_started_at: vadStatus.available ? vadSpeechStartedAt : null,
           speech_ended_at: vadStatus.available ? vadSpeechEndedAt : null,
-          ...pauseMetadata,
+          ...pauseSnapshot.metadata,
         };
         $("interim").textContent = isFinal ? "Waiting for speech..." : text;
+        if (!isFinal) {
+          transcriptTail.setInterim({
+            type: "STT_PARTIAL_RESULT", source_id: "browser_captioner",
+            data: {
+              engine: "browser_captioner", raw_text: text, is_final: false,
+              session_id: sessionId, utterance_id: utteranceId, ...speechMetadata,
+            },
+          });
+          updateTranscriptTail();
+        }
         if (isFinal || config.send_interims) {
+          if (isFinal) finalizing.add(utteranceId);
           try {
             const envelope = {
               session_id: sessionId,
@@ -704,27 +772,34 @@
               revision,
               text,
               is_final: isFinal,
-              confidence: Number.isFinite(result[0]?.confidence) ? Math.max(0, Math.min(1, result[0].confidence)) : 0,
+              confidence: Number.isFinite(update.confidence) ? Math.max(0, Math.min(1, update.confidence)) : 0,
               language: config.language,
-              started_at: lastResultAt,
-              result_at: nowIso(),
+              started_at: resultAt,
+              result_at: resultAt,
               ...speechMetadata,
             };
             const queued = await enqueue(envelope);
             if (isFinal && queued.accepted) {
               finalized.add(utteranceId);
-              pauseAssociator.commit();
-              vadSpeechStartedAt = null;
-              vadSpeechEndedAt = null;
+              pauseAssociator.commit(pauseSnapshot);
+              if (vadBoundaryVersion === boundaryVersion) {
+                vadSpeechStartedAt = null;
+                vadSpeechEndedAt = null;
+              }
               appendFinal(envelope);
+            } else if (isFinal) {
+              pauseAssociator.restore(pauseSnapshot);
             }
             if (queueBlocked) break;
           } catch (error) {
+            if (isFinal) pauseAssociator.restore(pauseSnapshot);
             lastError = `queue: ${error.message || error}`;
             queueBlocked = true;
-            stopRecognition();
+            stopRecognition({ stopDetector: false });
             setState("Error", `${lastError}; queue full; delivery required`);
             break;
+          } finally {
+            finalizing.delete(utteranceId);
           }
         }
       }
@@ -741,31 +816,25 @@
           terminalState === "permission_denied" ? "Permission denied" : "Error",
           `${lastError}; change configuration or use Resume listening.`
         );
-        stopRecognition();
+        stopRecognition({ stopDetector: terminalState === "permission_denied" });
       }
     };
     instance.onend = () => {
       if (recognizer !== instance) return;
       recognitionEpoch += 1;
-      pauseAssociator.reset();
-      void vadCapture.stop();
+      pauseAssociator.updateTranscript("", null);
       recognizer = null;
       starting = false;
       listening = false;
-      speaking = false;
       stopping = false;
       if (shouldRun()) scheduleRestart(lastError || "recognizer ended");
-      else setState(
-        config.paused ? "Paused" : (queueBlocked ? "Error" : (terminalState === "permission_denied" ? "Permission denied" : (terminal ? "Error" : "Idle"))),
-        lastError
-      );
+      else showDriverStatus();
     };
     try {
-      instance.start();
+      instance.start(audioTrack);
     } catch (error) {
       recognitionEpoch += 1;
-      pauseAssociator.reset();
-      void vadCapture.stop();
+      pauseAssociator.updateTranscript("", null);
       recognizer = null;
       starting = false;
       lastError = String(error.message || error);
@@ -781,13 +850,13 @@
       terminal = false;
       terminalState = "permission_denied";
       lastError = "";
-      stopRecognition();
+      stopRecognition({ stopDetector: false });
     }
     updateControls();
     if (!wantsRecognition()) {
-      stopRecognition();
-      ownership.release();
-      setState("Paused");
+      stopRecognition({ stopDetector: !shouldDetect() });
+      if (!shouldDetect()) ownership.release();
+      showDriverStatus();
     } else if (!hasOwnership) {
       requestOwnership();
     } else if (!listening && !starting) {
@@ -806,6 +875,7 @@
   }
   async function heartbeat() {
     try {
+      updateVadStatus(vadCapture.status());
       const depth = await queue.depth();
       $("queue-depth").textContent = String(depth);
       const response = await authenticatedFetch("heartbeat", {
@@ -859,27 +929,29 @@
 
   $("pause").addEventListener("click", async () => {
     config.paused = true;
-    localStorage.setItem("ws-captioner-paused", "true");
     stopRecognition();
     ownership.release();
     updateControls();
-    setState("Paused");
+    showDriverStatus();
     try { await control("pause"); } catch (error) { setState("Error", error.message); }
   });
   $("resume").addEventListener("click", async () => {
+    $("resume").disabled = true;
     terminal = false;
     lastError = "";
     micPermission = "prompt";
     vadFailureLatched = false;
-    config.paused = false;
     localStorage.removeItem("ws-captioner-paused");
-    await requestOwnership();
     try {
+      await heartbeat();
       await control("resume");
+      await heartbeat();
+      await requestOwnership();
     } catch (error) {
-      config.paused = true;
       stopRecognition();
       setState("Error", error.message);
+    } finally {
+      updateControls();
     }
   });
   $("language").addEventListener("change", async () => {
@@ -889,7 +961,7 @@
       terminal = false;
       terminalState = "permission_denied";
       lastError = "";
-      stopRecognition();
+      stopRecognition({ stopDetector: false });
       if (!recognizer && hasOwnership) startRecognition();
     } catch (error) { setState("Error", error.message); }
   });
@@ -904,11 +976,11 @@
     await queue.compact();
     await watchMicrophonePermission();
     updateControls();
+    transcriptTimer = setInterval(updateTranscriptTail, 100);
     if (!Recognition) {
       setState("Unsupported", "Chrome Web Speech API is unavailable.");
-    } else if (config.paused || localStorage.getItem("ws-captioner-paused") === "true") {
-      config.paused = true;
-      setState("Paused");
+    } else if (config.paused) {
+      showDriverStatus();
     } else setState("Standby", "Registering with backend selection authority.");
     scheduleDelivery(0);
     await heartbeat();
@@ -927,6 +999,7 @@
     }, 3000);
   }
   window.addEventListener("pagehide", () => {
+    clearInterval(transcriptTimer);
     failSafeStop("page closed");
   });
   document.addEventListener("visibilitychange", () => {

@@ -25,6 +25,13 @@ pre-existing environment quirk, unrelated to this code).
   do restart the bridge, use the same launch args it was last using
   (check `Get-CimInstance Win32_Process` for the live command line first).
 - Don't touch `CURRENT_AGENTS.md` / `CURRENT_AGENTS.tmp.md`.
+- Updated operator authorization (2026-09-12): restart WS_COLLAB on port 8802
+  and refresh its captioner automatically whenever a change is ready, without
+  asking again. Use graceful shutdown plus a fresh interpreter when loading
+  changed Python modules. This does not authorize restarting the Meet bridge.
+- During active work, periodically read recent user voice/chat input for requests
+  at meaningful checkpoints. Distinguish user requests from model output/echo.
+  Do not create an external agent keep-alive loop for this.
 - Full pytest suite must pass before every commit. Syntax-check
   (`node --check` for `.js`, `python -m py_compile` for `.py`) every file
   you touch before running tests.
@@ -74,8 +81,48 @@ mic floor: onset blocks/cancels conversational TTS and backchannels, end uses a
 playback path re-checks immediately before audio; floor release never speaks.
 The caption page requests ideal echo/noise suppression and reports bounded
 actual track settings without raw device IDs. It cannot directly hear another
-tab or source-separate speaker leakage; Chrome Web Speech uses the Chrome/OS
-default input.
+tab or source-separate speaker leakage. Chrome desktop 135+ now receives the same
+live microphone track for Web Speech and RMS detection via `start(audioTrack)`;
+there is no silent fallback to a different default recognition input.
+
+Caption lists now show completed silence durations and a live trailing silence
+counter, separate from "Last caption ... ago". "Paused" means an explicit user
+listening pause, never a quiet interval or backend standby. Normal Web Speech
+restarts keep local RMS detection running; capture interruption invalidates its
+silence timing. Caption toolbar labels/tooltips explain Open captioner, Show
+window, Pause listening, and Resume listening.
+Background silence sampling now uses an AudioWorklet and the audio sample clock,
+not throttled page timers. Caption lists show speech-in-progress before final
+recognition, including provisional words and inline silence markers. Internal
+VAD event fields are stripped before strict envelope validation.
+
+ChatBot Test (`/ws_collab/#chatbot-test`) configures a registered conversational
+agent backed by the existing emullm API at `http://127.0.0.1:8801/v1`, using
+`emullm/default` unless the operator selects another model. Its prompt and
+submitted history are per-agent. When enabled it consumes the shared finalized,
+non-echo STT pipeline, not a second microphone. Spoken replies use the owning
+browser's real speech-synthesis voice; the server's fake TTS test driver is not
+used for these replies. Configuration/history persist, but a new server boot
+starts chat stopped. No emullm source files or service configuration were changed.
+ChatBot Test now uses half-duplex input gating: model generation and all queued
+speech must finish before user input is accepted again; STT/VAD itself continues.
+Actual browser speech completion, not estimated duration, opens the gate.
+Per-turn timing traces separate STT delivery, turn wait, model dispatch/first
+token/completion, TTS queue/playback, and total observed latency.
+Workers such as Copilot can speak through `/ws_collab/language-chat/agent-speech`
+using the same monitored output queue, without an LLM call or recycled user input.
+Model/endpoint fields allow free-text drafts even while active or disconnected;
+Stop then Save applies them. Top-bar and System & Audit restart/shutdown controls
+use the guarded lifecycle routes. `python -m ws_collab.standalone
+start|status|restart|shutdown` provides external controls and readiness checks.
+The local `plugin.start_server()` API can start a stopped standalone service;
+there is no HTTP start route inside the stopped server. Foreground supervision
+uses fresh child interpreters on restart, with repo-root `collab_state` by default.
+Connection draining is bounded to ten seconds so disconnected browser transports
+cannot hold shutdown open indefinitely. Deployment note (2026-09-12): another
+checkout occupied port 8802; it was left untouched. This checkout was started and
+restarted on 8803 with its existing state and `gpt-5.6-sol` selection preserved.
+Use `--port 8803` for its CLI controls and `/ws_collab/#chatbot-test` on that port.
 
 The two-bot design: a HOST identity (real hardware mic/speakers, never
 automated) and a COMPANION identity (a second signed-in Google account,

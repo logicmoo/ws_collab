@@ -137,7 +137,7 @@ TTS queue worker, and bounded health monitor are normal and expected.)
 
 ## Shutdown and restart
 
-Operators can use the confirmed controls on **System & Audit**, or call
+Operators can use the confirmed controls in the **top bar** or **System & Audit**, or call
 `POST /ws_collab/admin/shutdown` and `POST /ws_collab/admin/restart`. Both
 require operator authorization and normal mutation CSRF/origin protection.
 Embedded hosts return `409` unless they explicitly supply the corresponding
@@ -146,8 +146,44 @@ lifecycle callback.
 Shutdown cancels the health monitor, drains and stops the TTS queue, closes
 owned child processes, ends Uvicorn serving, and releases the state-directory
 lock. Restart uses exit code `75` internally: `python -m ws_collab.standalone`
-runs a supervisor loop which waits for complete shutdown before rebinding with
-the original interpreter arguments and environment. The store then re-derives
+runs a supervisor loop which waits for complete shutdown before starting a fresh
+server interpreter with the original arguments and environment. The supervisor
+PID stays stable across restarts; the child server PID and `boot_id` change.
+The store then re-derives
 each stream's position from durable data, repairs an unterminated final record,
 and continues without reusing a position. Consumers resume from persisted
 cursors.
+Connection/request draining is limited to ten seconds, after which Uvicorn
+cancels remaining requests before service cleanup. A disconnected browser cannot
+leave shutdown waiting indefinitely for its transport. Save pending edits first.
+
+Use `python -m ws_collab.standalone start` to launch detached, `status` to inspect,
+`restart` to wait for a different ready boot, and `shutdown` to wait for the
+listener to close. These commands accept `--host`, `--port`, `--state-dir`, and
+`--timeout`; `--help` lists them. `run` runs the supervised server in the
+foreground and also accepts `--https-port`. The original positional foreground
+form remains supported. `python -m ws_collab.server` / `ws-collab` is the
+unsupervised child entrypoint: it exits with `75` on restart and needs an external
+supervisor. Prefer `ws-collab-standalone` for operator use.
+
+Startup only reuses a listener that returns the WS_COLLAB status schema and is
+ready. An unrelated or unready listener is an explicit error, never a reason to
+kill a process. A startup timeout reports the supervisor PID and
+`collab_state\standalone.log`; the child may still be starting. CLI errors and
+stopped/down status return a nonzero exit code. An already-stopped shutdown is
+idempotent. A stopped service cannot restart itself over HTTP.
+
+Hosts can use the exported local `plugin.start_server(...)` callable to start it
+again after shutdown; it accepts host/port/state directory/timeout and an optional
+`python_executable`. It defaults to the caller's interpreter, so a host using
+another environment should explicitly pass this plugin's `.venv` interpreter.
+This callable does not add an unauthenticated web route or assume an undocumented
+host lifecycle-hook contract. The host is responsible for authorization of any
+exposed action. It rejects embedded mode, where the host owns the service.
+
+CLI authorization is read from `WS_COLLAB_TOKEN`, then `WS_COLLAB_ADMIN_TOKEN`,
+then the state directory's generated token file. It uses the same operator-only
+API as the UI and never follows redirects or sends local controls through an
+HTTP proxy. Credentials are not printed or accepted as command arguments.
+Model/endpoint/prompt/history and captioner policy survive restart; ChatBot Test
+starts stopped on every new boot.

@@ -805,6 +805,86 @@ def create_rest_router(
         await _require(request, "viewer")
         return guarded(service.read_events, "conversation", after=after, limit=limit, filters=_filters(request))
 
+    # -------------------------------------------------------------- ChatBot Test
+    @router.get(f"{mount}/language-chat")
+    async def language_chat_state(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.language_chat_state)
+
+    @router.get(f"{mount}/language-chat/config")
+    async def language_chat_config(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.language_chat.config)
+
+    @router.post(f"{mount}/language-chat/config")
+    async def language_chat_config_update(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.configure_language_chat, body)
+
+    @router.get(f"{mount}/language-chat/models")
+    async def language_chat_models(request: Request) -> dict[str, Any]:
+        await _require(request, "operator")
+        return await guarded_async(service.language_chat.models())
+
+    @router.get(f"{mount}/language-chat/request-preview")
+    async def language_chat_request_preview(request: Request) -> dict[str, Any]:
+        await _require(request, "viewer")
+        return guarded(service.language_chat.request_preview)
+
+    @router.post(f"{mount}/language-chat/history")
+    async def language_chat_history(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.language_chat.set_history, body)
+
+    def _chat_action(body: dict[str, Any], *fields: str) -> None:
+        unknown = set(body) - {"client_id", *fields}
+        if unknown:
+            raise ValidationError("unknown ChatBot Test action fields", details={"fields": sorted(unknown)})
+
+    @router.post(f"{mount}/language-chat/start")
+    async def language_chat_start(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        guarded(_chat_action, body)
+        return guarded(service.start_language_chat, body.get("client_id"))
+
+    @router.post(f"{mount}/language-chat/stop")
+    async def language_chat_stop(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        guarded(_chat_action, body)
+        return guarded(service.stop_language_chat, body.get("client_id"))
+
+    @router.post(f"{mount}/language-chat/interrupt")
+    async def language_chat_interrupt(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        guarded(_chat_action, body)
+        return guarded(service.language_chat.interrupt, body.get("client_id"))
+
+    @router.post(f"{mount}/language-chat/send")
+    async def language_chat_send(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        guarded(_chat_action, body, "text")
+        return guarded(service.language_chat.submit_text, body.get("client_id"), body.get("text"))
+
+    @router.post(f"{mount}/language-chat/send-now")
+    async def language_chat_send_now(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        guarded(_chat_action, body)
+        return guarded(service.language_chat.send_now, body.get("client_id"))
+
+    @router.post(f"{mount}/language-chat/heartbeat")
+    async def language_chat_heartbeat(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "operator", mutating=True)
+        return guarded(service.language_chat.heartbeat, body)
+
+    @router.post(f"{mount}/language-chat/agent-speech")
+    async def language_chat_agent_speech(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        await _require(request, "worker", mutating=True)
+        def enqueue_speech():
+            if set(body) - {"agent_id", "text"}:
+                raise ValidationError("agent-speech accepts only agent_id and text")
+            return service.language_chat_agent_speech(body.get("agent_id", "copilot"), body.get("text"))
+        return guarded(enqueue_speech)
+
     # --------------------------------------------------------- mailboxes (streams)
     # Every durable JSONL stream is exposed as a "mailbox" so the shared workbench
     # ChatConversation UI can browse ws_collab streams (mailbox == stream file).

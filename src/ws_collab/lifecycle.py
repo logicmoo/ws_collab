@@ -10,6 +10,7 @@ from typing import Awaitable, Callable
 from .errors import ConflictError
 
 LifecycleCallback = Callable[[], Awaitable[None] | None]
+RESTART_EXIT_CODE = 75
 
 
 @dataclass(frozen=True)

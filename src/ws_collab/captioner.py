@@ -16,6 +16,7 @@ import re
 import secrets
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -976,6 +977,29 @@ class BrowserCaptioner:
         return highest
 
     @staticmethod
+    def _silence_position(prefix: str, text: str) -> int:
+        if not prefix:
+            return 0
+        if text.startswith(prefix):
+            return len(prefix)
+        normalized_prefix = "".join(
+            character for character in unicodedata.normalize("NFKC", prefix).lower()
+            if character.isalnum()
+        )
+        normalized = []
+        positions = []
+        for index, character in enumerate(text):
+            for part in unicodedata.normalize("NFKC", character).lower():
+                if part.isalnum():
+                    normalized.append(part)
+                    positions.append(index + 1)
+        if normalized_prefix and "".join(normalized).startswith(normalized_prefix):
+            return positions[len(normalized_prefix) - 1]
+        ends = [match.end() for match in re.finditer(r"\S+", text)]
+        word_count = len(prefix.split())
+        return ends[min(word_count, len(ends)) - 1] if ends and word_count else 0
+
+    @staticmethod
     def _preserve_speech_metadata(
         item: dict[str, Any], current: dict[str, Any] | None
     ) -> dict[str, Any]:
@@ -990,6 +1014,50 @@ class BrowserCaptioner:
                 item[field] = previous[field]
         if previous.get("speech_ended_at") is not None:
             item["speech_ended_at"] = previous["speech_ended_at"]
+        incoming = [dict(pause) for pause in item.get("pauses", [])]
+        prior_pauses = previous.get("pauses") or []
+        prior_text = current.get("text") if isinstance(current, dict) else None
+        text = item["text"]
+        prior_by_key = {
+            (pause["start_at"], pause["end_at"], pause["duration_ms"]): pause
+            for pause in prior_pauses
+        }
+        if isinstance(prior_text, str) and prior_text != text:
+            for pause in incoming:
+                old = prior_by_key.get((pause["start_at"], pause["end_at"], pause["duration_ms"]))
+                if old and old["alignment"] != "between_utterances":
+                    pause["after_char"] = BrowserCaptioner._silence_position(
+                        prior_text[:old["after_char"]], text
+                    )
+                    pause["alignment"] = "approximate_text_position"
+        incoming_keys = {
+            (pause["start_at"], pause["end_at"], pause["duration_ms"])
+            for pause in incoming
+        }
+        preserved = []
+        boundaries = [0, len(text)] + [
+            index for index, character in enumerate(text) if character.isspace()
+        ]
+        for pause in prior_pauses:
+            key = (pause["start_at"], pause["end_at"], pause["duration_ms"])
+            if key in incoming_keys:
+                continue
+            retained = dict(pause)
+            if retained["alignment"] != "between_utterances":
+                if isinstance(prior_text, str):
+                    retained["after_char"] = BrowserCaptioner._silence_position(
+                        prior_text[:retained["after_char"]], text
+                    )
+                else:
+                    retained["after_char"] = min(
+                        boundaries,
+                        key=lambda position: abs(position - min(retained["after_char"], len(text))),
+                    )
+                retained["alignment"] = "approximate_text_position"
+            preserved.append(retained)
+        if len(preserved) + len(incoming) > MAX_PAUSES_PER_ENVELOPE:
+            raise ValidationError("captioner accumulated silence metadata exceeds the per-utterance limit")
+        item["pauses"] = preserved + incoming
         return {
             "speech_started_at": item.get("speech_started_at"),
             "speech_ended_at": item.get("speech_ended_at"),
@@ -1102,6 +1170,7 @@ class BrowserCaptioner:
                     utterances[item["utterance_id"]] = {
                         "revision": item["revision"],
                         "final": item["is_final"],
+                        "text": item["text"],
                         "speech_metadata": speech_metadata,
                     }
                     if item["is_final"]:
@@ -1602,7 +1671,8 @@ class BrowserCaptioner:
                 if heartbeat.get("vad") and not heartbeat["vad"].get("available"):
                     health_level = "degraded"
             else:
-                state = str(heartbeat.get("state") or "idle")
+                reported_state = str(heartbeat.get("state") or "idle")
+                state = "standby" if reported_state == "paused" else reported_state
                 healthy = False
                 health_level = "degraded"
             return {
@@ -1622,6 +1692,7 @@ class BrowserCaptioner:
                 "state_age_seconds": round(state_age, 3) if state_age is not None else None,
                 "restart_count": heartbeat.get("restart_count", 0),
                 "session_id": heartbeat.get("session_id"),
+                "instance_id": heartbeat.get("instance_id"),
                 "recognizer_supported": heartbeat.get("recognizer_supported"),
                 "mic_permission": heartbeat.get("mic_permission"),
                 "queue_depth": heartbeat.get("queue_depth", 0),

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 from threading import Event
+import asyncio
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -174,27 +176,52 @@ def test_custom_plugin_prefix_composes_lifecycle_paths(app_context, monkeypatch)
 
 
 def test_standalone_supervisor_waits_for_release_before_rebind(monkeypatch) -> None:
-    from ws_collab import server, standalone
+    from ws_collab import standalone
 
     events: list[object] = []
-    original_environment = os.environ.copy()
+    commands = []
+    monkeypatch.setenv("WS_COLLAB_TEST_SENTINEL", "preserved")
 
-    def fake_server_main(argv):
-        events.append(("bind", tuple(argv), os.environ.copy()))
-        if len([event for event in events if event[0] == "bind"]) == 1:
+    class Child:
+        def __init__(self, command, *, env):
+            if commands:
+                assert events[-1] == "released-port-and-locks"
+            commands.append(command)
+            assert env["WS_COLLAB_TEST_SENTINEL"] == "preserved"
+            assert env["WS_COLLAB_STATE_DIR"]
+
+        def wait(self):
+            events.append("waited")
             events.append("released-port-and-locks")
-            return RESTART_EXIT_CODE
-        assert events[-2] == "released-port-and-locks"
-        return 0
+            return RESTART_EXIT_CODE if len(commands) == 1 else 0
 
-    monkeypatch.setattr(server, "main", fake_server_main)
+    monkeypatch.setattr(standalone.subprocess, "Popen", Child)
     assert standalone.main(["127.0.0.1", "8802"]) == 0
-    binds = [event for event in events if event[0] == "bind"]
-    assert [event[1] for event in binds] == [
-        ("127.0.0.1", "8802"),
-        ("127.0.0.1", "8802"),
-    ]
-    assert all(event[2] == original_environment for event in binds)
+    assert commands == [[standalone.sys.executable, "-u", "-m", "ws_collab.server", "127.0.0.1", "8802"]] * 2
+
+
+def test_server_bounds_connection_drain_before_releasing_context(config, monkeypatch) -> None:
+    from ws_collab import server
+    import uvicorn
+
+    context = Mock(ensure_started=AsyncMock(), aclose=AsyncMock())
+    monkeypatch.setattr(server, "build_context", lambda _: context)
+    monkeypatch.setattr(server, "build_app", lambda *a, **kw: object())
+    monkeypatch.setattr(server, "build_startup_report", lambda *a: "test")
+    configurations = []
+
+    class FakeServer:
+        def __init__(self, config):
+            configurations.append(config)
+            self.started = False
+
+        async def serve(self):
+            self.started = True
+
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    assert asyncio.run(server._serve(config)) is False
+    assert configurations[0].timeout_graceful_shutdown == 10.0
+    context.aclose.assert_awaited_once()
 
 
 def test_inventory_describes_admin_controls(client, admin_headers) -> None:
@@ -219,6 +246,7 @@ def test_admin_ui_lifecycle_controls_are_confirmed_and_prefix_aware() -> None:
     source = (root / "app.js").read_text(encoding="utf-8")
     assert 'id="sy-shutdown"' in html and 'class="danger"' in html
     assert 'id="sy-restart"' in html and 'class="secondary"' in html
+    assert 'id="server-restart"' in html and 'id="server-shutdown"' in html
     assert 'role="status"' in html and 'aria-live="polite"' in html
     assert "if (!confirm(warning)) return" in source
     assert "`${API_BASE}/admin/${action}`" in source

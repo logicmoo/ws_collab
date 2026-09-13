@@ -152,22 +152,33 @@ last acknowledgement, and last final.
 The **Chrome Captions** admin page owns these controls, keeps interim text
 separate, and rebuilds its finalized transcript from the durable STT stream.
 The lease owner first acquires an explicit `getUserMedia` stream, then starts
-Chrome recognition. A local Web Audio analyser feeds 20ms RMS frames to an
+Chrome recognition. A local AudioWorklet feeds audio-clocked 20ms RMS frames to an
 adaptive-noise-floor VAD with hysteresis. It reports every acoustic pause of at
 least 20ms, including multiple pauses inside one Chrome final. PCM/RMS frame
-samples are never posted or stored; only bounded scalar VAD health and validated
-pause metadata leave the page. On pause, restart, ownership loss, or shutdown,
+samples are never posted or stored; only RMS summaries cross to the page, and only bounded scalar VAD health and validated
+pause metadata leave the page. On an explicit listening pause, ownership loss, or shutdown,
 the page stops all media tracks, closes its `AudioContext`, and resets the VAD
 epoch before reacquiring.
+Normal Web Speech silence timeouts, reconnects, and language changes do not stop
+the independent microphone detector. "Paused" is reserved for a user-requested
+listening pause, not acoustic silence, standby, or a connection failure. Backend
+pause settings are authoritative; an old browser-local pause flag cannot override
+a resumed driver. Page timers are not used for audio sampling: Chrome can throttle
+them to one second in background tabs. Missing audio frames or a suspended audio context invalidate
+the silence interval rather than counting unobserved time as measured silence.
 
 The page requests ideal mono input with echo cancellation and noise suppression
 enabled and auto gain disabled, then reports the bounded actual track label and
 actual `getSettings()` values. Raw `deviceId` is never transmitted. Its input
 scope is microphone only: browser-origin isolation prevents direct observation
 of other tabs, and RMS cannot identify speaker leakage as human vs website
-audio. Chrome Web Speech independently uses the Chrome/OS default input and
-cannot be bound to the `getUserMedia` stream; use headphones or separate virtual
+audio. On Chrome desktop 135+, recognition receives the same live
+`getUserMedia` microphone track through `SpeechRecognition.start(audioTrack)`.
+If that track is unavailable, the page reports an error rather than starting
+recognition on an unrelated default input. Use headphones or separate virtual
 audio devices when acoustic isolation matters.
+Recognition remains continuous; measured silences do not force the recognizer
+to stop or shorten phrases. Text replacement is handled separately from timing.
 
 Only owner-authenticated, ordered `browser_rms_vad` transitions—not PCM or RMS
 frames—acquire the `local_microphone` floor. Speech onset blocks new
@@ -185,6 +196,89 @@ between legacy event timestamps. Chrome supplies no word timestamps, so internal
 marker placement uses a captured interim-text prefix and is explicitly
 best-effort; the displayed duration remains acoustically measured. **Clear
 view** is local and non-destructive; refreshing restores durable history.
+Both caption lists end with a live silence duration while the detector is active
+and a separate "Last caption ... ago" age. The running silence timer advances
+between detector reports and switches to an explicit unavailable/paused state
+when detection stops or reports become stale. Caption age keeps updating but is
+never presented as measured silence. Timer updates do not rebuild saved captions
+or announce every tick to screen readers.
+The list also shows a recognizing-speech placeholder immediately on detected
+speech, then provisional words as interim results arrive. Measured silences are
+inserted inside that evolving text, including between words, and retained when
+the matching final replaces it. Interim text is not counted as a committed
+caption. Silence durations use the audio clock even when the UI receives a batch
+of frames late; text positions remain best-effort because Chrome provides no
+word timestamps.
+Silence markers are duration-only (`80ms`, `4s`, `1m 08s`), with no pause glyph.
+Consecutive markers with no words between them are combined, including across
+sentence, interim, and live-counter boundaries. Separate intervals add together;
+repeated or overlapping timed intervals count only once. Whitespace is not a
+word boundary for this purpose, and merging never changes the stored raw timing.
+Silence anchors are captured when acoustic silence starts, rather than moved by
+later sentence-completion text. Final-caption persistence consumes only its own
+timing snapshot; silences detected during an asynchronous save remain pending
+for the following text. The backend retains previously received silence intervals
+across interim/final revisions even when a later revision omits them. When words
+are rewritten, placement may be marked approximate, but measured duration is kept.
+The same interval anchors also survive whole-text replacement in both live views.
+For example, reformatting `1 2 3` as `123` retains the two internal silence
+boundaries instead of snapping both to the end of the number. Pending finals
+reserve only their own intervals while being saved, preventing timing from being
+copied into the next utterance.
+Detector health uses the monotonic time at which audio frames actually arrive,
+not an audio-clock timestamp compared to a page clock. Audio/output timestamps
+correlate measured boundaries with real time even if those clocks advance at
+different rates. A genuinely stalled processor or suspended audio context reports
+that specific reason; disabling Google Meet or other STTs does not disable this
+microphone detector.
+
+#### Repeatable caption and silence baselines
+
+`tests\captioner_counting_harness.py` records Windows stock-voice TTS fixtures
+and inserts exact PCM-zero intervals: four 2-second gaps, mixed 80/240/1000/2000/
+4000ms gaps, a 4-second phrase gap, and a continuous-speech control. Generated
+WAVs, source crops, sample indices, hashes, baseline runtime snapshots, and
+machine-readable reports are retained in `collab_state\captioner_counting_tests`.
+
+```powershell
+.\.venv\Scripts\python.exe tests\captioner_counting_harness.py generate
+.\.venv\Scripts\python.exe tests\captioner_counting_harness.py vad
+.\.venv\Scripts\python.exe tests\captioner_counting_harness.py compare
+.\.venv\Scripts\python.exe tests\captioner_counting_harness.py replay
+.\.venv\Scripts\python.exe tests\captioner_counting_harness.py position
+```
+
+The optional `native` command runs continuous Chrome recognition and the real
+AudioWorklet on the same prerecorded track in an isolated browser context.
+It neither captures the user's microphone nor publishes test captions to the
+live backend. Run only one native benchmark at a time. Offline `replay` and
+`position` reuse the saved Google result arrays without more cloud recognition.
+
+The recorded baseline found all ten inserted TTS gaps. Eight VAD configurations
+at two gains show timing/extra-detection tradeoffs; defaults remain unchanged.
+Timing retention and word placement are scored separately: the current
+frozen-anchor strategy placed 7/10 gaps at the expected boundaries, while the
+experimental deferred-initial strategy placed 9/10. Neither result establishes
+perfect alignment, and these experiments do not invent word timestamps.
+
+Two CC-BY-4.0 LibriSpeech human recordings and their reference transcripts are
+preserved in `collab_state\captioner_recording_baseline`, with source attribution.
+Their normalized word error rates were 3/64 and 6/50. Natural silence is unlabeled:
+energy-envelope comparisons are proxies, not human silence ground truth.
+Derived recordings additionally contain verified zero-sample insertions between
+whole utterances; original quiet tails/heads are reported separately.
+
+Toolbar labels and tooltips distinguish **Open captioner** (open/reuse the
+dedicated tab), **Show window** (bring it into view, for example for microphone
+permission), and **Pause listening** (explicitly stop microphone, recognition,
+and silence detection until resumed; history is kept).
+The instance list counts recently reporting pages separately from collapsed
+earlier/unresponsive records; a new instance ID after a reload does not imply a
+new browser window. Browser-tab presence, speech-recognition retries, and local
+detector activity are reported separately. Normal `no-speech` / recognizer-end
+retries stay at 500-625ms rather than backing off for quiet input; actual failures
+retain bounded exponential backoff. A speech-engine retry reuses the existing
+browser tab and microphone stream.
 Its persistent **Caption source priority** panel stores three strict booleans: prefer it over recent
 duplicate Google Meet finals (default true), suppress new typed Meet caption
 publication (default false), and bypass other configured audio-segment STTs

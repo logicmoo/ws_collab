@@ -25,7 +25,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .config import Config
 from .context import AppContext, build_context
 from .errors import WsCollabError
-from .lifecycle import LifecycleController
+from .lifecycle import RESTART_EXIT_CODE, LifecycleController
 from .rest import create_rest_router, create_static_router
 from .urls import (
     DEFAULT_ROUTE_PREFIX,
@@ -43,9 +43,7 @@ _DOC_URLS = {
     "openapi_url": f"{_OPENAPI_BASE}.json",
     "swagger_ui_oauth2_redirect_url": f"{_OPENAPI_BASE}/oauth2-redirect",
 }
-
-RESTART_EXIT_CODE = 75
-
+GRACEFUL_SHUTDOWN_SECONDS = 10.0
 
 def build_app(ctx: AppContext, *, with_lifespan: bool = True) -> FastAPI:
     if with_lifespan:
@@ -200,7 +198,11 @@ async def _serve(config: Config) -> bool:
     failed: list[dict[str, Any]] = []
     tasks: list[asyncio.Task] = []
     for plan in _binding_plans(config):
-        kwargs: dict[str, Any] = dict(host=plan["host"], port=plan["port"], log_level="warning", lifespan="off")
+        kwargs: dict[str, Any] = dict(
+            host=plan["host"], port=plan["port"], log_level="warning", lifespan="off",
+            # A disconnected browser/transport must not hold the state lock forever.
+            timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
+        )
         if plan["scheme"] == "https":
             kwargs["ssl_certfile"] = plan["certfile"]
             kwargs["ssl_keyfile"] = plan["keyfile"]

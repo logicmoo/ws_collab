@@ -6,7 +6,7 @@ WebSocket parity.
 
 WS_COLLAB runs two ways:
 
-* **As a standalone server (recommended)** — `python -m ws_collab.server` binds
+* **As a standalone server (recommended)** — `python -m ws_collab.standalone` binds
   HTTP/HTTPS/WS/WSS and prints a startup report. A host application (e.g. the
   workbench) then mounts it with a lightweight HTTP `web_proxy` at `/ws_collab`,
   so the host never imports WS_COLLAB and stays free of its dependencies.
@@ -83,10 +83,34 @@ external ingest remain available.
 
 Input scope is microphone only. Other tabs are not captured directly, and RMS
 cannot distinguish a person from speaker audio leaking acoustically into the
-mic. Use headphones or separate virtual audio devices. Chrome Web Speech listens
-to the Chrome/OS default input and cannot accept the page's chosen
-`MediaStream`; no misleading microphone picker or source-separation claim is
-provided.
+mic. Use headphones or separate virtual audio devices. On Chrome desktop 135+
+the page passes its live microphone track to `SpeechRecognition.start(track)`,
+so recognition and silence detection use the same input and processing.
+Recognition does not silently fall back to a separate default input if the
+shared track is unavailable.
+
+### ChatBot Test
+
+Open `/ws_collab/#chatbot-test` to configure a registered conversational agent
+using the existing emullm service (`http://127.0.0.1:8801/v1`, model
+`emullm/default`). Its editable system prompt and per-agent history determine
+the submitted context; the request preview makes that context visible.
+
+Once enabled, it monitors finalized, non-echo speech from the shared STT
+pipeline automatically. It does not open another microphone. Replies appear
+incrementally and are spoken by the active browser client's text-to-speech
+voice, assigned automatically and changeable in the page. Stop/Interrupt affects
+this chat, not the general captioner. Keep the chat client open for spoken
+replies; headphones help prevent acoustic feedback. This client submits chat
+context only; the external emullm agent retains its own action permissions.
+The agent waits for its full response and actual TTS completion before accepting
+speech again; microphone activity is not treated as an automatic interruption.
+The timing trace shows where response latency occurs. Workers can send direct
+announcements through `/ws_collab/language-chat/agent-speech`, using the same
+output gate and echo handling without an extra LLM round trip.
+Model IDs and endpoint URLs are free text; the model list only offers suggestions.
+You can draft either field while chat is active or temporarily disconnected.
+Stop chat and **Save agent settings** to apply a draft; polling does not replace it.
 
 Google Meet is a manual-start chat/transcript resource and is not in the current
 autostart set. Start or join it explicitly through the operator controls,
@@ -96,7 +120,7 @@ autostart set. Start or join it explicitly through the operator controls,
 
 ```bash
 export WS_COLLAB_ADMIN_TOKEN=choose-a-strong-token
-python -m ws_collab.server 127.0.0.1 8802
+python -m ws_collab.standalone 127.0.0.1 8802
 ```
 
 Then open <http://127.0.0.1:8802/ws_collab/admin> and sign in with that token.
@@ -108,6 +132,37 @@ mounted. `GET /ws_collab/endpoints` returns the categorized inventory.
 
 If you do not configure a token, a random administrator token is generated and
 written to `collab_state/generated_admin_token.txt` — it is never printed.
+
+### Command-line and plugin startup
+
+From this repository on Windows:
+
+```powershell
+.\.venv\Scripts\python.exe -m ws_collab.standalone start
+.\.venv\Scripts\python.exe -m ws_collab.standalone status
+.\.venv\Scripts\python.exe -m ws_collab.standalone restart
+.\.venv\Scripts\python.exe -m ws_collab.standalone shutdown
+```
+
+The installed `ws-collab-standalone` command accepts the same actions.
+`start` detaches and waits for HTTP readiness; `run` (or the original positional
+form above) stays in the foreground. Use `--host`, `--port`, `--state-dir`, and
+`--timeout` on control commands as needed. Default state/logs are in this repo's
+`collab_state`, not `src\collab_state`. Restart launches a fresh Python server
+after the previous one exits. It never restarts emullm or the Meet bridge.
+
+The plugin host can call **`plugin.start_server()`** even after shutdown.
+It returns a JSON-compatible result with `status`, `url`, `boot_id`, and
+`supervisor_pid` (null when reusing an existing server). Optional keywords are
+`host`, `port`, `state_dir`, `timeout`, and `python_executable`; pass the plugin's
+own virtualenv interpreter when the host uses a different Python environment.
+This is a local Python API, not an HTTP route on a stopped server; the host must
+authorize any remote/UI action it exposes. Embedded mode remains host-owned.
+
+Restart/shutdown controls are also visible in the admin top bar and **System &
+Audit**. Protected CLI requests use `WS_COLLAB_TOKEN`, `WS_COLLAB_ADMIN_TOKEN`,
+or the selected state's `generated_admin_token.txt`; never put tokens in command
+arguments. See [operations](docs/OPERATIONS.md#shutdown-and-restart).
 
 ## The single writable directory
 

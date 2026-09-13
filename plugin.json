@@ -1,7 +1,7 @@
 {
   "id": "ws_collab",
   "label": "WS_COLLAB",
-  "description": "Coordination, audio, local STT, backend-selected browser caption instances, durable Chrome/Meet caption-source policy, and administration over durable JSONL event streams.",
+  "description": "Coordination, audio, local STT, browser captions, emullm-backed ChatBot Test agents with spoken replies, and administration over durable JSONL event streams.",
   "summary": "Run the WS_COLLAB server, review its transports, and open its administration console.",
   "version": "1.0.0",
   "entrypoint": "plugin.py",
@@ -73,7 +73,7 @@
       "workspaceShutdown": null,
       "workspaceShutdownAfter": null
     },
-    "note": "Runs as its own standalone server by default (set WS_COLLAB_PLUGIN_MODE=embedded to mount it in-process instead). The operator lifecycle API gracefully controls the standalone host; embedded mounts expose the same routes but return 409 unless their host supplies lifecycle callbacks."
+    "note": "Runs as its own standalone server by default (set WS_COLLAB_PLUGIN_MODE=embedded to mount it in-process instead). The local Python plugin.start_server() callable and python -m ws_collab.standalone start can start it after shutdown. The operator HTTP lifecycle API controls a running server; embedded mounts return 409 unless their host supplies lifecycle callbacks."
   },
   "plugin-api": {
     "base": {
@@ -126,6 +126,13 @@
       "auth": "bearer-or-session",
       "capability": "viewer/operator",
       "description": "Lists recent browser captioner tab instances; operator-only per-instance enable, disable, and pinned selection actions control backend microphone authority."
+    },
+    "languageChat": {
+      "method": "GET/POST",
+      "path": "/ws_collab/language-chat",
+      "auth": "bearer-or-session",
+      "capability": "viewer/operator",
+      "description": "ChatBot Test agent configuration, prompt/history, emullm model replies, automatic STT monitoring, and single-client browser TTS."
     },
     "config": {
       "method": "GET",

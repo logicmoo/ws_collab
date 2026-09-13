@@ -97,6 +97,7 @@ from .tts import accuracy as accuracy_metrics
 from .tts.engine import TtsEngine
 from .tts.voices import VoiceManager
 from .workers import WorkerMonitor
+from .language_chat import LanguageChat
 from . import __version__
 from .urls import (
     DEFAULT_ROUTE_PREFIX,
@@ -391,6 +392,12 @@ class WsCollabService:
             self.classifier.echo_policy = saved_echo_policy
         self.prompt = PromptManager(config, self.publish, read_history=self._prompt_history_events)
         self.accuracy = accuracy_metrics.AccuracyAccumulator()
+        self.language_chat = LanguageChat(
+            config.state_dir,
+            microphone_state=self._language_chat_microphone,
+            publish_message=self._publish_language_chat_message,
+            audit=self._language_chat_audit,
+        )
         self.captioner.recover_pending()
 
         self._monitor_task: asyncio.Task | None = None
@@ -5056,6 +5063,113 @@ class WsCollabService:
     def list_workers(self) -> dict[str, Any]:
         return {"workers": self.workers.list_workers(), "server_time": utc_now_iso()}
 
+    # -------------------------------------------------------------- ChatBot Test
+    def _language_chat_microphone(self) -> dict[str, Any]:
+        status = self.captioner.status()
+        vad = status.get("vad") or {}
+        fresh = status.get("heartbeat_age_seconds")
+        if (
+            status.get("enabled")
+            and not status.get("paused")
+            and isinstance(fresh, (int, float))
+            and fresh <= 15
+            and vad.get("available")
+        ):
+            return {
+                "available": True,
+                "state": vad.get("state", "idle"),
+                "current_silence_ms": vad.get("current_silence_ms"),
+                "error": None,
+            }
+        return {
+            "available": False,
+            "state": "unavailable",
+            "current_silence_ms": None,
+            "error": vad.get("error") or "STT is monitored, but live silence timing is unavailable; use Send now.",
+        }
+
+    def _register_language_chat_agent(self) -> None:
+        config = self.language_chat.config()
+        agent_id = config["agent_id"]
+        known = any(row["worker_id"] == agent_id for row in self.workers.list_workers())
+        self.register_worker(
+            agent_id,
+            "" if known else "ChatBot Test: emullm conversation with spoken replies",
+            {
+                "client_type": "chatbot-test",
+                "provider": "emullm",
+                "cadence": "on-activation",
+                "voice_backend": "browser",
+                "voice_uri": config.get("voice_uri", ""),
+                "model": config.get("model", ""),
+            },
+        )
+
+    def _language_chat_audit(self, event_type: str, data: dict[str, Any]) -> None:
+        self.publish(
+            stream=STREAM_AUDIT,
+            type=event_type,
+            data=data,
+            source_id=str(data.get("agent_id") or "language-chat"),
+            source_kind="agent",
+        )
+
+    def _publish_language_chat_message(
+        self, agent_id: str, session_id: str, role: str, text: str,
+        message_id: str, status: str,
+    ) -> None:
+        metadata = {
+            "language_chat": True, "agent_id": agent_id, "session_id": session_id,
+            "message_id": message_id, "role": role, "status": status,
+        }
+        if text.strip():
+            self.add_conversation(
+                text,
+                source_id=agent_id if role == "assistant" else f"{agent_id}:user",
+                source_kind="agent" if role == "assistant" else "client",
+                correlation_id=session_id,
+                idempotency_key=f"language-chat:{session_id}:{message_id}:{status}",
+                data=metadata,
+            )
+        else:
+            self._language_chat_audit("LANGUAGE_CHAT_MESSAGE_STATUS", metadata)
+        self.worker_status(agent_id, f"ChatBot Test {role} message: {status}")
+
+    def language_chat_state(self) -> dict[str, Any]:
+        return self.language_chat.state()
+
+    def configure_language_chat(self, body: dict[str, Any]) -> dict[str, Any]:
+        self.language_chat.configure(body)
+        self._register_language_chat_agent()
+        return self.language_chat.state()
+
+    def start_language_chat(self, client_id: str) -> dict[str, Any]:
+        result = self.language_chat.start(client_id)
+        self._register_language_chat_agent()
+        self.worker_status(self.language_chat.config()["agent_id"], "ChatBot Test monitoring STT")
+        return result
+
+    def stop_language_chat(self, client_id: str) -> dict[str, Any]:
+        result = self.language_chat.stop(client_id)
+        self.worker_status(self.language_chat.config()["agent_id"], "ChatBot Test stopped")
+        return result
+
+    def language_chat_agent_speech(self, agent_id: str, text: str) -> dict[str, Any]:
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise ValidationError("agent_id is required")
+        profile = self.voices.get_profile(agent_id)
+        if profile and not profile.speaking_permission:
+            raise ConflictError(f"agent {agent_id!r} does not have speaking permission")
+        microphone = self._language_chat_microphone()
+        if microphone["available"] and microphone["state"] == "speech":
+            raise ConflictError("Wait for the user's speech to finish before speaking an agent update.")
+        result = self.language_chat.speak_agent(agent_id, text)
+        self.register_worker(
+            agent_id,
+            meta={"voice_backend": "browser", "voice_channel": "chatbot-test", "cadence": "on-activation"},
+        )
+        return result
+
     def run_monitor_cycle(self) -> dict[str, Any]:
         alerts = self.workers.evaluate()
         return {"alerts": alerts, "workers": self.workers.list_workers()}
@@ -5301,7 +5415,10 @@ class WsCollabService:
             "utterance_id": None,
             "backchannel_cancelled": False,
         }
+        if result.get("accepted") and transition["event"] == "speech_end":
+            self.language_chat.on_speech_end(transition["at"])
         if result.get("accepted") and result.get("acquired"):
+            self.language_chat.on_speech_start()
             cancellation.update(self.tts.cancel_current_conversational())
             companion = self._refresh_companion_tts_status(timeout=0.05)
             current = companion.get("current") if isinstance(companion, dict) else None
@@ -5396,6 +5513,8 @@ class WsCollabService:
             ),
         )
         if not item["is_final"]:
+            if not published.get("duplicate"):
+                self.language_chat.on_partial(item["text"], correlation_id)
             return published
         segment = AudioSegment(
             correlation_id=correlation_id,
@@ -5671,6 +5790,7 @@ class WsCollabService:
         """Run one segment through STT -> disambiguation -> classification."""
 
         async def on_partial(correlation_id: str, hyp: Hypothesis) -> None:
+            self.language_chat.on_partial(hyp.normalized_text or hyp.raw_text, correlation_id)
             self.publish(
                 stream=STREAM_STT_TRANSCRIPTS,
                 type=STT_PARTIAL_RESULT,
@@ -5757,7 +5877,9 @@ class WsCollabService:
         )
 
         classification = self.classifier.classify(
-            segment, resolved.resolved_text, active_tts=self.tts.active_expected_texts()
+            segment,
+            resolved.resolved_text,
+            active_tts=self.tts.active_expected_texts() + self.language_chat.active_tts_context(),
         )
 
         # TTS echo handling + accuracy measurement.
@@ -5832,6 +5954,13 @@ class WsCollabService:
                 f"{idempotency_prefix}:heard" if idempotency_prefix else None
             ),
         )
+        if not heard.get("duplicate") and resolved.resolved_text.strip():
+            self.language_chat.on_caption(
+                resolved.resolved_text,
+                segment.correlation_id,
+                segment.started_at,
+                is_echo=classification.is_echo,
+            )
         return {
             "correlation_id": segment.correlation_id,
             "segment_id": segment.id,
@@ -6941,12 +7070,19 @@ class WsCollabService:
         self._seed_prompt()
         self._seed_voices()
         self._seed_workers()
+        await self.language_chat.startup()
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         self._captioner_task = asyncio.create_task(
             self.captioner_supervisor.run(), name="browser-captioner-supervisor"
         )
 
     async def shutdown(self) -> None:
+        try:
+            await self.language_chat.shutdown()
+        finally:
+            await self._shutdown_audio_and_monitors()
+
+    async def _shutdown_audio_and_monitors(self) -> None:
         if self.secondary_capture.state()["listening"]:
             self.secondary_capture.stop()
         if self._monitor_task is not None:

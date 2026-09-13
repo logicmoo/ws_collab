@@ -917,6 +917,7 @@ def test_captioner_heartbeat_validates_and_exposes_vad(tmp_path: Path) -> None:
     }
     source.heartbeat({**base, "vad": vad})
     assert source.status()["vad"] == vad
+    assert source.status()["instance_id"] == "owner"
     for field, value in [
         ("rms", -1),
         ("threshold", float("nan")),
@@ -1612,7 +1613,9 @@ def test_captioner_page_contains_restart_queue_and_privacy_contract() -> None:
     assert "getUserMedia" not in source  # lifecycle is isolated in the pure runtime helper
     runtime = script_path.with_name("captioner_runtime.js").read_text(encoding="utf-8")
     assert "getUserMedia" in runtime
-    assert "getFloatTimeDomainData" in runtime
+    assert "context.audioWorklet.addModule" in runtime
+    assert "this.frames.push(samples, currentFrame)" in runtime
+    assert "getFloatTimeDomainData" not in runtime
     assert "browser_rms_vad" in runtime
     assert "recording-indicator" in html
     assert "not offline or local" in html
@@ -1620,6 +1623,8 @@ def test_captioner_page_contains_restart_queue_and_privacy_contract() -> None:
     assert "Other tabs are not captured directly." in html
     assert "cannot be reliably identified" in html
     assert "Chrome/OS default input" in html
+    assert "Recognition and silence detection share the same microphone track" in html
+    assert "instance.start(audioTrack)" in source
     assert "noiseSuppression: { ideal: true }" in runtime
     assert "settings.deviceId" not in runtime
 
@@ -1789,8 +1794,12 @@ class Element {
     this.scrollTop = 0;
     this.scrollHeight = 0;
     this.listeners = {};
+    this.style = {setProperty() {}};
   }
   addEventListener(type, listener) { this.listeners[type] = listener; }
+  setAttribute() {}
+  append() {}
+  remove() {}
   replaceChildren() {}
   appendChild() {}
 }
@@ -1830,16 +1839,24 @@ global.document = {
 global.window.location = {href: "http://127.0.0.1/captioner/"};
 global.window.addEventListener = (type, listener) => { windowListeners[type] = listener; };
 global.localStorage = new Storage();
+global.localStorage.setItem("ws-captioner-paused", "true");
 Object.defineProperty(global, "crypto", {
   value: {randomUUID: () => "00000000-0000-4000-8000-000000000001"},
   configurable: true,
 });
 global.BroadcastChannel = undefined;
 global.indexedDB = undefined;
-global.setTimeout = () => 1;
-global.clearTimeout = () => {};
-global.setInterval = () => 1;
-global.clearInterval = () => {};
+const timeouts = new Map();
+const intervals = new Map();
+let timerId = 0;
+global.setTimeout = (callback, ms) => {
+  const id = ++timerId; timeouts.set(id, {callback, ms}); return id;
+};
+global.clearTimeout = (id) => timeouts.delete(id);
+global.setInterval = (callback, ms) => {
+  const id = ++timerId; intervals.set(id, {callback, ms}); return id;
+};
+global.clearInterval = (id) => intervals.delete(id);
 
 let permissionQueries = 0;
 const permissionStatus = {state: "granted", onchange: null};
@@ -1847,6 +1864,8 @@ const lifecycle = [];
 let trackStops = 0;
 let contextCloses = 0;
 const track = {
+  kind: "audio",
+  readyState: "live",
   label: "Unit Test Mic",
   getSettings: () => ({
     deviceId: "must-not-leak",
@@ -1884,8 +1903,11 @@ Object.defineProperty(global, "navigator", {
 
 let starts = 0;
 let stops = 0;
+let recognizer;
 class Recognition {
-  start() {
+  constructor() { recognizer = this; }
+  start(inputTrack) {
+    assert.equal(inputTrack, track, "recognition must consume the very same microphone track as the VAD");
     lifecycle.push("recognition-start");
     starts += 1;
     this.onstart();
@@ -1898,17 +1920,30 @@ class Recognition {
 }
 global.window.SpeechRecognition = Recognition;
 global.window.AudioContext = class {
-  constructor() { this.state = "running"; lifecycle.push("audio-context"); }
+  constructor() {
+    this.state = "running"; this.currentTime = 0;
+    this.audioWorklet = {addModule: async () => lifecycle.push("worklet-module")};
+    lifecycle.push("audio-context");
+  }
   createMediaStreamSource(value) {
     assert.equal(value, stream);
     return {connect() {}, disconnect() { lifecycle.push("disconnect"); }};
   }
-  createAnalyser() {
-    return {fftSize: 1024, smoothingTimeConstant: 0, getFloatTimeDomainData() {}};
-  }
+  createGain() { return {gain: {value: 1}, connect() {}, disconnect() {}}; }
   async close() { contextCloses += 1; lifecycle.push("context-close"); }
 };
+let processor;
+global.window.AudioWorkletNode = class {
+  constructor() { processor = this; this.port = {close() {}}; lifecycle.push("audio-worklet"); }
+  connect() {}
+  disconnect() {}
+};
 const runtime = require(runtimePath);
+const Association = runtime.PauseAssociation;
+let association;
+runtime.PauseAssociation = class extends Association {
+  constructor(...args) { super(...args); association = this; }
+};
 runtime.StorageLease = class {
   constructor() { this.key = "lease"; }
   tryAcquire() { return true; }
@@ -1918,18 +1953,26 @@ runtime.StorageLease = class {
 };
 global.window.WsCaptionerRuntime = runtime;
 global.window.WsCollabTranscript = require(transcriptPath);
-global.fetch = async () => ({
+let backendPaused = false;
+global.fetch = async (url, options) => {
+  const body = JSON.parse(options.body);
+  if (url.endsWith("/control")) {
+    if (body.action === "pause") backendPaused = true;
+    if (body.action === "resume") backendPaused = false;
+  }
+  return ({
   ok: true,
   status: 200,
   json: async () => ({
     boot_id: "boot",
-    config: {enabled: true, paused: false},
-    instance: {may_capture: true, selected: true, enabled: true, reason: null},
+    config: {enabled: true, paused: backendPaused},
+    instance: {may_capture: !backendPaused, selected: true, enabled: true, reason: null},
   }),
-});
+  });
+};
 
 require(scriptPath);
-setImmediate(() => {
+setImmediate(async () => {
   assert.equal(permissionQueries, 1);
   assert.equal(typeof permissionStatus.onchange, "function");
   assert.equal(starts, 1);
@@ -1939,15 +1982,63 @@ setImmediate(() => {
   assert.match(elements.get("input-processing").textContent, /noise suppression on/);
   assert.doesNotMatch(elements.get("input-processing").textContent, /must-not-leak/);
 
+  let finishSequence;
+  runtime.nextFallbackSequence = () => new Promise(resolve => { finishSequence = resolve; });
+  const firstFinal = [{transcript:"first three words",confidence:.9}];
+  firstFinal.isFinal = true;
+  const saving = recognizer.onresult({resultIndex:0,results:[firstFinal]});
+  association.record({
+    type:"pause",duration_ms:4000,start_at:"2026-09-11T00:00:00Z",
+    end_at:"2026-09-11T00:00:04Z",source:"browser_rms_vad",
+  });
+  await recognizer.onresult({resultIndex:0,results:[firstFinal]});
+  finishSequence(1);
+  await saving;
+  assert.equal(association.pending.length, 1, "silence detected during a real final handler must survive its save");
+  runtime.nextFallbackSequence = () => 2;
+  const secondFinal = [{transcript:"last three words",confidence:.9}];
+  secondFinal.isFinal = true;
+  await recognizer.onresult({resultIndex:1,results:[firstFinal,secondFinal]});
+  const queued = JSON.parse(localStorage.getItem("ws-captioner-queue"));
+  assert.equal(queued.length, 2, "concurrent duplicate final callback must not enqueue a second copy");
+  assert.equal(queued[1].pauses[0].duration_ms, 4000);
+  assert.equal(queued[1].pauses[0].after_char, 0);
+
+  recognizer.onerror({error: "no-speech"});
+  recognizer.onend();
+  assert.equal(trackStops, 0, "recognizer silence timeout must not stop the acoustic detector");
+  assert.equal(contextCloses, 0);
+  assert.match(elements.get("status").textContent, /^Reconnecting/);
+  assert.ok(![...intervals.values()].some((timer) => timer.ms === 20));
+  assert.equal(typeof processor.port.onmessage, "function", "audio thread continues while recognition restarts");
+  const restart = [...timeouts.values()].find((timer) => timer.ms >= 500 && timer.ms < 1000);
+  assert.ok(restart);
+  await restart.callback();
+  await new Promise(setImmediate);
+  assert.equal(starts, 2);
+  assert.equal(lifecycle.filter((step) => step === "getUserMedia").length, 1);
+
+  await elements.get("pause").listeners.click();
+  assert.equal(trackStops, 1);
+  assert.match(elements.get("status").textContent, /^Paused: Listening paused by the user/);
+  assert.equal(backendPaused, true);
+  await elements.get("resume").listeners.click();
+  await new Promise(setImmediate);
+  assert.equal(backendPaused, false);
+  assert.equal(starts, 3);
+  assert.equal(elements.get("status").textContent, "Listening");
+  const priorStops = stops;
+  const priorTrackStops = trackStops;
+  const priorContextCloses = contextCloses;
   permissionStatus.state = "denied";
   permissionStatus.onchange();
-  assert.equal(stops, 1);
-  assert.equal(trackStops, 1);
-  assert.equal(contextCloses, 1);
+  assert.equal(stops, priorStops + 1);
+  assert.equal(trackStops, priorTrackStops + 1);
+  assert.equal(contextCloses, priorContextCloses + 1);
   assert.match(elements.get("status").textContent, /^Permission denied/);
 
   windowListeners.storage({key: "lease"});
-  assert.equal(stops, 1);
+  assert.equal(stops, priorStops + 1);
   assert.match(elements.get("status").textContent, /^Standby/);
   assert.deepEqual(global.window.__wsCollabCaptionerShutdown(), {
     stopped: true,

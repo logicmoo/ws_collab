@@ -68,6 +68,54 @@ Every failure — on both transports — uses the same envelope and codes:
 | `payload_too_large` | 413 |
 | `rate_limited` | 429 |
 
+## ChatBot Test agent
+
+The ChatBot Test page uses emullm's OpenAI-compatible chat endpoint and monitors
+the shared resolved STT pipeline. Configuration and editable history are scoped
+to the selected registered agent. Enabling a session is explicit; subsequent
+spoken turns are automatic. No microphone is created by this client.
+
+| Method / path | Purpose |
+| --- | --- |
+| `GET /ws_collab/language-chat` | Current agent, messages, pending speech, response and browser-TTS queue |
+| `GET/POST /ws_collab/language-chat/config` | Per-agent endpoint, model, system prompt, turn timing and voice settings |
+| `GET /ws_collab/language-chat/models` | Discover models from the configured emullm endpoint |
+| `GET /ws_collab/language-chat/request-preview` | Inspect the model request context without credentials |
+| `POST /ws_collab/language-chat/history` | Replace the selected agent's submitted history using `{agent_id,messages}` |
+| `POST /ws_collab/language-chat/start` | Enable automatic STT monitoring for `{client_id}` |
+| `POST /ws_collab/language-chat/stop` | Stop this chat and its queued replies |
+| `POST /ws_collab/language-chat/interrupt` | Cancel the current response/speech generation |
+| `POST /ws_collab/language-chat/send` | Submit `{client_id,text}` explicitly |
+| `POST /ws_collab/language-chat/send-now` | Submit the accumulated spoken turn now |
+| `POST /ws_collab/language-chat/heartbeat` | Report client liveness and browser speech acknowledgements |
+| `POST /ws_collab/language-chat/agent-speech` | Worker-authorized `{agent_id,text}` speech through the active browser voice channel, without an LLM request |
+
+Reads require viewer access; controls, edits, model discovery and TTS
+acknowledgements require operator access. A live client identity owns browser
+speech so polling or multiple tabs cannot intentionally replay the same queue.
+Completed conversation messages also appear in the normal conversation stream.
+Editing submitted history does not rewrite that append-only stream.
+While the model is generating or any speech is queued/playing, this agent's
+input gate is closed. It waits for all actual completion acknowledgements plus
+a short echo tail; shared STT/VAD remains active. Spoken input does not interrupt
+the agent automatically. The operator's Interrupt reply control remains explicit.
+
+Speech `done` acknowledgements may include actual `duration_ms` (0–1800000).
+`turn_timings` separates STT delivery, turn wait, model dispatch/first token/full
+response, speech queue wait, actual playback, and total observed latency.
+Unknown stages are null. Total latency is measured from server receipt of the
+input to completion; speech-end-to-STT time is shown separately when available.
+Speech-duration estimates in the browser are display-only and never open the
+input gate early.
+Playback duration is measured with the browser's monotonic clock from its actual
+`onstart` to `onend` callbacks. Native `elapsedTime` is not used because browser
+voice implementations have reported inconsistent units.
+
+Agent-speech requires a live chat owner and an idle output queue. It respects
+speaking permission, does not interrupt an existing reply, is tagged with its
+source agent, and is excluded from the next model prompt/history. It uses that
+agent's configured browser voice when available, otherwise the active bound voice.
+
 ## Reading events
 
 ```http

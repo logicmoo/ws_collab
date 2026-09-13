@@ -10,6 +10,8 @@
   const MEASURED_PAUSE_THRESHOLD_MS = 20;
   const MAX_GAP_MS = 24 * 60 * 60 * 1000;
   const MAX_TRANSCRIPT_EVENTS = 5000;
+  const markerData = new WeakMap();
+  const transcriptEdges = new WeakMap();
 
   function finiteTimestamp(value) {
     const parsed = Date.parse(typeof value === "string" ? value : "");
@@ -75,6 +77,66 @@
       alignment: pause.alignment,
       afterChar: pause.after_char,
     };
+  }
+
+  function interimCaption(event) {
+    if (event?.type !== "STT_PARTIAL_RESULT" || event.data?.is_final !== false) return null;
+    return finalCaption({
+      ...event, type: "STT_FINAL_RESULT", data: { ...event.data, is_final: true },
+    });
+  }
+
+  function silencePosition(prefix, text) {
+    const characters = [...text];
+    if (!prefix) return 0;
+    if (text.startsWith(prefix)) return [...prefix].length;
+    const normalizedPrefix = [...prefix.normalize("NFKC").toLowerCase()]
+      .filter(character => /[\p{L}\p{N}]/u.test(character)).join("");
+    let normalized = "";
+    const positions = [];
+    characters.forEach((character, index) => {
+      for (const part of character.normalize("NFKC").toLowerCase()) {
+        if (/[\p{L}\p{N}]/u.test(part)) {
+          normalized += part;
+          positions.push(index + 1);
+        }
+      }
+    });
+    if (normalizedPrefix && normalized.startsWith(normalizedPrefix)) {
+      return positions[[...normalizedPrefix].length - 1];
+    }
+    const wordCount = prefix.trim().split(/\s+/u).length;
+    const ends = [];
+    characters.forEach((character, index) => {
+      if (!/\s/u.test(character) && (index + 1 === characters.length || /\s/u.test(characters[index + 1]))) {
+        ends.push(index + 1);
+      }
+    });
+    return ends[Math.min(wordCount, ends.length) - 1] ?? 0;
+  }
+
+  function reviseCaption(previous, current) {
+    if (!current) return null;
+    const sameUtterance = previous && current.sessionId && current.utteranceId
+      && previous.sessionId === current.sessionId && previous.utteranceId === current.utteranceId;
+    const key = pause => `${pause.startAt}|${pause.endAt}|${pause.durationMs}`;
+    const old = new Map((sameUtterance ? previous.pauses : []).map(pause => [key(pause), pause]));
+    const combined = new Map(current.pauses.map(pause => [key(pause), pause]));
+    for (const [id, pause] of old) if (!combined.has(id)) combined.set(id, pause);
+    const pauses = [...combined].map(([id, pause]) => {
+      const original = old.get(id);
+      const anchorPrefix = original
+        ? (original.anchorPrefix ?? [...previous.text].slice(0, original.afterChar).join(""))
+        : [...current.text].slice(0, pause.afterChar).join("");
+      return {
+        ...pause,
+        anchorPrefix,
+        afterChar: silencePosition(anchorPrefix, current.text),
+        alignment: original && previous.text !== current.text && original.alignment !== "between_utterances"
+          ? "approximate_text_position" : pause.alignment,
+      };
+    });
+    return { ...current, pauses };
   }
 
   function identityKeys(row) {
@@ -175,7 +237,7 @@
     if (!previous || !current) return null;
     if (current.pauses.length) return null;
     if (current.silenceBeforeMs !== null) {
-      if (current.silenceBeforeMs < MEASURED_PAUSE_THRESHOLD_MS) return null;
+      if (current.silenceBeforeMs < 1) return null;
       return measuredMarker(current.silenceBeforeMs, "between_utterances");
     }
 
@@ -200,7 +262,7 @@
     }[alignment] || "best-effort position";
   }
 
-  function measuredMarker(durationMs, alignment) {
+  function measuredMarker(durationMs, alignment, interval = {}) {
     return {
       kind: "measured",
       durationMs,
@@ -209,66 +271,264 @@
       title: "Measured locally from microphone RMS; text position is best-effort because Chrome supplies no word timestamps. "
         + `Alignment: ${alignmentLabel(alignment)}.`,
       alignment,
+      startMs: finiteTimestamp(interval.startAt),
+      endMs: finiteTimestamp(interval.endAt),
     };
   }
 
-  function silenceMarker(documentRef, marker) {
-    const node = documentRef.createElement("span");
-    node.className = `silence-marker ${marker.kind}`;
-    node.setAttribute("role", "img");
+  function combineSilenceMarkers(markers) {
+    if (markers.length === 1) return markers[0];
+    const segments = markers.flatMap(marker => marker.segments || [marker]);
+    const intervals = new Map();
+    let durationMs = 0;
+    for (const segment of segments) {
+      if (Number.isFinite(segment.startMs) && Number.isFinite(segment.endMs)
+          && segment.endMs >= segment.startMs) {
+        const key = `${segment.startMs}:${segment.endMs}`;
+        const previous = intervals.get(key);
+        if (!previous || segment.durationMs > previous.durationMs) intervals.set(key, segment);
+      } else {
+        durationMs += segment.durationMs;
+      }
+    }
+    let coveredUntil = -Infinity;
+    for (const segment of [...intervals.values()].sort(
+      (a, b) => a.startMs - b.startMs || b.endMs - a.endMs
+    )) {
+      const overlap = Math.max(0, Math.min(coveredUntil, segment.endMs) - segment.startMs);
+      durationMs += Math.max(0, segment.durationMs - overlap);
+      coveredUntil = Math.max(coveredUntil, segment.endMs);
+    }
+    const approximate = markers.some(marker => marker.kind === "approximate");
+    return {
+      ...measuredMarker(durationMs, markers[0].alignment),
+      kind: approximate ? "approximate" : "measured",
+      text: `${approximate ? "~" : ""}${formatDuration(durationMs)}`,
+      ariaLabel: `${approximate ? "Combined approximate gap" : "Measured acoustic silence"} ${spokenDuration(durationMs)}`,
+      title: approximate
+        ? "Combined adjacent gaps; includes approximate event-timestamp timing."
+        : "Combined adjacent measured silences with no words between them; overlapping intervals are counted once. Text position is best-effort.",
+      segments,
+    };
+  }
+
+  function displaySilenceMarker(node, marker, live = false) {
+    const className = `silence-marker ${marker.kind}${live ? " live" : ""}`;
+    if (node.className !== className) node.className = className;
+    node.setAttribute("role", "note");
     node.setAttribute("aria-label", marker.ariaLabel);
     node.title = marker.title;
+    if (node.textContent !== marker.text) node.textContent = marker.text;
     node.style.setProperty(
       "--silence-scale",
       String(Math.min(1.45, 0.8 + Math.log10(Math.max(1, marker.durationMs / 300)) * 0.16))
     );
-    const icon = documentRef.createElementNS("http://www.w3.org/2000/svg", "svg");
-    icon.setAttribute("viewBox", "0 0 8 10");
-    icon.setAttribute("aria-hidden", "true");
-    const first = documentRef.createElementNS("http://www.w3.org/2000/svg", "rect");
-    first.setAttribute("x", "1");
-    first.setAttribute("y", "1");
-    first.setAttribute("width", "2");
-    first.setAttribute("height", "8");
-    const second = documentRef.createElementNS("http://www.w3.org/2000/svg", "rect");
-    second.setAttribute("x", "5");
-    second.setAttribute("y", "1");
-    second.setAttribute("width", "2");
-    second.setAttribute("height", "8");
-    icon.append(first, second);
-    const label = documentRef.createElement("span");
-    label.textContent = marker.text;
-    node.append(icon, label);
+  }
+
+  function silenceMarker(documentRef, marker) {
+    const node = documentRef.createElement("span");
+    displaySilenceMarker(node, marker);
+    markerData.set(node, marker);
     return node;
   }
 
   function renderTranscript(documentRef, container, rows) {
     container.replaceChildren();
+    const edges = { leading: null, trailing: null };
+    transcriptEdges.set(container, edges);
     if (!rows.length) return;
     const fragment = documentRef.createDocumentFragment();
+    let pending = null;
+    let hasWords = false;
+    const appendText = (parent, text) => {
+      if (text.trim()) {
+        hasWords = true;
+        pending = null;
+      }
+      const chunk = documentRef.createElement("span");
+      chunk.textContent = text;
+      parent.appendChild(chunk);
+    };
+    const appendMarker = (parent, marker) => {
+      if (pending) {
+        const combined = combineSilenceMarkers([markerData.get(pending), marker]);
+        markerData.set(pending, combined);
+        displaySilenceMarker(pending, combined);
+      } else {
+        pending = silenceMarker(documentRef, marker);
+        parent.appendChild(pending);
+      }
+      if (!hasWords) edges.leading = pending;
+    };
     rows.forEach((row, index) => {
       const marker = index ? markerBetween(rows[index - 1], row) : null;
-      if (marker) fragment.appendChild(silenceMarker(documentRef, marker));
+      if (marker) appendMarker(fragment, marker);
       const utterance = documentRef.createElement("span");
       utterance.className = "transcript-utterance";
       let cursor = 0;
       const characters = [...row.text];
       [...row.pauses].sort((a, b) => a.afterChar - b.afterChar).forEach((pause) => {
-        const chunk = documentRef.createElement("span");
-        chunk.textContent = characters.slice(cursor, pause.afterChar).join("");
-        utterance.appendChild(chunk);
-        utterance.appendChild(silenceMarker(
-          documentRef,
-          measuredMarker(pause.durationMs, pause.alignment)
-        ));
+        appendText(utterance, characters.slice(cursor, pause.afterChar).join(""));
+        appendMarker(utterance, measuredMarker(pause.durationMs, pause.alignment, pause));
         cursor = pause.afterChar;
       });
-      const tail = documentRef.createElement("span");
-      tail.textContent = characters.slice(cursor).join("");
-      utterance.appendChild(tail);
+      appendText(utterance, characters.slice(cursor).join(""));
       fragment.appendChild(utterance);
     });
     container.appendChild(fragment);
+    edges.trailing = pending;
+  }
+
+  function liveSilenceState(vad, { ageMs = 0, maxAgeMs = 15000, reason = "" } = {}) {
+    if (reason) return { text: reason, active: false };
+    if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > maxAgeMs) {
+      return { text: "Silence detector unavailable (stale update)", active: false };
+    }
+    if (!vad || vad.source !== "browser_rms_vad" || !vad.available) {
+      return { text: "Silence detector unavailable", active: false };
+    }
+    if (vad.state === "speech") return { text: "Speech detected", active: false };
+    const duration = validDuration(vad.current_silence_ms);
+    if (vad.state !== "silence" || duration === null) {
+      return { text: "Listening for speech", active: false };
+    }
+    const elapsed = Math.min(MAX_GAP_MS, Math.round(duration + ageMs));
+    return {
+      text: formatDuration(elapsed),
+      ariaLabel: `Current silence ${spokenDuration(elapsed)}; still listening`,
+      active: true,
+      durationMs: elapsed,
+    };
+  }
+
+  class LiveTranscriptTail {
+    constructor(documentRef, container, {
+      monotonicNow = () => performance.now(),
+      wallNow = () => Date.now(),
+    } = {}) {
+      this.container = container;
+      this.monotonicNow = monotonicNow;
+      this.wallNow = wallNow;
+      this.documentRef = documentRef;
+      this.sample = null;
+      this.interim = null;
+      this.mergedNodes = new Set();
+      this.hiddenMarkers = new Set();
+      this.node = documentRef.createElement("span");
+      this.node.className = "transcript-live-tail";
+      // The transcript remains live, but do not announce the timer on every tick.
+      this.node.setAttribute("aria-live", "off");
+      this.silence = documentRef.createElement("span");
+      this.draft = documentRef.createElement("span");
+      this.draft.className = "transcript-draft";
+      this.draft.setAttribute("aria-live", "polite");
+      this.draft.title = "Interim caption: these words and their positions may change before recognition is final.";
+      this.age = documentRef.createElement("span");
+      this.age.className = "transcript-last-age";
+      this.age.title = "Time since the last finalized caption, not a measurement of silence.";
+      this.node.append(this.draft, this.silence, this.age);
+    }
+
+    observe(vad, { ageMs = 0, maxAgeMs = 15000, reason = "" } = {}) {
+      this.sample = {
+        vad: vad ? { ...vad } : null,
+        observedAt: this.monotonicNow(),
+        ageMs,
+        maxAgeMs,
+        reason,
+      };
+    }
+
+    setInterim(event) {
+      this.interim = event ? reviseCaption(this.interim, interimCaption(event)) : null;
+      renderTranscript(this.documentRef, this.draft, this.interim ? [this.interim] : []);
+    }
+
+    finish(event) {
+      const row = finalCaption(event);
+      if (row && this.interim && row.sessionId === this.interim.sessionId
+          && row.utteranceId === this.interim.utteranceId) {
+        const revised = reviseCaption(this.interim, row);
+        this.setInterim(null);
+        return revised;
+      }
+      return row;
+    }
+
+    mergeBoundarySilences(status, waitingForWords) {
+      const previous = transcriptEdges.get(this.container)?.trailing;
+      const draft = transcriptEdges.get(this.draft);
+      if (status.active) {
+        const now = this.wallNow();
+        markerData.set(this.silence, {
+          ...measuredMarker(status.durationMs, "between_utterances"),
+          startMs: now - status.durationMs, endMs: now,
+        });
+      }
+      const live = status.active ? this.silence : null;
+      const groups = this.interim
+        ? [[previous, draft?.leading], [draft?.trailing, live]]
+        : [waitingForWords ? [] : [previous, live]];
+      const merged = new Map();
+      const hidden = new Set();
+      for (const group of groups) {
+        const nodes = group.filter(Boolean);
+        if (nodes.length < 2) continue;
+        const sink = nodes.includes(this.silence) ? this.silence : nodes[0];
+        const marker = combineSilenceMarkers(nodes.map(node => markerData.get(node)));
+        if (sink === this.silence) {
+          marker.ariaLabel += "; current silence is still ongoing";
+          marker.title += " Includes the current, ongoing silence.";
+        }
+        merged.set(sink, marker);
+        nodes.filter(node => node !== sink).forEach(node => hidden.add(node));
+      }
+      for (const node of this.mergedNodes) {
+        if (node !== this.silence && !merged.has(node)) displaySilenceMarker(node, markerData.get(node));
+      }
+      for (const node of this.hiddenMarkers) if (!hidden.has(node)) node.hidden = false;
+      for (const node of hidden) node.hidden = true;
+      for (const [node, marker] of merged) displaySilenceMarker(node, marker, node === this.silence);
+      this.mergedNodes = new Set(merged.keys());
+      this.hiddenMarkers = hidden;
+    }
+
+    update(lastRow) {
+      const sample = this.sample;
+      const status = liveSilenceState(sample?.vad, sample ? {
+        ageMs: sample.ageMs + Math.max(0, this.monotonicNow() - sample.observedAt),
+        maxAgeMs: sample.maxAgeMs,
+        reason: sample.reason,
+      } : {});
+      const waitingForWords = status.text === "Speech detected" || (status.active && !lastRow);
+      const empty = this.container.querySelector?.(".transcript-empty");
+      if (!lastRow && !this.interim && !waitingForWords) {
+        this.mergeBoundarySilences(status, true);
+        this.node.remove();
+        if (empty) empty.hidden = false;
+        return;
+      }
+      if (!this.interim) {
+        const placeholder = waitingForWords ? "Recognizing speech... " : "";
+        if (this.draft.textContent !== placeholder) this.draft.textContent = placeholder;
+      }
+      const ageMs = !lastRow || lastRow.eventAtMs === null
+        ? null : Math.max(0, this.wallNow() - lastRow.eventAtMs);
+      const ageText = ageMs === null ? "" : ` Last caption ${formatDuration(ageMs)} ago`;
+      const silenceClass = status.active ? "silence-marker live" : "transcript-detector-state";
+      if (this.silence.className !== silenceClass) this.silence.className = silenceClass;
+      if (this.silence.textContent !== status.text) {
+        this.silence.textContent = status.text;
+        this.silence.setAttribute("aria-label", status.ariaLabel || status.text);
+      }
+      this.silence.title = status.active
+        ? "Silence detected locally from microphone RMS. The timer advances between detector reports; listening has not been paused."
+        : status.text;
+      this.mergeBoundarySilences(status, waitingForWords);
+      if (this.age.textContent !== ageText) this.age.textContent = ageText;
+      if (empty) empty.hidden = true;
+      if (this.node.parentNode !== this.container) this.container.appendChild(this.node);
+    }
   }
 
   class SpeechBoundaryTracker {
@@ -370,12 +630,18 @@
     MEASURED_PAUSE_THRESHOLD_MS,
     SILENCE_MARKER_THRESHOLD_MS,
     SpeechBoundaryTracker,
+    LiveTranscriptTail,
     clearViewCutoff,
     collectFinalPages,
     finalCaption,
+    interimCaption,
+    silencePosition,
+    reviseCaption,
     formatDuration,
     markerBetween,
+    liveSilenceState,
     measuredMarker,
+    combineSilenceMarkers,
     mergeFinalEvents,
     renderTranscript,
     rowsAfterCutoff,

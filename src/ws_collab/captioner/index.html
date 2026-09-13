@@ -32,23 +32,24 @@
       This is not offline or local speech recognition. Pause detection is separate:
       microphone RMS is analyzed locally in this page, and WS_COLLAB neither transmits
       nor stores those audio samples.
-      <br><strong>Input scope: microphone only.</strong> Other tabs are not captured directly. Speaker audio that leaks into the mic cannot be reliably identified; use headphones or separate virtual audio devices. Chrome Web Speech listens to the Chrome/OS default input and cannot be bound to this page's MediaStream.
+      <br><strong>Input scope: microphone only.</strong> Recognition and silence detection share the same microphone track (Chrome desktop 135 or newer). Other tabs are not captured directly. Speaker audio that leaks into the mic cannot be reliably identified; use headphones or separate virtual audio devices.
     </section>
 
     <section class="controls">
       <label for="language">Recognition language</label>
       <input id="language" type="text" maxlength="35" autocomplete="off">
       <label class="check"><input id="send-interims" type="checkbox"> Send interim captions</label>
-      <button id="pause" type="button">Pause</button>
-      <button id="resume" type="button">Resume listening</button>
+      <button id="pause" type="button" title="Stop Chrome Captions listening: release the microphone and stop speech recognition and silence detection until you resume. Saved captions are kept.">Pause listening</button>
+      <button id="resume" type="button" title="Clear the user pause and retry microphone access and recognition. The backend-selected window will listen; this does not change source selection.">Resume listening</button>
     </section>
+    <p class="subtitle">Silence means the detector is still listening. Pause listening is your explicit stop control; it is not a quiet gap in speech.</p>
 
     <section class="status-grid" aria-label="Captioner status">
       <div><span>Status</span><strong id="status">Starting</strong></div>
       <div><span>Microphone</span><strong id="mic">Unknown</strong></div>
       <div><span>Delivery queue</span><strong id="queue-depth">0</strong></div>
       <div><span>Last acknowledgement</span><strong id="last-ack">Never</strong></div>
-      <div class="vad-card"><span>Acoustic VAD</span><strong id="vad-status">Local pause detector: starting</strong></div>
+      <div class="vad-card"><span>Acoustic VAD</span><strong id="vad-status">Local silence detector: starting</strong></div>
       <div><span>Input scope</span><strong id="input-scope">microphone</strong></div>
       <div><span>Detected input</span><strong id="input-device">Chrome/OS default input</strong></div>
       <div class="vad-card"><span>Actual input processing</span><strong id="input-processing">Waiting for microphone track</strong></div>
@@ -64,6 +65,7 @@
       <div id="final-log" class="final-log transcript-flow" aria-live="polite">
         <span class="transcript-empty">No finalized captions this session.</span>
       </div>
+      <p class="subtitle">Speech appears here as it starts; italic words are provisional until confirmed. Blue durations mark detected silence between words or sentences. The final indicator counts the current silence while listening; "Last caption" shows caption age, not measured silence.</p>
     </section>
 
     <p id="error" class="error" role="alert"></p>
